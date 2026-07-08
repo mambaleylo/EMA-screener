@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 """
-EMA Bounce Dossier v1.6 (fork of SMC Optimizer v3.52.96)
+EMA Bounce Dossier v1.7 (fork of SMC Optimizer v3.52.96)
+- v1.7: отслеживание живых сигналов до закрытия. Каждый выданный сигнал
+  теперь логируется отдельной записью в ema_signal_history.json (не
+  перезатирается следующим сигналом по той же монете, как _ema_live_state)
+  со статусом "open". Фоновый цикл (_ema_history_update_open, раз в
+  EMA_LIVE_POLL_SEC) тянет свечи с момента входа и проверяет, что сработало
+  раньше — TP или SL; если в одной свече задето и то, и другое (порядок
+  внутри бара неизвестен) — консервативно считается SL. Новый эндпоинт
+  GET /ema_signal_history (список + winrate/tp/sl по закрытым). В UI —
+  таблица "История сигналов" со статусом (⏳ открыт / ✅ TP / ❌ SL) и
+  винрейтом в шапке.
 - v1.6: КРИТИЧНЫЙ ФИКС — LAB_USDT выдал LONG с SL=9.44 ВЫШЕ входа 5.75 и
   TP=-1.63 (отрицательная цена). Причина: "touched" проверял только, что EMA
   попадает в диапазон [low,high] всей свечи — на свече с огромным
@@ -1857,7 +1867,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "1.6"
+APP_VERSION  = "1.7"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4088,6 +4098,89 @@ _ema_live_lock  = threading.Lock()
 _ema_live_state = {"signals": {}, "updated_at": 0}   # symbol -> last signal dict
 _ema_alert_seen = {}                                  # symbol -> последний t алерченной свечи
 
+# v1.7: история сигналов — каждый выданный сигнал логируется отдельной
+# записью (не перезаписывает предыдущий, в отличие от _ema_live_state) и
+# отслеживается до момента, пока не сработает TP или SL.
+EMA_HISTORY_FILE = os.path.expanduser("~/ema_signal_history.json")
+EMA_HISTORY_MAX  = 500     # чтобы файл не рос бесконечно
+_ema_history_lock = threading.Lock()
+
+def _load_ema_history():
+    try:
+        with open(EMA_HISTORY_FILE, "r") as f:
+            state = json.load(f)
+            state.setdefault("items", {})
+            return state
+    except Exception:
+        return {"items": {}}
+
+def _save_ema_history(state):
+    try:
+        with open(EMA_HISTORY_FILE, "w") as f: json.dump(state, f)
+    except Exception as e:
+        olog(f"[ema_history] ошибка сохранения: {e}")
+
+def _ema_history_add(sig):
+    """Логирует новый сигнал как 'open', если такого (тот же symbol/tf/ema/
+    свеча) ещё нет в истории."""
+    key = f"{sig['symbol']}|{sig['tf']}|{sig['ema_period']}|{sig['bar_t']}"
+    with _ema_history_lock:
+        state = _load_ema_history()
+        if key in state["items"]:
+            return
+        item = dict(sig)
+        item.update(status="open", opened_at=int(time.time()),
+                    closed_at=None, close_price=None)
+        state["items"][key] = item
+        if len(state["items"]) > EMA_HISTORY_MAX:
+            oldest = sorted(state["items"].items(), key=lambda kv: kv[1]["opened_at"])
+            for k, _ in oldest[:len(state["items"]) - EMA_HISTORY_MAX]:
+                del state["items"][k]
+        _save_ema_history(state)
+
+def _ema_history_update_open():
+    """Проходит по всем сигналам со статусом 'open', тянет свечи с момента
+    входа и проверяет, что сработало раньше — TP или SL. Если в одной и той
+    же свече задето и то, и другое (быстрая волатильная свеча, порядок
+    внутри бара неизвестен) — консервативно засчитываем SL (хуже сценарий,
+    так безопаснее для статистики, чем случайно завысить винрейт)."""
+    with _ema_history_lock:
+        state = _load_ema_history()
+    open_items = [(k, v) for k, v in state["items"].items() if v["status"] == "open"]
+    if not open_items:
+        return
+    updated = {}
+    for key, item in open_items:
+        try:
+            fetch_tf = "1d" if item["tf"] == "1w" else item["tf"]
+            days = _days_for_live_check(item["tf"], item["ema_period"])
+            raw = _fetch_candles(item["symbol"], fetch_tf, days)
+            candles = _resample_to_weekly(raw) if item["tf"] == "1w" else raw
+            fwd = [c for c in candles if c["t"] > item["bar_t"]]
+            outcome, outcome_price = None, None
+            for c in fwd:
+                if item["dir"] == "long":
+                    hit_tp, hit_sl = c["high"] >= item["tp"], c["low"] <= item["sl"]
+                else:
+                    hit_tp, hit_sl = c["low"] <= item["tp"], c["high"] >= item["sl"]
+                if hit_sl:
+                    outcome, outcome_price = "sl", item["sl"]; break
+                if hit_tp:
+                    outcome, outcome_price = "tp", item["tp"]; break
+            if outcome:
+                item["status"] = outcome
+                item["closed_at"] = int(time.time())
+                item["close_price"] = outcome_price
+                updated[key] = item
+        except Exception as e:
+            olog(f"[ema_history] статус {item.get('symbol')} ошибка: {e}")
+    if updated:
+        with _ema_history_lock:
+            state2 = _load_ema_history()
+            for key, item in updated.items():
+                state2["items"][key] = item
+            _save_ema_history(state2)
+
 def _pick_best_ema_for_symbol(dossier_entry):
     """Из досье монеты выбирает одну (tf, ema_period) пару с максимальным
     bounce_rate среди надёжных (touches >= EMA_DOSSIER_MIN_TOUCHES)."""
@@ -4202,6 +4295,7 @@ def _ema_signal_loop():
                 with _ema_live_lock:
                     _ema_live_state["signals"][symbol] = sig
                     _ema_live_state["updated_at"] = int(time.time())
+                _ema_history_add(sig)   # v1.7: логируем в историю для отслеживания TP/SL
                 arrow = "🟢 LONG" if sig["dir"] == "long" else "🔴 SHORT"
                 msg = (f"📊 <b>{symbol}</b> {sig['tf']} — {arrow}\n"
                        f"Отскок от EMA{sig['ema_period']} (истор. bounce_rate {sig['bounce_rate']*100:.0f}%)\n"
@@ -4209,6 +4303,7 @@ def _ema_signal_loop():
                        f"SL: {sig['sl']} | TP: {sig['tp']} (RR 1:{sig['rr']:.0f})")
                 _send_alert(msg)
                 olog(f"[ema_live] новый сигнал {symbol} {sig['tf']} EMA{sig['ema_period']} {sig['dir']}")
+            _ema_history_update_open()   # v1.7: проверяем открытые сигналы на TP/SL
         except Exception as e:
             olog(f"[ema_live] ошибка цикла: {e}")
         time.sleep(EMA_LIVE_POLL_SEC)
@@ -4223,6 +4318,7 @@ table{width:100%;border-collapse:collapse;margin-top:12px;font-size:13px}
 th,td{padding:6px 8px;text-align:left;border-bottom:1px solid #21262d}
 th{color:#8b949e}
 .long{color:#3fb950}.short{color:#f85149}
+.tp{color:#3fb950}.sl{color:#f85149}.open{color:#8b949e}
 #status{color:#8b949e;font-size:13px;margin-top:8px}
 </style></head><body>
 <h1>&#9889; EMA Bounce Dossier</h1>
@@ -4230,6 +4326,8 @@ th{color:#8b949e}
 <div id="status"></div>
 <h3>&#128276; Живые сигналы</h3>
 <table id="live"><thead><tr><th>Монета</th><th>ТФ</th><th>EMA</th><th>Направление</th><th>Цена</th><th>SL</th><th>TP</th><th>Bounce rate</th></tr></thead><tbody></tbody></table>
+<h3>&#128203; История сигналов <span id="histSummary" style="font-weight:normal;font-size:13px;color:#8b949e"></span></h3>
+<table id="history"><thead><tr><th>Монета</th><th>ТФ</th><th>EMA</th><th>Направление</th><th>Вход</th><th>SL</th><th>TP</th><th>Статус</th><th>Когда</th></tr></thead><tbody></tbody></table>
 <details id="dossierBlock">
 <summary style="cursor:pointer;font-size:15px;margin-top:16px">Досье по монетам (лучшая EMA на каждом ТФ, включая недельный) — <span id="dossierCount">0</span> строк</summary>
 <table id="dossier"><thead><tr><th>Монета</th><th>Взлёт</th><th>ТФ</th><th>Лучшая EMA</th><th>Bounce rate</th></tr></thead><tbody></tbody></table>
@@ -4238,6 +4336,12 @@ th{color:#8b949e}
 async function startScan(){
   const r = await fetch('/ema_dossier_start'); const d = await r.json();
   document.getElementById('status').innerText = d.msg;
+}
+function fmtAgo(ts){
+  const s = Math.floor(Date.now()/1000) - ts;
+  if(s < 3600) return Math.floor(s/60)+'м назад';
+  if(s < 86400) return Math.floor(s/3600)+'ч назад';
+  return Math.floor(s/86400)+'д назад';
 }
 async function refresh(){
   try{
@@ -4248,6 +4352,18 @@ async function refresh(){
       const cls = sig.dir === 'long' ? 'long' : 'short';
       tr.innerHTML = `<td>${sym}</td><td>${sig.tf}</td><td>EMA${sig.ema_period}</td><td class="${cls}">${sig.dir.toUpperCase()}</td><td>${sig.price}</td><td>${sig.sl}</td><td>${sig.tp}</td><td>${(sig.bounce_rate*100).toFixed(0)}%</td>`;
       tbody2.appendChild(tr);
+    }
+
+    const r3 = await fetch('/ema_signal_history'); const d3 = await r3.json();
+    document.getElementById('histSummary').innerText = d3.closed
+      ? `закрыто ${d3.closed} (TP ${d3.tp} / SL ${d3.sl}) — винрейт ${d3.winrate}%` : '';
+    const tbody3 = document.querySelector('#history tbody'); tbody3.innerHTML = '';
+    const statusLabel = {open:'⏳ открыт', tp:'✅ TP', sl:'❌ SL'};
+    for(const it of (d3.items||[])){
+      const tr = document.createElement('tr');
+      const dcls = it.dir === 'long' ? 'long' : 'short';
+      tr.innerHTML = `<td>${it.symbol}</td><td>${it.tf}</td><td>EMA${it.ema_period}</td><td class="${dcls}">${it.dir.toUpperCase()}</td><td>${it.price}</td><td>${it.sl}</td><td>${it.tp}</td><td class="${it.status}">${statusLabel[it.status]||it.status}</td><td>${fmtAgo(it.opened_at)}</td>`;
+      tbody3.appendChild(tr);
     }
 
     const r = await fetch('/ema_dossier_status'); const d = await r.json();
@@ -9359,6 +9475,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/ema_live_signals":
             with _ema_live_lock:
                 self._json(dict(_ema_live_state))
+        elif self.path == "/ema_signal_history":
+            with _ema_history_lock:
+                state = _load_ema_history()
+            items = sorted(state["items"].values(), key=lambda v: v["opened_at"], reverse=True)
+            closed = [v for v in items if v["status"] in ("tp", "sl")]
+            tp_n = sum(1 for v in closed if v["status"] == "tp")
+            winrate = round(tp_n / len(closed) * 100, 1) if closed else None
+            self._json({"items": items, "closed": len(closed), "tp": tp_n,
+                         "sl": len(closed) - tp_n, "winrate": winrate})
         elif self.path == "/ema_dossier_start":
             with _ema_dossier_lock:
                 if _ema_dossier_running["v"]:
