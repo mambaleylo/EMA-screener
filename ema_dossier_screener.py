@@ -1,6 +1,24 @@
 #!/usr/bin/env python3
 """
-EMA Bounce Dossier v1.5 (fork of SMC Optimizer v3.52.96)
+EMA Bounce Dossier v1.6 (fork of SMC Optimizer v3.52.96)
+- v1.6: КРИТИЧНЫЙ ФИКС — LAB_USDT выдал LONG с SL=9.44 ВЫШЕ входа 5.75 и
+  TP=-1.63 (отрицательная цена). Причина: "touched" проверял только, что EMA
+  попадает в диапазон [low,high] всей свечи — на свече с огромным
+  внутридневным диапазоном (гэп/обвал) EMA технически "внутри" свечи, даже
+  если реальное закрытие ушло от него на десятки ATR. Добавлено условие
+  EMA_TOUCH_CLOSE_MAX_ATR: закрытие свечи не дальше 1.5*ATR от EMA, иначе
+  это не touch, а мусор от волатильной свечи. Плюс защитная геометрическая
+  проверка в _ema_check_symbol_signal: для long обязано быть sl<price<tp,
+  для short — tp<price<sl, иначе сигнал не выдаётся вообще (последний
+  рубеж, если найдётся ещё не учтённый edge-case). Отдельно пробовал
+  ужесточить лесенку из v1.4 (отклонять и "ladder is None" тоже, не только
+  явное противоречие) — откатил: на реальном откате к медленному EMA
+  (50/100/200) цена в момент касания закономерно оказывается ниже быстрых
+  EMA 7/14/28 (они ещё не догнали такой же откат), из-за чего ladder почти
+  всегда None именно в момент касания — это нормальный откат, а не "жгут",
+  строгий reject резал бы легитимные сигналы. Оставлена permissive-логика
+  v1.4: отклоняем только явное противоречие направлению, не саму
+  неопределённость.
 - v1.5: добавлена оценка SL/TP к живым сигналам (запрос: "можно ли оценить
   где тейк и стоп"). Стоп — за EMA-уровнем на EMA_SIGNAL_SL_ATR=0.6*ATR(14)
   (если пробили дальше — "отскок" не состоялся, сетап отменён, и это шире
@@ -1839,7 +1857,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "1.5"
+APP_VERSION  = "1.6"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3787,6 +3805,19 @@ EMA_WEEKLY_PERIODS  = [10, 20, 50]
 PUMP_LOOKBACK_DAYS  = 7
 PUMP_THRESHOLD_PCT  = 20.0   # v1.1: рост за PUMP_LOOKBACK_DAYS дней, помечаем монету "resent pump"
 EMA_DOSSIER_TOUCH_ATR    = 0.25   # допуск касания EMA, в ATR(14)
+EMA_TOUCH_CLOSE_MAX_ATR  = 1.5    # v1.6: КРИТИЧНЫЙ ФИКС — старое "касание"
+                                   # проверяло только (low-tol)<=EMA<=(high+tol),
+                                   # т.е. EMA попадает в диапазон [low,high] всей
+                                   # свечи. На свече с огромным диапазоном (гэп/
+                                   # обвал внутри дня) EMA технически "внутри"
+                                   # свечи, даже если реальное закрытие ушло от
+                                   # него на десятки ATR (кейс LAB_USDT: close
+                                   # 5.75, EMA28 15.3 — оба технически "в свече",
+                                   # но это не touch, а мусор). Теперь ДОПОЛНИТЕЛЬНО
+                                   # требуем, чтобы закрытие свечи было не дальше
+                                   # EMA_TOUCH_CLOSE_MAX_ATR*ATR от EMA — иначе это
+                                   # не "касание уровня", а случайное пересечение
+                                   # диапазона на волатильной свече.
 EMA_DOSSIER_REACT_ATR    = 0.5    # порог "отскок засчитан", в ATR(14)
 EMA_DOSSIER_REACT_BARS   = 5      # за сколько баров после касания ждём реакцию
 EMA_DOSSIER_MIN_TOUCHES  = 5      # меньше касаний — статистика не считается надёжной
@@ -3861,15 +3892,26 @@ def _detect_ema_bounces(candles, ema_period,
             continue
         lo, hi = candles[i]["low"], candles[i]["high"]
         tol = touch_atr * atr_v
-        touched = (lo - tol) <= ema_v <= (hi + tol)
+        # v1.6: касание = EMA внутри диапазона свечи И закрытие не дальше
+        # EMA_TOUCH_CLOSE_MAX_ATR*ATR от EMA (см. константу — иначе огромная
+        # по диапазону свеча засчитывает "касание", даже если реальная цена
+        # закрытия ушла от EMA на десятки ATR)
+        touched = ((lo - tol) <= ema_v <= (hi + tol) and
+                   abs(closes[i] - ema_v) <= EMA_TOUCH_CLOSE_MAX_ATR * atr_v)
         prev_close = closes[i-1]
         if touched and abs(prev_close - ema_v) > tol:
             # с какой стороны подошли
             side_above = prev_close > ema_v
-            # v1.4: касание засчитываем как валидное только если ПОЛНАЯ
-            # лесенка EMA (7/14/28 + промежуточные до касаемого уровня)
-            # подтверждает сторону (здоровый тренд), а не спутана
-            # памп-дампом — иначе это грязное касание, в статистику не берём
+            # v1.6-b: попытка ужесточить до "ladder != expected" (отклонять
+            # и None тоже) откатил обратно — на РЕАЛЬНОМ здоровом откате к
+            # поддержке цена в момент касания медленного EMA (50/100/200)
+            # закономерно оказывается НИЖЕ быстрых EMA 7/14/28 (они ещё не
+            # успели отреагировать на такой же откат) — это нормальный
+            # откат, а не "жгут", но строгая проверка с учётом цены почти
+            # всегда даёт None именно в момент касания и резала бы легитимные
+            # сигналы. Оставляю как в v1.4: отклоняем только явное
+            # ПРОТИВОРЕЧИЕ (ladder уверенно "down" при ожидании "up"),
+            # а неопределённость (None) не считаем поводом для отказа.
             expected = "up" if side_above else "down"
             ladder = _ladder_order([closes[i]] + [arr[i] for arr in ladder_arrs])
             if ladder is not None and ladder != expected:
@@ -4083,7 +4125,12 @@ def _ema_check_symbol_signal(symbol, pick):
     if ema_v is None or not atr_v: return None
     lo, hi = candles[i]["low"], candles[i]["high"]
     tol = EMA_DOSSIER_TOUCH_ATR * atr_v
-    touched = (lo - tol) <= ema_v <= (hi + tol)
+    # v1.6: см. константу EMA_TOUCH_CLOSE_MAX_ATR — без этого условия
+    # огромная по диапазону свеча (гэп/обвал внутри дня) засчитывала бы
+    # "касание", даже если реальное закрытие ушло от EMA на десятки ATR
+    # (кейс LAB_USDT: close 5.75, EMA28 15.3, оба технически "в свече").
+    touched = ((lo - tol) <= ema_v <= (hi + tol) and
+               abs(closes[i] - ema_v) <= EMA_TOUCH_CLOSE_MAX_ATR * atr_v)
     prev_close = closes[i-1]
     if not touched or abs(prev_close - ema_v) <= tol:
         return None
@@ -4099,6 +4146,8 @@ def _ema_check_symbol_signal(symbol, pick):
     ladder_arrs = [_ema(closes, p) for p in ladder_periods]
     ladder = _ladder_order([closes[i]] + [arr[i] for arr in ladder_arrs])
     expected = "up" if side_above else "down"
+    # v1.6-b: см. комментарий в _detect_ema_bounces — откатил строгий reject
+    # на None обратно к permissive (отклоняем только явное противоречие)
     if ladder is not None and ladder != expected:
         return None
     price = candles[i]["close"]
@@ -4115,6 +4164,15 @@ def _ema_check_symbol_signal(symbol, pick):
         sl = ema_v + sl_buf
         risk = sl - price
         tp = price - EMA_SIGNAL_RR * risk
+    # v1.6: защитная геометрическая проверка — для long обязано быть
+    # sl < price < tp, для short — tp < price < sl. Если по каким-то причинам
+    # (тот же баг с огромной свечой, или другой ещё не найденный edge-case)
+    # уровни получились по "не ту сторону" от цены — сигнал абсурдный,
+    # лучше не показать вообще, чем показать SL выше входа на LONG.
+    if direction == "long" and not (sl < price < tp):
+        return None
+    if direction == "short" and not (tp < price < sl):
+        return None
     return {
         "symbol": symbol, "tf": tf, "ema_period": ema_period, "dir": direction,
         "price": price, "ema_value": round(ema_v, 6),
