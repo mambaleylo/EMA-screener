@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-EMA Bounce Dossier v1.2 (fork of SMC Optimizer v3.52.96)
+EMA Bounce Dossier v1.3 (fork of SMC Optimizer v3.52.96)
+- v1.3: UI — "Живые сигналы" подняты НАД досье (раньше были ниже длинного
+  списка досье, приходилось скроллить). Список досье (до N монет x 5 ТФ строк
+  — реально огромный) свёрнут в <details> по умолчанию и отсортирован по
+  bounce_rate по убыванию, чтобы самое релевантное было видно первым, если
+  раскрыть. Логика сигналов не менялась.
 - v1.2: КРИТИЧНЫЙ ФИКС логики сигнала (по разбору живого кейса YFI —
   цена взлетела до 2820, обвалилась через EMA100 (2264,7) вниз к 2081, наш
   алгоритм отдал LONG). Причина: касание EMA засчитывалось как "отскок от
@@ -1814,7 +1819,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "1.2"
+APP_VERSION  = "1.3"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4108,10 +4113,12 @@ th{color:#8b949e}
 <h1>&#9889; EMA Bounce Dossier</h1>
 <button onclick="startScan()">Запустить скан (топ-50)</button>
 <div id="status"></div>
-<h3>Досье по монетам (лучшая EMA на каждом ТФ, включая недельный)</h3>
-<table id="dossier"><thead><tr><th>Монета</th><th>Взлёт</th><th>ТФ</th><th>Лучшая EMA</th><th>Bounce rate</th></tr></thead><tbody></tbody></table>
-<h3>Живые сигналы</h3>
+<h3>&#128276; Живые сигналы</h3>
 <table id="live"><thead><tr><th>Монета</th><th>ТФ</th><th>EMA</th><th>Направление</th><th>Цена</th><th>Bounce rate</th></tr></thead><tbody></tbody></table>
+<details id="dossierBlock">
+<summary style="cursor:pointer;font-size:15px;margin-top:16px">Досье по монетам (лучшая EMA на каждом ТФ, включая недельный) — <span id="dossierCount">0</span> строк</summary>
+<table id="dossier"><thead><tr><th>Монета</th><th>Взлёт</th><th>ТФ</th><th>Лучшая EMA</th><th>Bounce rate</th></tr></thead><tbody></tbody></table>
+</details>
 <script>
 async function startScan(){
   const r = await fetch('/ema_dossier_start'); const d = await r.json();
@@ -4119,20 +4126,6 @@ async function startScan(){
 }
 async function refresh(){
   try{
-    const r = await fetch('/ema_dossier_status'); const d = await r.json();
-    document.getElementById('status').innerText =
-      `Статус: ${d.status||'idle'}  |  ${d.done||0}/${d.total||0} монет`;
-    const tbody = document.querySelector('#dossier tbody'); tbody.innerHTML = '';
-    for(const [sym, entry] of Object.entries(d.results||{})){
-      if(entry.error){ continue; }
-      const pumpLabel = entry.recent_pump ? ('&#128293; +'+entry.pump_pct+'%') : '';
-      for(const [tf, tfd] of Object.entries(entry.by_tf||{})){
-        if(!tfd.best_ema) continue;
-        const tr = document.createElement('tr');
-        tr.innerHTML = `<td>${sym}</td><td>${pumpLabel}</td><td>${tf}</td><td>EMA${tfd.best_ema}</td><td>${(tfd.best_bounce_rate*100).toFixed(0)}%</td>`;
-        tbody.appendChild(tr);
-      }
-    }
     const r2 = await fetch('/ema_live_signals'); const d2 = await r2.json();
     const tbody2 = document.querySelector('#live tbody'); tbody2.innerHTML = '';
     for(const [sym, sig] of Object.entries(d2.signals||{})){
@@ -4140,6 +4133,30 @@ async function refresh(){
       const cls = sig.dir === 'long' ? 'long' : 'short';
       tr.innerHTML = `<td>${sym}</td><td>${sig.tf}</td><td>EMA${sig.ema_period}</td><td class="${cls}">${sig.dir.toUpperCase()}</td><td>${sig.price}</td><td>${(sig.bounce_rate*100).toFixed(0)}%</td>`;
       tbody2.appendChild(tr);
+    }
+
+    const r = await fetch('/ema_dossier_status'); const d = await r.json();
+    document.getElementById('status').innerText =
+      `Статус: ${d.status||'idle'}  |  ${d.done||0}/${d.total||0} монет`;
+    // v1.2: список огромный (до N монет x 5 ТФ строк) — собираем все строки,
+    // сортируем по bounce_rate по убыванию (самое релевантное сверху) и
+    // прячем за <details>, чтобы не захламлять экран по умолчанию.
+    const rows = [];
+    for(const [sym, entry] of Object.entries(d.results||{})){
+      if(entry.error){ continue; }
+      const pumpLabel = entry.recent_pump ? ('&#128293; +'+entry.pump_pct+'%') : '';
+      for(const [tf, tfd] of Object.entries(entry.by_tf||{})){
+        if(!tfd.best_ema) continue;
+        rows.push({sym, pumpLabel, tf, ema: tfd.best_ema, rate: tfd.best_bounce_rate});
+      }
+    }
+    rows.sort((a,b) => b.rate - a.rate);
+    document.getElementById('dossierCount').innerText = rows.length;
+    const tbody = document.querySelector('#dossier tbody'); tbody.innerHTML = '';
+    for(const row of rows){
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${row.sym}</td><td>${row.pumpLabel}</td><td>${row.tf}</td><td>EMA${row.ema}</td><td>${(row.rate*100).toFixed(0)}%</td>`;
+      tbody.appendChild(tr);
     }
   }catch(e){}
 }
