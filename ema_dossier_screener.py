@@ -1,6 +1,25 @@
 #!/usr/bin/env python3
 """
-EMA Bounce Dossier v1.1 (fork of SMC Optimizer v3.52.96)
+EMA Bounce Dossier v1.2 (fork of SMC Optimizer v3.52.96)
+- v1.2: КРИТИЧНЫЙ ФИКС логики сигнала (по разбору живого кейса YFI —
+  цена взлетела до 2820, обвалилась через EMA100 (2264,7) вниз к 2081, наш
+  алгоритм отдал LONG). Причина: касание EMA засчитывалось как "отскок от
+  support/resistance" по одному правилу (подошли сверху → long, подошли
+  снизу → short) БЕЗ проверки, что мы реально в здоровом тренде, а не в
+  памп-дампе. По методичке автора идеи (EMA.pdf): "если линии выстроены по
+  порядку — тренд здоровый, каждая линия работает поддержкой. Если линии
+  сплелись в жгут — рынок в боковике, реакции слабые и грязные". Добавлена
+  _ladder_direction() — сверяет касание с лесенкой EMA7/14/28: сигнал long
+  подтверждается только если price>=ema7>=ema14>=ema28 (лесенка вверх),
+  short — только если price<=ema7<=ema14<=ema28 (лесенка вниз). Если лесенка
+  спутана или противоречит стороне касания (ровно кейс YFI: цена падает
+  сквозь EMA100 после пампа, лесенка ещё не развернулась вниз) — сигнал
+  считается шумом и не выдаётся. Применено и в live-проверке
+  (_ema_check_symbol_signal), и в офлайн-досье (_detect_ema_bounces), чтобы
+  bounce_rate в досье тоже не завышался за счёт грязных памп-дамп касаний.
+  Также добавлены периоды EMA 7/14/28 в EMA_DOSSIER_PERIODS (раньше
+  тестировались только 20/50/100/200 — а именно EMA28 автор методики
+  выделяет как "границу локального тренда", её не хватало вообще).
 - v1.1: добавлен недельный ТФ (1w, ресемплинг из 1d — Gate.io Futures такой
   интервал напрямую не отдаёт) с отдельным набором периодов EMA (10/20/50,
   т.к. EMA200 на неделях требует ~4 года истории, которой у большинства
@@ -1795,7 +1814,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "1.1"
+APP_VERSION  = "1.2"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3730,7 +3749,7 @@ def _vol_sma(candles, period=20):
 # уважительнее всего взаимодействует. Это НЕ P&L-бэктест и НЕ трогает
 # _simulate/оптимизатор/автотрейд выше — отдельный независимый скан.
 
-EMA_DOSSIER_PERIODS = [20, 50, 100, 200]
+EMA_DOSSIER_PERIODS = [7, 14, 28, 50, 100, 200]
 EMA_DOSSIER_TFS      = ["15m", "1h", "4h", "1d"]
 EMA_DOSSIER_DAYS     = {"15m": 10, "1h": 30, "4h": 90, "1d": 400}  # глубина истории на ТФ
 # v1.1: "1d" тянем напрямую с Gate.io, а "1w" получаем РЕСЕМПЛИНГОМ дневных
@@ -3747,6 +3766,24 @@ EMA_DOSSIER_REACT_ATR    = 0.5    # порог "отскок засчитан", 
 EMA_DOSSIER_REACT_BARS   = 5      # за сколько баров после касания ждём реакцию
 EMA_DOSSIER_MIN_TOUCHES  = 5      # меньше касаний — статистика не считается надёжной
 EMA_DOSSIER_FILE = os.path.expanduser("~/ema_dossier_state.json")
+EMA_LADDER_PERIODS = (7, 14, 28)   # v1.2: "лесенка" для проверки здоровья тренда
+
+def _ladder_direction(price, ema7, ema14, ema28):
+    """v1.2: по методичке автора идеи (EMA.pdf) — "если линии выстроены по
+    порядку — цена сверху, под ней 7, ниже 14, 28, 50 — тренд здоровый,
+    каждая линия работает поддержкой. Если линии сплелись в жгут — рынок в
+    боковике, реакции слабые и грязные". Возвращает "up", если лесенка
+    выстроена вверх (price>=ema7>=ema14>=ema28 — здоровый аптренд, касания
+    работают как support), "down" — если лесенка вниз (здоровый даунтренд,
+    касания как resistance), None — если данных не хватает или лесенка
+    спутана (боковик/памп-дамп в процессе разворота — касанию не доверяем)."""
+    if ema7 is None or ema14 is None or ema28 is None:
+        return None
+    if price >= ema7 >= ema14 >= ema28:
+        return "up"
+    if price <= ema7 <= ema14 <= ema28:
+        return "down"
+    return None
 
 def _detect_ema_bounces(candles, ema_period,
                          touch_atr=EMA_DOSSIER_TOUCH_ATR,
@@ -3765,6 +3802,7 @@ def _detect_ema_bounces(candles, ema_period,
     closes = [c["close"] for c in candles]
     ema_arr = _ema(closes, ema_period)
     atr_arr = _atr(candles, 14)
+    ema7_arr, ema14_arr, ema28_arr = (_ema(closes, p) for p in EMA_LADDER_PERIODS)
     n = len(candles)
     touches = 0
     bounces = 0
@@ -3785,6 +3823,14 @@ def _detect_ema_bounces(candles, ema_period,
         if touched and abs(prev_close - ema_v) > tol:
             # с какой стороны подошли
             side_above = prev_close > ema_v
+            # v1.2: касание засчитываем как валидное только если лесенка
+            # EMA7/14/28 подтверждает сторону (здоровый тренд), а не спутана
+            # памп-дампом — иначе это грязное касание, в статистику не берём
+            expected = "up" if side_above else "down"
+            ladder = _ladder_direction(closes[i], ema7_arr[i], ema14_arr[i], ema28_arr[i])
+            if ladder is not None and ladder != expected:
+                i += 1
+                continue
             touches += 1
             fwd_closes = closes[i+1:i+1+react_bars]
             if side_above:
@@ -3999,6 +4045,16 @@ def _ema_check_symbol_signal(symbol, pick):
         return None
     side_above = prev_close > ema_v
     direction = "long" if side_above else "short"   # отскок от EMA как от support/resistance
+    # v1.2: подтверждаем лесенкой EMA7/14/28 — по методичке трейдера сигнал
+    # валиден только в здоровом тренде (лесенка выстроена по порядку). Если
+    # лесенка спутана или прямо противоречит стороне касания — это ровно
+    # кейс YFI (памп → обвал сквозь EMA100, лесенка ещё не развернулась вниз,
+    # а мы чуть не отдали LONG) — сигнал не выдаём.
+    ema7_arr, ema14_arr, ema28_arr = (_ema(closes, p) for p in EMA_LADDER_PERIODS)
+    ladder = _ladder_direction(closes[i], ema7_arr[i], ema14_arr[i], ema28_arr[i])
+    expected = "up" if side_above else "down"
+    if ladder is not None and ladder != expected:
+        return None
     return {
         "symbol": symbol, "tf": tf, "ema_period": ema_period, "dir": direction,
         "price": candles[i]["close"], "ema_value": round(ema_v, 6),
