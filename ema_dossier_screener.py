@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
 """
-EMA Bounce Dossier v1.3 (fork of SMC Optimizer v3.52.96)
+EMA Bounce Dossier v1.4 (fork of SMC Optimizer v3.52.96)
+- v1.4: ФИКС недоделанной лесенки. Методичка (и мой же комментарий к v1.2)
+  дословно требует: "если они выстроены по порядку — цена сверху, под ней
+  7, ниже 14, 28, 50 — тренд здоровый" — но реализация v1.2 проверяла ТОЛЬКО
+  7/14/28, забыв EMA50 из этой же цитаты. На практике это значило: касание
+  по EMA100/200 подтверждалось лесенкой из всего трёх младших EMA, EMA50
+  между ними и касаемым уровнем вообще не сверялась. _ladder_direction()
+  (фикс.7/14/28) заменена на _ladder_periods_for()+_ladder_order():
+  для касания уровня ema_period лесенка теперь включает 7,14,28 + ВСЕ
+  промежуточные EMA_DOSSIER_PERIODS между 28 и ema_period (т.е. для
+  касания EMA100 проверяются 7/14/28/50, для EMA200 — 7/14/28/50/100).
+  Применено и в live-сигнале, и в офлайн-досье.
 - v1.3: UI — "Живые сигналы" подняты НАД досье (раньше были ниже длинного
   списка досье, приходилось скроллить). Список досье (до N монет x 5 ТФ строк
   — реально огромный) свёрнут в <details> по умолчанию и отсортирован по
@@ -14,7 +25,8 @@ EMA Bounce Dossier v1.3 (fork of SMC Optimizer v3.52.96)
   памп-дампе. По методичке автора идеи (EMA.pdf): "если линии выстроены по
   порядку — тренд здоровый, каждая линия работает поддержкой. Если линии
   сплелись в жгут — рынок в боковике, реакции слабые и грязные". Добавлена
-  _ladder_direction() — сверяет касание с лесенкой EMA7/14/28: сигнал long
+  проверка лесенки EMA7/14/28 (см. v1.4 — там же донастроена до полной
+  лесенки): сигнал long
   подтверждается только если price>=ema7>=ema14>=ema28 (лесенка вверх),
   short — только если price<=ema7<=ema14<=ema28 (лесенка вниз). Если лесенка
   спутана или противоречит стороне касания (ровно кейс YFI: цена падает
@@ -1819,7 +1831,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "1.3"
+APP_VERSION  = "1.4"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3771,22 +3783,32 @@ EMA_DOSSIER_REACT_ATR    = 0.5    # порог "отскок засчитан", 
 EMA_DOSSIER_REACT_BARS   = 5      # за сколько баров после касания ждём реакцию
 EMA_DOSSIER_MIN_TOUCHES  = 5      # меньше касаний — статистика не считается надёжной
 EMA_DOSSIER_FILE = os.path.expanduser("~/ema_dossier_state.json")
-EMA_LADDER_PERIODS = (7, 14, 28)   # v1.2: "лесенка" для проверки здоровья тренда
+EMA_LADDER_PERIODS = (7, 14, 28)   # v1.2: базовая "быстрая" лесенка
 
-def _ladder_direction(price, ema7, ema14, ema28):
-    """v1.2: по методичке автора идеи (EMA.pdf) — "если линии выстроены по
-    порядку — цена сверху, под ней 7, ниже 14, 28, 50 — тренд здоровый,
-    каждая линия работает поддержкой. Если линии сплелись в жгут — рынок в
-    боковике, реакции слабые и грязные". Возвращает "up", если лесенка
-    выстроена вверх (price>=ema7>=ema14>=ema28 — здоровый аптренд, касания
-    работают как support), "down" — если лесенка вниз (здоровый даунтренд,
-    касания как resistance), None — если данных не хватает или лесенка
-    спутана (боковик/памп-дамп в процессе разворота — касанию не доверяем)."""
-    if ema7 is None or ema14 is None or ema28 is None:
+def _ladder_periods_for(ema_period):
+    """v1.4: какие EMA-периоды должны быть выстроены по порядку, чтобы
+    касание уровня ema_period считалось происходящим в здоровом тренде.
+    Дословная цитата из методички (мой же комментарий в v1.2 предлагал её,
+    но реализация проверяла только 7/14/28, забыв упомянутую там же 50):
+    "если они выстроены по порядку — цена сверху, под ней 7, ниже 14, 28,
+    50 — тренд здоровый". Для касания по старшему EMA (50/100/200) в лесенку
+    добавляются все более быстрые EMA между базовой тройкой и касаемым
+    уровнем — иначе лесенка неполная и мы рискуем повторить кейс YFI на
+    другом периоде."""
+    return list(EMA_LADDER_PERIODS) + sorted(
+        p for p in EMA_DOSSIER_PERIODS if 28 < p < ema_period)
+
+def _ladder_order(vals):
+    """vals = [price, ema_самая_быстрая, ..., ema_самая_медленная].
+    "up" — лесенка выстроена по порядку вверх (здоровый аптренд, касания
+    работают как support), "down" — вниз (здоровый даунтренд, касания как
+    resistance), None — лесенка спутана (боковик/памп-дамп в процессе
+    разворота) или каких-то значений не хватает."""
+    if any(v is None for v in vals):
         return None
-    if price >= ema7 >= ema14 >= ema28:
+    if all(vals[k] >= vals[k+1] for k in range(len(vals)-1)):
         return "up"
-    if price <= ema7 <= ema14 <= ema28:
+    if all(vals[k] <= vals[k+1] for k in range(len(vals)-1)):
         return "down"
     return None
 
@@ -3807,7 +3829,8 @@ def _detect_ema_bounces(candles, ema_period,
     closes = [c["close"] for c in candles]
     ema_arr = _ema(closes, ema_period)
     atr_arr = _atr(candles, 14)
-    ema7_arr, ema14_arr, ema28_arr = (_ema(closes, p) for p in EMA_LADDER_PERIODS)
+    ladder_periods = _ladder_periods_for(ema_period)
+    ladder_arrs = [_ema(closes, p) for p in ladder_periods]
     n = len(candles)
     touches = 0
     bounces = 0
@@ -3828,11 +3851,12 @@ def _detect_ema_bounces(candles, ema_period,
         if touched and abs(prev_close - ema_v) > tol:
             # с какой стороны подошли
             side_above = prev_close > ema_v
-            # v1.2: касание засчитываем как валидное только если лесенка
-            # EMA7/14/28 подтверждает сторону (здоровый тренд), а не спутана
+            # v1.4: касание засчитываем как валидное только если ПОЛНАЯ
+            # лесенка EMA (7/14/28 + промежуточные до касаемого уровня)
+            # подтверждает сторону (здоровый тренд), а не спутана
             # памп-дампом — иначе это грязное касание, в статистику не берём
             expected = "up" if side_above else "down"
-            ladder = _ladder_direction(closes[i], ema7_arr[i], ema14_arr[i], ema28_arr[i])
+            ladder = _ladder_order([closes[i]] + [arr[i] for arr in ladder_arrs])
             if ladder is not None and ladder != expected:
                 i += 1
                 continue
@@ -4050,13 +4074,15 @@ def _ema_check_symbol_signal(symbol, pick):
         return None
     side_above = prev_close > ema_v
     direction = "long" if side_above else "short"   # отскок от EMA как от support/resistance
-    # v1.2: подтверждаем лесенкой EMA7/14/28 — по методичке трейдера сигнал
-    # валиден только в здоровом тренде (лесенка выстроена по порядку). Если
-    # лесенка спутана или прямо противоречит стороне касания — это ровно
-    # кейс YFI (памп → обвал сквозь EMA100, лесенка ещё не развернулась вниз,
-    # а мы чуть не отдали LONG) — сигнал не выдаём.
-    ema7_arr, ema14_arr, ema28_arr = (_ema(closes, p) for p in EMA_LADDER_PERIODS)
-    ladder = _ladder_direction(closes[i], ema7_arr[i], ema14_arr[i], ema28_arr[i])
+    # v1.4: подтверждаем ПОЛНОЙ лесенкой (7/14/28 + промежуточные EMA до
+    # касаемого уровня, не только базовая тройка) — по методичке трейдера
+    # сигнал валиден только в здоровом тренде (лесенка выстроена по
+    # порядку). Если лесенка спутана или прямо противоречит стороне касания
+    # — это ровно кейс YFI (памп → обвал сквозь EMA100, лесенка ещё не
+    # развернулась вниз, а мы чуть не отдали LONG) — сигнал не выдаём.
+    ladder_periods = _ladder_periods_for(ema_period)
+    ladder_arrs = [_ema(closes, p) for p in ladder_periods]
+    ladder = _ladder_order([closes[i]] + [arr[i] for arr in ladder_arrs])
     expected = "up" if side_above else "down"
     if ladder is not None and ladder != expected:
         return None
