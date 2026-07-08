@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """
-EMA Bounce Dossier v1.0 (fork of SMC Optimizer v3.52.96)
+EMA Bounce Dossier v1.1 (fork of SMC Optimizer v3.52.96)
+- v1.1: добавлен недельный ТФ (1w, ресемплинг из 1d — Gate.io Futures такой
+  интервал напрямую не отдаёт) с отдельным набором периодов EMA (10/20/50,
+  т.к. EMA200 на неделях требует ~4 года истории, которой у большинства
+  перпетуалов Gate.io просто нет). Добавлен детектор резкого взлёта монеты
+  (recent_pump/pump_pct, рост ≥20% за 7 дней) — подсвечивает монеты, для
+  которых сейчас особенно актуален откат к EMA старшего ТФ. Live-сигналы
+  тоже поддерживают tf=1w (ресемплинг на лету, не только в досье).
 - v1.0: новый скринер поверх архитектуры smc-optimizer (тот же Gate.io fetch,
   параллелизм через ProcessPoolExecutor, HTTP-сервер). Логика поиска сигналов
   заменена: вместо SMC (Order Blocks/FVG/CHoCH) — статистика отскоков цены от
@@ -1788,7 +1795,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "1.0"
+APP_VERSION  = "1.1"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3724,8 +3731,17 @@ def _vol_sma(candles, period=20):
 # _simulate/оптимизатор/автотрейд выше — отдельный независимый скан.
 
 EMA_DOSSIER_PERIODS = [20, 50, 100, 200]
-EMA_DOSSIER_TFS      = ["15m", "1h", "4h"]
-EMA_DOSSIER_DAYS     = {"15m": 10, "1h": 30, "4h": 90}   # глубина истории на ТФ
+EMA_DOSSIER_TFS      = ["15m", "1h", "4h", "1d"]
+EMA_DOSSIER_DAYS     = {"15m": 10, "1h": 30, "4h": 90, "1d": 400}  # глубина истории на ТФ
+# v1.1: "1d" тянем напрямую с Gate.io, а "1w" получаем РЕСЕМПЛИНГОМ дневных
+# свечей (не полагаемся на то, что Gate.io Futures вообще отдаёт interval="7d"
+# через тот же candlesticks-эндпоинт — надёжнее собрать неделю самим из
+# уже полученных дневных баров). EMA_DOSSIER_PERIODS для "1w" держим меньше
+# (иначе EMA200 на неделях = ~4 года истории, которой у большинства
+# перпетуалов Gate.io просто нет).
+EMA_WEEKLY_PERIODS  = [10, 20, 50]
+PUMP_LOOKBACK_DAYS  = 7
+PUMP_THRESHOLD_PCT  = 20.0   # v1.1: рост за PUMP_LOOKBACK_DAYS дней, помечаем монету "resent pump"
 EMA_DOSSIER_TOUCH_ATR    = 0.25   # допуск касания EMA, в ATR(14)
 EMA_DOSSIER_REACT_ATR    = 0.5    # порог "отскок засчитан", в ATR(14)
 EMA_DOSSIER_REACT_BARS   = 5      # за сколько баров после касания ждём реакцию
@@ -3795,15 +3811,69 @@ def _detect_ema_bounces(candles, ema_period,
         "bounce_rate": round(bounce_rate, 4),
     }
 
+def _resample_to_weekly(daily_candles):
+    """Собирает недельные свечи из дневных (7 дней в бар, календарные недели
+    по UTC понедельникам — не идеально ровно ISO-неделя, но для EMA/ATR
+    вполне достаточно последовательных 7-дневных блоков)."""
+    if not daily_candles: return []
+    weekly = []
+    bucket = []
+    bucket_start = None
+    for c in daily_candles:
+        day_idx = c["t"] // 86400
+        week_idx = day_idx // 7
+        if bucket_start is None:
+            bucket_start = week_idx
+        if week_idx != bucket_start:
+            if bucket:
+                weekly.append({
+                    "t": bucket[0]["t"],
+                    "open": bucket[0]["open"], "close": bucket[-1]["close"],
+                    "high": max(b["high"] for b in bucket),
+                    "low":  min(b["low"] for b in bucket),
+                    "vol":  sum(b.get("vol", 0) for b in bucket),
+                })
+            bucket = [c]; bucket_start = week_idx
+        else:
+            bucket.append(c)
+    if bucket:
+        weekly.append({
+            "t": bucket[0]["t"],
+            "open": bucket[0]["open"], "close": bucket[-1]["close"],
+            "high": max(b["high"] for b in bucket),
+            "low":  min(b["low"] for b in bucket),
+            "vol":  sum(b.get("vol", 0) for b in bucket),
+        })
+    return weekly
+
+def _detect_recent_pump(daily_candles, lookback_days=PUMP_LOOKBACK_DAYS, threshold_pct=PUMP_THRESHOLD_PCT):
+    """Резкий взлёт = рост close за последние lookback_days дней >= threshold_pct.
+    Возвращает (is_pump, pct_change) — используем, чтобы подсветить монеты,
+    для которых сейчас особенно актуален поиск старого уровня EMA (куда
+    цена может откатить после взлёта)."""
+    if len(daily_candles) < lookback_days + 1:
+        return False, 0.0
+    prev = daily_candles[-lookback_days-1]["close"]
+    last = daily_candles[-1]["close"]
+    if prev <= 0: return False, 0.0
+    pct = (last - prev) / prev * 100.0
+    return (pct >= threshold_pct), round(pct, 2)
+
 def _build_coin_dossier(symbol, timeframes=None, ema_periods=None):
-    """Досье по монете: для каждого ТФ — статистика отскоков по каждой EMA
-    и лучшая (самая уважаемая рынком) EMA на этом ТФ."""
+    """Досье по монете: для каждого ТФ (включая недельный, ресемплингом из
+    дневного) — статистика отскоков по каждой EMA, лучшая EMA на этом ТФ,
+    плюс флаг "резкий взлёт" — если недавно был сильный памп, EMA старшего
+    ТФ особенно интересна как потенциальный уровень отката."""
     timeframes  = timeframes or EMA_DOSSIER_TFS
     ema_periods = ema_periods or EMA_DOSSIER_PERIODS
-    dossier = {"symbol": symbol, "by_tf": {}, "generated_at": int(time.time())}
+    dossier = {"symbol": symbol, "by_tf": {}, "generated_at": int(time.time()),
+               "recent_pump": False, "pump_pct": 0.0}
+    daily_candles_cache = None
     for tf in timeframes:
         days = EMA_DOSSIER_DAYS.get(tf, 30)
         candles = _fetch_candles(symbol, tf, days)
+        if tf == "1d":
+            daily_candles_cache = candles
         if len(candles) < max(ema_periods) + EMA_DOSSIER_REACT_BARS + 10:
             dossier["by_tf"][tf] = {"error": "недостаточно данных", "emas": []}
             continue
@@ -3815,6 +3885,23 @@ def _build_coin_dossier(symbol, timeframes=None, ema_periods=None):
             "best_ema": best["ema_period"] if best else None,
             "best_bounce_rate": best["bounce_rate"] if best else None,
         }
+    # ── недельный ТФ (ресемплинг из уже скачанных дневных свечей) ──────────
+    if daily_candles_cache:
+        weekly_candles = _resample_to_weekly(daily_candles_cache)
+        if len(weekly_candles) >= max(EMA_WEEKLY_PERIODS) + EMA_DOSSIER_REACT_BARS + 10:
+            w_stats = [_detect_ema_bounces(weekly_candles, p) for p in EMA_WEEKLY_PERIODS]
+            w_reliable = [s for s in w_stats if s["touches"] >= EMA_DOSSIER_MIN_TOUCHES]
+            w_best = max(w_reliable, key=lambda s: s["bounce_rate"]) if w_reliable else None
+            dossier["by_tf"]["1w"] = {
+                "emas": w_stats,
+                "best_ema": w_best["ema_period"] if w_best else None,
+                "best_bounce_rate": w_best["bounce_rate"] if w_best else None,
+            }
+        else:
+            dossier["by_tf"]["1w"] = {"error": "недостаточно недель истории", "emas": []}
+        is_pump, pct = _detect_recent_pump(daily_candles_cache)
+        dossier["recent_pump"] = is_pump
+        dossier["pump_pct"] = pct
     return dossier
 
 def _load_ema_dossier_state():
@@ -3883,14 +3970,20 @@ def _pick_best_ema_for_symbol(dossier_entry):
 
 def _days_for_live_check(tf, ema_period):
     bars_needed = ema_period + 260
-    return max(3, math.ceil(bars_needed * TF_SECONDS.get(tf, 3600) / 86400))
+    src_tf = "1d" if tf == "1w" else tf   # 1w собирается ресемплингом из 1d
+    days = math.ceil(bars_needed * (TF_SECONDS.get(src_tf, 3600) if tf != "1w" else 86400*7) / 86400)
+    return max(3, days)
 
 def _ema_check_symbol_signal(symbol, pick):
     """Смотрит ПОСЛЕДНЮЮ закрытую свечу — новое ли это касание EMA, и если
-    да — в какую сторону (long/short). Возвращает None, если сигнала нет."""
+    да — в какую сторону (long/short). Возвращает None, если сигнала нет.
+    tf="1w" — Gate.io такого интервала не отдаёт, поэтому берём дневные
+    свечи и ресемплим в недельные тем же способом, что и в досье."""
     tf, ema_period = pick["tf"], pick["ema_period"]
     days = _days_for_live_check(tf, ema_period)
-    candles = _fetch_candles(symbol, tf, days)
+    fetch_tf = "1d" if tf == "1w" else tf
+    raw = _fetch_candles(symbol, fetch_tf, days)
+    candles = _resample_to_weekly(raw) if tf == "1w" else raw
     if len(candles) < ema_period + 5: return None
     closes = [c["close"] for c in candles]
     ema_arr = _ema(closes, ema_period)
@@ -3959,8 +4052,8 @@ th{color:#8b949e}
 <h1>&#9889; EMA Bounce Dossier</h1>
 <button onclick="startScan()">Запустить скан (топ-50)</button>
 <div id="status"></div>
-<h3>Досье по монетам (лучшая EMA на каждом ТФ)</h3>
-<table id="dossier"><thead><tr><th>Монета</th><th>ТФ</th><th>Лучшая EMA</th><th>Bounce rate</th></tr></thead><tbody></tbody></table>
+<h3>Досье по монетам (лучшая EMA на каждом ТФ, включая недельный)</h3>
+<table id="dossier"><thead><tr><th>Монета</th><th>Взлёт</th><th>ТФ</th><th>Лучшая EMA</th><th>Bounce rate</th></tr></thead><tbody></tbody></table>
 <h3>Живые сигналы</h3>
 <table id="live"><thead><tr><th>Монета</th><th>ТФ</th><th>EMA</th><th>Направление</th><th>Цена</th><th>Bounce rate</th></tr></thead><tbody></tbody></table>
 <script>
@@ -3976,10 +4069,11 @@ async function refresh(){
     const tbody = document.querySelector('#dossier tbody'); tbody.innerHTML = '';
     for(const [sym, entry] of Object.entries(d.results||{})){
       if(entry.error){ continue; }
+      const pumpLabel = entry.recent_pump ? ('&#128293; +'+entry.pump_pct+'%') : '';
       for(const [tf, tfd] of Object.entries(entry.by_tf||{})){
         if(!tfd.best_ema) continue;
         const tr = document.createElement('tr');
-        tr.innerHTML = `<td>${sym}</td><td>${tf}</td><td>EMA${tfd.best_ema}</td><td>${(tfd.best_bounce_rate*100).toFixed(0)}%</td>`;
+        tr.innerHTML = `<td>${sym}</td><td>${pumpLabel}</td><td>${tf}</td><td>EMA${tfd.best_ema}</td><td>${(tfd.best_bounce_rate*100).toFixed(0)}%</td>`;
         tbody.appendChild(tr);
       }
     }
