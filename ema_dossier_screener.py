@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """
-EMA Bounce Dossier v1.4 (fork of SMC Optimizer v3.52.96)
+EMA Bounce Dossier v1.5 (fork of SMC Optimizer v3.52.96)
+- v1.5: добавлена оценка SL/TP к живым сигналам (запрос: "можно ли оценить
+  где тейк и стоп"). Стоп — за EMA-уровнем на EMA_SIGNAL_SL_ATR=0.6*ATR(14)
+  (если пробили дальше — "отскок" не состоялся, сетап отменён, и это шире
+  допуска касания 0.25*ATR, чтобы не выбивало тем же шумом). Тейк — по
+  фиксированному risk:reward 1:2 от входа/стопа (методичка не даёт формулу
+  тейка, только качественно описывает силу реакции — это ориентир, а не
+  гарантия). Добавлено в возвращаемый sig-dict (sl/tp/rr), в текст
+  Telegram-алерта и в колонки таблицы живых сигналов на веб-странице.
 - v1.4: ФИКС недоделанной лесенки. Методичка (и мой же комментарий к v1.2)
   дословно требует: "если они выстроены по порядку — цена сверху, под ней
   7, ниже 14, 28, 50 — тренд здоровый" — но реализация v1.2 проверяла ТОЛЬКО
@@ -1831,7 +1839,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "1.4"
+APP_VERSION  = "1.5"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3783,6 +3791,13 @@ EMA_DOSSIER_REACT_ATR    = 0.5    # порог "отскок засчитан", 
 EMA_DOSSIER_REACT_BARS   = 5      # за сколько баров после касания ждём реакцию
 EMA_DOSSIER_MIN_TOUCHES  = 5      # меньше касаний — статистика не считается надёжной
 EMA_DOSSIER_FILE = os.path.expanduser("~/ema_dossier_state.json")
+EMA_SIGNAL_SL_ATR = 0.6   # v1.5: стоп за EMA-уровнем, в ATR(14) — если пробили
+                          # уровень настолько, значит "отскок" не состоялся,
+                          # ставим шире touch_atr (0.25), чтобы не выбивало
+                          # тем же шумом, что и сам допуск касания
+EMA_SIGNAL_RR      = 2.0  # v1.5: тейк по risk:reward от входа/стопа (методичка
+                          # не даёт формулу тейка — этот RR консервативная
+                          # оценка, не "истина", ориентир для входа)
 EMA_LADDER_PERIODS = (7, 14, 28)   # v1.2: базовая "быстрая" лесенка
 
 def _ladder_periods_for(ema_period):
@@ -4086,9 +4101,24 @@ def _ema_check_symbol_signal(symbol, pick):
     expected = "up" if side_above else "down"
     if ladder is not None and ladder != expected:
         return None
+    price = candles[i]["close"]
+    # v1.5: оценка стопа и тейка. Стоп — за EMA-уровнем (если пробили дальше
+    # этого — "отскок" не состоялся, сетап отменён), тейк — по фиксированному
+    # risk:reward от входа/стопа. Это ориентир, а не гарантия — методичка
+    # формулу тейка не даёт, только качественно описывает силу реакции.
+    sl_buf = EMA_SIGNAL_SL_ATR * atr_v
+    if direction == "long":
+        sl = ema_v - sl_buf
+        risk = price - sl
+        tp = price + EMA_SIGNAL_RR * risk
+    else:
+        sl = ema_v + sl_buf
+        risk = sl - price
+        tp = price - EMA_SIGNAL_RR * risk
     return {
         "symbol": symbol, "tf": tf, "ema_period": ema_period, "dir": direction,
-        "price": candles[i]["close"], "ema_value": round(ema_v, 6),
+        "price": price, "ema_value": round(ema_v, 6),
+        "sl": round(sl, 6), "tp": round(tp, 6), "rr": EMA_SIGNAL_RR,
         "bounce_rate": pick["bounce_rate"], "bar_t": candles[i]["t"],
     }
 
@@ -4117,7 +4147,8 @@ def _ema_signal_loop():
                 arrow = "🟢 LONG" if sig["dir"] == "long" else "🔴 SHORT"
                 msg = (f"📊 <b>{symbol}</b> {sig['tf']} — {arrow}\n"
                        f"Отскок от EMA{sig['ema_period']} (истор. bounce_rate {sig['bounce_rate']*100:.0f}%)\n"
-                       f"Цена: {sig['price']} | EMA: {sig['ema_value']}")
+                       f"Цена: {sig['price']} | EMA: {sig['ema_value']}\n"
+                       f"SL: {sig['sl']} | TP: {sig['tp']} (RR 1:{sig['rr']:.0f})")
                 _send_alert(msg)
                 olog(f"[ema_live] новый сигнал {symbol} {sig['tf']} EMA{sig['ema_period']} {sig['dir']}")
         except Exception as e:
@@ -4140,7 +4171,7 @@ th{color:#8b949e}
 <button onclick="startScan()">Запустить скан (топ-50)</button>
 <div id="status"></div>
 <h3>&#128276; Живые сигналы</h3>
-<table id="live"><thead><tr><th>Монета</th><th>ТФ</th><th>EMA</th><th>Направление</th><th>Цена</th><th>Bounce rate</th></tr></thead><tbody></tbody></table>
+<table id="live"><thead><tr><th>Монета</th><th>ТФ</th><th>EMA</th><th>Направление</th><th>Цена</th><th>SL</th><th>TP</th><th>Bounce rate</th></tr></thead><tbody></tbody></table>
 <details id="dossierBlock">
 <summary style="cursor:pointer;font-size:15px;margin-top:16px">Досье по монетам (лучшая EMA на каждом ТФ, включая недельный) — <span id="dossierCount">0</span> строк</summary>
 <table id="dossier"><thead><tr><th>Монета</th><th>Взлёт</th><th>ТФ</th><th>Лучшая EMA</th><th>Bounce rate</th></tr></thead><tbody></tbody></table>
@@ -4157,7 +4188,7 @@ async function refresh(){
     for(const [sym, sig] of Object.entries(d2.signals||{})){
       const tr = document.createElement('tr');
       const cls = sig.dir === 'long' ? 'long' : 'short';
-      tr.innerHTML = `<td>${sym}</td><td>${sig.tf}</td><td>EMA${sig.ema_period}</td><td class="${cls}">${sig.dir.toUpperCase()}</td><td>${sig.price}</td><td>${(sig.bounce_rate*100).toFixed(0)}%</td>`;
+      tr.innerHTML = `<td>${sym}</td><td>${sig.tf}</td><td>EMA${sig.ema_period}</td><td class="${cls}">${sig.dir.toUpperCase()}</td><td>${sig.price}</td><td>${sig.sl}</td><td>${sig.tp}</td><td>${(sig.bounce_rate*100).toFixed(0)}%</td>`;
       tbody2.appendChild(tr);
     }
 
