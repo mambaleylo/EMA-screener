@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
 """
+EMA Bounce Dossier v2.6 (fork of SMC Optimizer v3.52.96)
+- v2.6: КРИТИЧНЫЙ ФИКС дублей сигналов — одна и та же монета/ТФ/EMA
+  переоткрывалась почти сразу же (раз в 20-56 минут) с почти идентичной
+  ценой входа, пока предыдущий сигнал ещё висел "открыт". Причина: (1)
+  вход/выход из зоны касания EMA проверялись по одной и той же границе
+  tol — цена у самой границы шумит туда-обратно, каждое пересечение
+  считалось новым касанием (добавлен гистерезис: выход из зоны — только
+  при отходе дальше в EMA_TOUCH_EXIT_MULT раз); (2) единственная защита
+  от дублей (_ema_touch_state) была только в памяти процесса и обнулялась
+  при каждом рестарте (в т.ч. после SIGKILL/OOM) — монета, стоящая в зоне
+  касания в момент рестарта, тут же считалась "свежим" касанием. Добавлена
+  вторая, независимая проверка _ema_has_open_signal — не открывает новый
+  сигнал, если по той же связке symbol/tf/ema_period уже есть незакрытый
+  в истории на диске (рестарт процесса её не обнуляет).
 EMA Bounce Dossier v2.5 (fork of SMC Optimizer v3.52.96)
 - v2.5: диагностика убыточных (SL) сигналов. При создании сигнала теперь
   сохраняется больше контекста входа (atr_v, dist_atr — дистанция касания
@@ -1995,7 +2009,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "2.5"
+APP_VERSION  = "2.6"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3984,12 +3998,6 @@ EMA_WEEKLY_PERIODS  = EMA_TF_PERIODS["1w"]
 PUMP_LOOKBACK_DAYS  = 7
 PUMP_THRESHOLD_PCT  = 20.0   # v1.1: рост за PUMP_LOOKBACK_DAYS дней, помечаем монету "resent pump"
 EMA_DOSSIER_TOUCH_ATR    = 0.25   # допуск касания EMA, в ATR(14)
-EMA_TOUCH_EXIT_MULT      = 1.8    # v2.6: гистерезис — выход из зоны касания
-                                   # засчитывается только дальше, чем
-                                   # tol*EMA_TOUCH_EXIT_MULT, чтобы шум цены
-                                   # прямо на границе tol не плодил дубли
-                                   # сигналов (см. комментарий в
-                                   # _ema_check_symbol_signal)
 EMA_TOUCH_CLOSE_MAX_ATR  = 1.5    # v1.6: КРИТИЧНЫЙ ФИКС — старое "касание"
                                    # проверяло только (low-tol)<=EMA<=(high+tol),
                                    # т.е. EMA попадает в диапазон [low,high] всей
@@ -4557,6 +4565,26 @@ def _days_for_live_check(tf, ema_period):
     return max(3, days)
 
 _ema_touch_state = {}   # v1.8: symbol|tf|ema_period -> сейчас ли цена в зоне касания
+EMA_TOUCH_EXIT_MULT = 1.8   # v2.6: гистерезис выхода из зоны касания (см. _ema_check_symbol_signal)
+
+# v2.6: кэш "какие ключи symbol|tf|ema_period сейчас открыты" — иначе
+# _ema_has_open_signal читал бы ema_signal_history.json с диска на КАЖДУЮ
+# монету при КАЖДОМ опросе (250+ раз в 15 секунд) — дорого и бессмысленно,
+# набор открытых сигналов не может измениться быстрее, чем раз в бар.
+_ema_open_keys_cache = {"at": 0, "keys": set()}
+EMA_OPEN_KEYS_TTL = 10   # секунд — кэш живёт меньше, чем сам EMA_LIVE_POLL_SEC цикл
+
+def _ema_has_open_signal(symbol, tf, ema_period):
+    now = time.time()
+    if now - _ema_open_keys_cache["at"] > EMA_OPEN_KEYS_TTL:
+        with _ema_history_lock:
+            state = _load_ema_history()
+        _ema_open_keys_cache["keys"] = {
+            f"{v['symbol']}|{v['tf']}|{v['ema_period']}"
+            for v in state["items"].values() if v.get("status") == "open"
+        }
+        _ema_open_keys_cache["at"] = now
+    return f"{symbol}|{tf}|{ema_period}" in _ema_open_keys_cache["keys"]
 _ema_ctx_cache   = {}   # v2.3: symbol|tf|ema_period -> кэш контекста с закрытых свечей
 
 def _round_price(v):
@@ -4657,34 +4685,35 @@ def _ema_check_symbol_signal(symbol, pick):
     live_price = _gate_get_price(symbol)
     if not live_price: return None
     ema_v = _ema_live_value(ema_closed, live_price, ema_period)   # v1.8-b: EMA "сейчас"
-    dist = abs(live_price - ema_v)
     tol = EMA_DOSSIER_TOUCH_ATR * atr_v
-    # v2.6: КРИТИЧНЫЙ ФИКС — почти-дубликаты сигналов по одной и той же
-    # монете/ТФ/EMA с похожим entry/SL/TP через 10-30 минут (живой кейс:
-    # MU_USDT 1d EMA28 SHORT, XAU_USDT 4h EMA50 SHORT). Причина: вход и
-    # выход из зоны касания раньше проверялись по ОДНОЙ и той же границе
-    # tol — живая цена (_gate_get_price) естественно дрожит прямо у этой
-    # границы (тики/спред), и на соседних опросах флаг was_in_zone мог
-    # успеть сброситься в False и тут же снова стать True, что засчитывалось
-    # как "новый свежий подход" к линии, хотя цена реально топталась почти
-    # на месте. Гистерезис: ВХОД в зону — по tol (как раньше), а вот сброс
-    # "мы ушли и вернёмся заново" — только когда цена реально отошла дальше,
-    # за tol_exit (заметно шире tol). Шум на границе tol больше не
-    # засчитывается как выход из зоны.
-    tol_exit = tol * EMA_TOUCH_EXIT_MULT
-    touched_now = dist <= tol
-    # v1.8: "заходили ли мы уже в зону этого касания" — фиксируем состояние
-    # ПЕРЕД любыми return, чтобы при выходе из зоны (цена ушла) следующий
-    # реальный подход снова считался свежим касанием
+    dist = abs(live_price - ema_v)
     key = f"{symbol}|{tf}|{ema_period}"
     was_in_zone = _ema_touch_state.get(key, False)
-    if dist > tol_exit:
-        _ema_touch_state[key] = False        # реально ушли из зоны — сброс
-    elif touched_now:
-        _ema_touch_state[key] = True         # внутри узкой зоны касания
-    # иначе (между tol и tol_exit) — состояние не трогаем, "серая зона"
+    # v2.6: КРИТИЧНЫЙ ФИКС дублей — раньше вход/выход из зоны касания
+    # проверялись по ОДНОЙ и той же границе tol. Если цена стоит вплотную
+    # к этой границе (обычный шум тика туда-обратно на пару пунктов), она
+    # пересекает её десятки раз за минуты: каждое "вышли-зашли" считалось
+    # НОВЫМ касанием и плодило почти идентичные сигналы (видно на скринах:
+    # MU_USDT 1d EMA28 SHORT/XAU_USDT 4h EMA50 SHORT и т.п. — одна и та же
+    # сделка переоткрывается раз в 20-30 минут с чуть другой ценой входа).
+    # Теперь выход из зоны требует отойти ЗАМЕТНО дальше (tol * 1.8), а не
+    # на волосок — простой гистерезис вместо одной границы.
+    if was_in_zone:
+        touched_now = dist <= tol * EMA_TOUCH_EXIT_MULT
+    else:
+        touched_now = dist <= tol
+    _ema_touch_state[key] = touched_now
     if not touched_now or was_in_zone:
         return None   # либо не у линии, либо уже отработали этот подход
+    # v2.6: ВТОРОЙ, независимый уровень защиты от дублей — даже если
+    # touch_state выше почему-то даст сбой (например process restart из-за
+    # signal 9 обнуляет весь in-memory _ema_touch_state, и монета, которая
+    # в момент рестарта СТОИТ в зоне касания, снова покажется "свежим
+    # касанием") — не открываем новый сигнал, если по этой же связке
+    # symbol/tf/ema_period уже есть НЕЗАКРЫТЫЙ сигнал в истории. История на
+    # диске, рестарт процесса её не обнуляет.
+    if _ema_has_open_signal(symbol, tf, ema_period):
+        return None
     side_above = ctx["close_i"] > ema_closed   # направление — по последнему закрытию (стабильно)
     direction = "long" if side_above else "short"   # отскок от EMA как от support/resistance
     # v1.4/v1.8-b: подтверждаем ПОЛНОЙ лесенкой (7/14/28 + промежуточные EMA
