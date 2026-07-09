@@ -1,5 +1,21 @@
 #!/usr/bin/env python3
 """
+EMA Bounce Dossier v2.7 (fork of SMC Optimizer v3.52.96)
+- v2.7: реальная автоторговля по EMA-сигналам через Gate.io (переиспользует
+  универсальные _gate_open_position/_gate_close_position/_gate_get_position
+  из SMC-части — они уже принимали любой symbol, ничего не дублировалось).
+  В отличие от SMC (одна позиция разом) — здесь сознательно разрешены
+  МНОЖЕСТВЕННЫЕ одновременные входы по разным монетам: position_pct теперь
+  маржа ОДНОГО входа (по умолчанию 3%), а не общий лимит депозита. Настройки
+  (enabled/position_pct/risk_pct/max_concurrent) хранятся в
+  ~/ema_auto_trade_cfg.json, меняются на ходу через кнопку "⚙️ Автоторговля"
+  на /ema (POST /ema_auto_trade_settings) без рестарта процесса. Перед
+  каждым новым входом — проверка, что по этой монете ещё нет незакрытой
+  реальной сделки (_ema_maybe_open_live_trade) и что на бирже нет
+  "ничейной" позиции вне нашего учёта. При закрытии сигнала по TP/SL —
+  подстраховка (_ema_finalize_live_position): если реальные TP/SL-ордера
+  почему-то не исполнили закрытие на бирже — принудительный маркет-close +
+  алерт, чтобы деньги не остались без присмотра.
 EMA Bounce Dossier v2.6 (fork of SMC Optimizer v3.52.96)
 - v2.6: КРИТИЧНЫЙ ФИКС дублей сигналов — одна и та же монета/ТФ/EMA
   переоткрывалась почти сразу же (раз в 20-56 минут) с почти идентичной
@@ -2009,7 +2025,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "2.6"
+APP_VERSION  = "2.7"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2570,6 +2586,11 @@ def _gate_open_position(symbol, direction, entry_px, sl_px, tp_px, risk_pct, **k
     try:
         sl_pct_val   = abs(entry_px - sl_px) / entry_px * 100.0
         position_pct = kwargs.get("position_pct", risk_pct)  # % депо в маржу
+        # v2.6 (EMA fork): позволяет переиспользовать эту же функцию для
+        # EMA auto-trade, но отличать источник в логах/алертах/на бирже
+        # (иначе всё подписывалось бы "SMC AUTO" даже для сделок EMA-бота).
+        label       = kwargs.get("label", "SMC AUTO")
+        text_prefix = kwargs.get("text_prefix", "smc")
 
         # 1. Баланс
         balance = _gate_get_balance()
@@ -2634,7 +2655,7 @@ def _gate_open_position(symbol, direction, entry_px, sl_px, tp_px, risk_pct, **k
                 "size":     size if is_long else -size,
                 "price":    "0",
                 "tif":      "ioc",
-                "text":     "t-smc-open",
+                "text":     f"t-{text_prefix}-open",
             }, _retries=1)
         except (requests.exceptions.ConnectionError,
                 requests.exceptions.Timeout,
@@ -2674,7 +2695,7 @@ def _gate_open_position(symbol, direction, entry_px, sl_px, tp_px, risk_pct, **k
                     "price":       "0",
                     "tif":         "ioc",
                     "reduce_only": True,
-                    "text":        "t-smc-tp",
+                    "text":        f"t-{text_prefix}-tp",
                 },
                 "trigger": {
                     "strategy_type": 0,
@@ -2692,7 +2713,7 @@ def _gate_open_position(symbol, direction, entry_px, sl_px, tp_px, risk_pct, **k
                     "price":       "0",
                     "tif":         "ioc",
                     "reduce_only": True,
-                    "text":        "t-smc-sl",
+                    "text":        f"t-{text_prefix}-sl",
                 },
                 "trigger": {
                     "strategy_type": 0,
@@ -2724,9 +2745,9 @@ def _gate_open_position(symbol, direction, entry_px, sl_px, tp_px, risk_pct, **k
 
         emoji = "🟢" if is_long else "🔴"
         status = "✅ открыт + TP/SL выставлены" if tp_sl_ok else "⚠️ открыт, TP/SL — см. выше"
-        olog(f"{status}: {symbol} {direction.upper()}")
+        olog(f"{status}: {symbol} {direction.upper()} [{label}]")
         _send_alert(
-            f"{emoji} <b>{symbol} SMC AUTO</b> — {direction.upper()}\n"
+            f"{emoji} <b>{symbol} {label}</b> — {direction.upper()}\n"
             f"Entry ≈ {_fmt_px(entry_px)} | TP {_fmt_px(tp_px)} | SL {_fmt_px(sl_px)}\n"
             f"Size {size} контр | ~{notional:.1f}U | {applied_leverage}×плечо"
             + ("" if tp_sl_ok else "\n⚠️ TP/SL не выставлены — проверь вручную!")
@@ -4337,12 +4358,14 @@ def _save_ema_history(state):
 
 def _ema_history_add(sig):
     """Логирует новый сигнал как 'open', если такого (тот же symbol/tf/ema/
-    свеча) ещё нет в истории."""
+    свеча) ещё нет в истории. Возвращает ключ записи (нужен вызывающему
+    коду для _ema_maybe_open_live_trade — связать реальную сделку именно
+    с этой записью истории)."""
     key = f"{sig['symbol']}|{sig['tf']}|{sig['ema_period']}|{sig['bar_t']}"
     with _ema_history_lock:
         state = _load_ema_history()
         if key in state["items"]:
-            return
+            return key
         item = dict(sig)
         item.update(status="open", opened_at=int(time.time()),
                     closed_at=None, close_price=None)
@@ -4352,6 +4375,7 @@ def _ema_history_add(sig):
             for k, _ in oldest[:len(state["items"]) - EMA_HISTORY_MAX]:
                 del state["items"][k]
         _save_ema_history(state)
+        return key
 
 def _ema_history_update_open():
     """Проходит по всем сигналам со статусом 'open' и проверяет, что
@@ -4419,8 +4443,135 @@ def _ema_history_update_open():
             for key, item in updated.items():
                 state2["items"][key] = item
             _save_ema_history(state2)
+        # v2.7: для сигналов с реальной позицией на бирже (live=True) —
+        # подстраховка ПОСЛЕ сохранения статуса и ВНЕ лока (сетевой вызов).
+        # Gate сам должен закрыть по своим TP/SL price_orders, но если они
+        # почему-то не выставились (см. tp_sl_ok в _gate_open_position) —
+        # позиция всё ещё висит на бирже без присмотра, деньги реально
+        # рискуют остаться в рынке дольше, чем должны.
+        for item in updated.values():
+            if item.get("live"):
+                _ema_finalize_live_position(item)
 
-# ─── v2.5: диагностика убыточных сигналов ──────────────────────────────────
+# ─── v2.7: реальная автоторговля по EMA-сигналам ───────────────────────────
+# В отличие от SMC-оптимизатора (одна позиция разом на один символ/стратегию,
+# auto_trade_state выше) — EMA-сигналы приходят по МНОЖЕСТВУ монет
+# параллельно, и здесь сознательно разрешены множественные одновременные
+# входы. position_pct поэтому по умолчанию небольшой (маржа ОДНОГО входа,
+# не общий лимит депозита) — иначе при 90%+ вторая-третья монета просто не
+# найдёт свободной маржи. _gate_open_position/_gate_close_position/
+# _gate_get_position уже универсальны (принимают любой symbol) — переиспо-
+# льзуем их как есть, ничего не дублируем под EMA.
+EMA_AUTO_TRADE_CFG_FILE = os.path.expanduser("~/ema_auto_trade_cfg.json")
+ema_auto_trade_lock  = threading.Lock()
+ema_auto_trade_state = {
+    "enabled": False,
+    "position_pct":   3.0,   # % депозита в маржу ОДНОГО входа
+    "risk_pct":       5.0,   # риск% на сделку (плечо = risk_pct/SL%)
+    "max_concurrent": None,  # None = без ограничений (сколько хватит маржи)
+    "last_error": "",
+}
+
+def _load_ema_auto_trade_cfg():
+    try:
+        with open(EMA_AUTO_TRADE_CFG_FILE) as f:
+            saved = json.load(f)
+        with ema_auto_trade_lock:
+            for k in ("enabled", "position_pct", "risk_pct", "max_concurrent"):
+                if k in saved:
+                    ema_auto_trade_state[k] = saved[k]
+    except Exception:
+        pass   # первый запуск — файла ещё нет, живём с дефолтами выше
+
+def _save_ema_auto_trade_cfg():
+    try:
+        with ema_auto_trade_lock:
+            snapshot = {k: ema_auto_trade_state[k] for k in
+                        ("enabled", "position_pct", "risk_pct", "max_concurrent")}
+        with open(EMA_AUTO_TRADE_CFG_FILE, "w") as f:
+            json.dump(snapshot, f)
+    except Exception as e:
+        olog(f"[ema_auto_trade] ошибка сохранения настроек: {e}")
+
+def _ema_maybe_open_live_trade(symbol, sig, hist_key):
+    """Вызывается сразу после _ema_history_add для КАЖДОГО нового сигнала.
+    Если автоторговля включена — открывает реальную позицию на Gate.io и
+    помечает соответствующую запись истории live=True (чтобы её статус
+    tp/sl потом сверялся с реальной позицией — см. _ema_finalize_live_position,
+    и чтобы _ema_maybe_open_live_trade не открыл вторую сделку по той же
+    монете, пока первая ещё не закрыта)."""
+    with ema_auto_trade_lock:
+        if not ema_auto_trade_state["enabled"]:
+            return
+        position_pct = ema_auto_trade_state["position_pct"]
+        risk_pct     = ema_auto_trade_state["risk_pct"]
+        max_c        = ema_auto_trade_state["max_concurrent"]
+    with _ema_history_lock:
+        state = _load_ema_history()
+        live_items = [v for v in state["items"].values()
+                      if v.get("status") == "open" and v.get("live")]
+    if any(v["symbol"] == symbol for v in live_items):
+        return   # уже есть незакрытая реальная сделка по этой монете
+    if max_c and len(live_items) >= max_c:
+        olog(f"[ema_auto_trade] лимит {max_c} одновр. позиций достигнут — пропуск {symbol}")
+        return
+    contract = symbol.replace("/", "_").upper()
+    try:
+        existing = _gate_get_position(contract)
+    except Exception as e:
+        olog(f"[ema_auto_trade] {symbol}: не смог проверить биржу перед входом ({e}) — пропуск на этот раз")
+        return
+    if existing:
+        # На бирже уже висит позиция по этой монете вне нашего учёта
+        # (например, руками открытая, или от старой сессии до очистки
+        # истории) — не наваливаем поверх, слишком рискованно гадать.
+        olog(f"[ema_auto_trade] {symbol}: на бирже уже есть позиция вне нашего учёта — пропуск")
+        return
+    pos_info = _gate_open_position(
+        symbol, sig["dir"], sig["price"], sig["sl"], sig["tp"], risk_pct,
+        position_pct=position_pct, label="EMA AUTO", text_prefix="ema",
+    )
+    if not pos_info:
+        return   # _gate_open_position уже залогировала причину и заалертила
+    with _ema_history_lock:
+        state = _load_ema_history()
+        item = state["items"].get(hist_key)
+        if item:
+            item["live"] = True
+            item["live_size"]     = pos_info.get("size")
+            item["live_leverage"] = pos_info.get("leverage")
+            item["live_notional"] = pos_info.get("notional")
+            _save_ema_history(state)
+
+def _ema_finalize_live_position(item):
+    """Подстраховка на момент, когда наш виртуальный расчёт (по live-цене/
+    свечам) решил, что сигнал закрылся по TP/SL. Реальные TP/SL-ордера на
+    Gate.io должны были исполниться сами — но если они по какой-то причине
+    не выставились при открытии (см. tp_sl_ok в _gate_open_position),
+    позиция всё ещё висит на бирже без защиты. Проверяем и, если нужно,
+    закрываем маркетом принудительно — деньги не должны остаться в рынке
+    просто потому что наш учёт уже считает сделку закрытой."""
+    symbol = item["symbol"]
+    contract = symbol.replace("/", "_").upper()
+    try:
+        still_open = _gate_get_position(contract)
+    except Exception as e:
+        olog(f"[ema_auto_trade] {symbol}: не смог проверить биржу после закрытия сигнала: {e}")
+        return
+    if not still_open:
+        return   # штатный случай — Gate уже закрыл по своим TP/SL ордерам
+    olog(f"[ema_auto_trade] ⚠ {symbol}: сигнал закрыт ({item['status']}), но позиция "
+         f"ещё висит на бирже — закрываю маркетом принудительно")
+    try:
+        _gate_close_position(symbol)
+        _send_alert(f"⚠️ <b>{symbol} EMA AUTO</b> — TP/SL-ордер не сработал вовремя, "
+                     f"позиция закрыта маркетом принудительно")
+    except Exception as e:
+        olog(f"[ema_auto_trade] {symbol}: ошибка принудительного закрытия: {e}")
+        _send_alert(f"🚨 <b>{symbol} EMA AUTO</b> — не удалось закрыть позицию "
+                     f"принудительно: {e}. ЗАКРОЙ ВРУЧНУЮ!")
+
+
 # Цель — не просто знать, что сигнал закрылся в минус, а понять ПОЧЕМУ:
 # 1) стоп был слишком тесный (цена выбила SL и тут же развернулась туда,
 #    куда и предполагал сигнал — не хватило "воздуха");
@@ -4810,7 +4961,7 @@ def _ema_signal_loop():
                 with _ema_live_lock:
                     _ema_live_state["signals"][symbol] = sig
                     _ema_live_state["updated_at"] = int(time.time())
-                _ema_history_add(sig)   # v1.7: логируем в историю для отслеживания TP/SL
+                hist_key = _ema_history_add(sig)   # v1.7: логируем в историю для отслеживания TP/SL
                 arrow = "🟢 LONG" if sig["dir"] == "long" else "🔴 SHORT"
                 msg = (f"📊 <b>{symbol}</b> {sig['tf']} — {arrow}\n"
                        f"Отскок от EMA{sig['ema_period']} (истор. bounce_rate {sig['bounce_rate']*100:.0f}%)\n"
@@ -4818,6 +4969,7 @@ def _ema_signal_loop():
                        f"SL: {sig['sl']} | TP: {sig['tp']} (RR 1:{sig['rr']:.0f})")
                 _send_alert(msg)
                 olog(f"[ema_live] новый сигнал {symbol} {sig['tf']} EMA{sig['ema_period']} {sig['dir']}")
+                _ema_maybe_open_live_trade(symbol, sig, hist_key)   # v2.7: реальная автоторговля
             _ema_history_update_open()   # v1.7: проверяем открытые сигналы на TP/SL
             _ema_run_diagnostics()       # v2.5: разбор убыточных сигналов, готовых к анализу
         except Exception as e:
@@ -4853,10 +5005,47 @@ th{color:#8b949e}
 .long{color:#3fb950}.short{color:#f85149}
 .tp{color:#3fb950}.sl{color:#f85149}.open{color:#8b949e}
 #status{color:#8b949e;font-size:13px;margin-top:8px}
+.livebadge{background:#1f6feb;color:#fff;font-size:10px;padding:1px 5px;border-radius:3px;margin-left:4px}
+#atBox{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px 14px;margin-top:10px;font-size:13px}
+#atModal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:50;align-items:center;justify-content:center}
+#atModal .card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:20px;width:min(420px,92vw)}
+#atModal label{display:block;margin-top:12px;font-size:13px;color:#8b949e}
+#atModal input[type=number]{width:100%;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:8px;margin-top:4px;font-size:14px;box-sizing:border-box}
+#atModal .row{display:flex;justify-content:space-between;align-items:center;margin-top:12px}
+.switch{position:relative;width:44px;height:24px}
+.switch input{opacity:0;width:0;height:0}
+.slider{position:absolute;inset:0;background:#30363d;border-radius:24px;cursor:pointer;transition:.2s}
+.slider:before{content:"";position:absolute;height:18px;width:18px;left:3px;bottom:3px;background:#fff;border-radius:50%;transition:.2s}
+input:checked + .slider{background:#238636}
+input:checked + .slider:before{transform:translateX(20px)}
 </style></head><body>
 <h1>&#9889; EMA Bounce Dossier</h1>
 <button onclick="startScan()">Запустить скан (топ-50)</button>
+<button onclick="openSettings()" style="background:#21262d;border:1px solid #30363d">&#9881;&#65039; Автоторговля</button>
 <div id="status"></div>
+<div id="atBox"></div>
+
+<div id="atModal">
+  <div class="card">
+    <h3 style="margin-top:0">&#9881;&#65039; Автоторговля EMA (Gate.io)</h3>
+    <div class="row">
+      <span>Включена</span>
+      <label class="switch"><input type="checkbox" id="atEnabled"><span class="slider"></span></label>
+    </div>
+    <label>Маржа на ОДИН вход, % от депозита</label>
+    <input type="number" id="atPositionPct" step="0.5" min="0.1" max="100">
+    <label>Risk %, влияет на плечо (плечо = risk% / SL%)</label>
+    <input type="number" id="atRiskPct" step="0.5" min="0.1" max="100">
+    <label>Максимум одновременных позиций (пусто = без ограничений)</label>
+    <input type="number" id="atMaxConcurrent" step="1" min="1">
+    <div class="row">
+      <button onclick="closeSettings()" style="background:#21262d;border:1px solid #30363d">Отмена</button>
+      <button onclick="saveSettings()">Сохранить</button>
+    </div>
+    <div id="atMsg" style="margin-top:8px;font-size:12px;color:#f85149"></div>
+  </div>
+</div>
+
 <h3>&#128276; Живые сигналы</h3>
 <table id="live"><thead><tr><th>Монета</th><th>ТФ</th><th>EMA</th><th>Направление</th><th>Цена</th><th>SL</th><th>TP</th><th>Bounce rate</th></tr></thead><tbody></tbody></table>
 <h3>&#128203; История сигналов <span id="histSummary" style="font-weight:normal;font-size:13px;color:#8b949e"></span>
@@ -4875,6 +5064,55 @@ async function clearHistory(){
   if(!confirm('Точно очистить всю историю сигналов? Открытые сделки тоже сотрутся, отменить нельзя.')) return;
   await fetch('/ema_signal_history_clear');
   refresh();
+}
+function openSettings(){ document.getElementById('atModal').style.display='flex'; loadSettingsIntoModal(); }
+function closeSettings(){ document.getElementById('atModal').style.display='none'; }
+async function loadSettingsIntoModal(){
+  try{
+    const r = await fetch('/ema_auto_trade_status'); const d = await r.json();
+    document.getElementById('atEnabled').checked = !!d.enabled;
+    document.getElementById('atPositionPct').value = d.position_pct;
+    document.getElementById('atRiskPct').value = d.risk_pct;
+    document.getElementById('atMaxConcurrent').value = d.max_concurrent ?? '';
+  }catch(e){}
+}
+async function saveSettings(){
+  const msg = document.getElementById('atMsg'); msg.innerText = '';
+  const payload = {
+    enabled: document.getElementById('atEnabled').checked,
+    position_pct: parseFloat(document.getElementById('atPositionPct').value),
+    risk_pct: parseFloat(document.getElementById('atRiskPct').value),
+    max_concurrent: document.getElementById('atMaxConcurrent').value || null,
+  };
+  const r = await fetch('/ema_auto_trade_settings', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+  const d = await r.json();
+  if(!d.ok){ msg.innerText = d.msg || 'Ошибка сохранения'; return; }
+  closeSettings();
+  refreshAutoTradeBox();
+}
+async function closeLivePosition(sym){
+  if(!confirm(`Закрыть реальную позицию ${sym} маркетом прямо сейчас?`)) return;
+  await fetch('/ema_auto_trade_close', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({symbol: sym})});
+  refreshAutoTradeBox();
+}
+async function refreshAutoTradeBox(){
+  try{
+    const r = await fetch('/ema_auto_trade_status'); const d = await r.json();
+    const box = document.getElementById('atBox');
+    const stateTxt = d.enabled ? '🟢 включена' : '⚪ выключена';
+    let rows = (d.live_positions||[]).map(p => {
+      const cls = p.dir === 'long' ? 'long' : 'short';
+      return `<tr><td>${p.symbol}</td><td class="${cls}">${p.dir.toUpperCase()}</td><td>${p.entry}</td><td>${p.sl}</td><td>${p.tp}</td><td>${p.size ?? ''}</td><td>${p.leverage ?? ''}×</td><td>${p.notional ?? ''}U</td>`
+        + `<td><button style="margin:0;padding:3px 8px;font-size:11px;background:#3a1414;border:1px solid #f85149;color:#f85149" onclick="closeLivePosition('${p.symbol}')">Закрыть</button></td></tr>`;
+    }).join('');
+    box.innerHTML = `<b>Автоторговля:</b> ${stateTxt} &nbsp;|&nbsp; `
+      + `маржа/вход ${d.position_pct}% &nbsp;|&nbsp; risk ${d.risk_pct}% &nbsp;|&nbsp; `
+      + `лимит позиций: ${d.max_concurrent ?? 'без ограничений'} &nbsp;|&nbsp; `
+      + `открыто сейчас: <b>${d.live_count}</b>`
+      + (d.balance != null ? ` &nbsp;|&nbsp; баланс: ${d.balance.toFixed(2)}U` : '')
+      + (!d.gate_configured ? ` <span style="color:#f85149">— Gate.io ключи не настроены (/gate_cfg)</span>` : '')
+      + (rows ? `<table style="margin-top:8px"><thead><tr><th>Монета</th><th>Напр.</th><th>Вход</th><th>SL</th><th>TP</th><th>Size</th><th>Плечо</th><th>~USDT</th><th></th></tr></thead><tbody>${rows}</tbody></table>` : '');
+  }catch(e){}
 }
 function fmtAgo(ts){
   const s = Math.floor(Date.now()/1000) - ts;
@@ -4901,7 +5139,8 @@ async function refresh(){
     for(const it of (d3.items||[])){
       const tr = document.createElement('tr');
       const dcls = it.dir === 'long' ? 'long' : 'short';
-      tr.innerHTML = `<td>${it.symbol}</td><td>${it.tf}</td><td>EMA${it.ema_period}</td><td class="${dcls}">${it.dir.toUpperCase()}</td><td>${it.price}</td><td>${it.sl}</td><td>${it.tp}</td><td class="${it.status}">${statusLabel[it.status]||it.status}</td><td>${fmtAgo(it.opened_at)}</td>`;
+      const liveBadge = it.live ? '<span class="livebadge">LIVE</span>' : '';
+      tr.innerHTML = `<td>${it.symbol}</td><td>${it.tf}</td><td>EMA${it.ema_period}</td><td class="${dcls}">${it.dir.toUpperCase()}</td><td>${it.price}</td><td>${it.sl}</td><td>${it.tp}</td><td class="${it.status}">${statusLabel[it.status]||it.status}${liveBadge}</td><td>${fmtAgo(it.opened_at)}</td>`;
       tbody3.appendChild(tr);
     }
 
@@ -4931,6 +5170,7 @@ async function refresh(){
   }catch(e){}
 }
 refresh(); setInterval(refresh, 5000);
+refreshAutoTradeBox(); setInterval(refreshAutoTradeBox, 5000);
 </script></body></html>"""
 # ─── конец live EMA-сигналов ────────────────────────────────────────────────
 # ─── конец EMA-bounce dossier engine ────────────────────────────────────────
@@ -10065,6 +10305,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
             winrate = round(tp_n / len(closed) * 100, 1) if closed else None
             self._json({"items": items, "closed": len(closed), "tp": tp_n,
                          "sl": len(closed) - tp_n, "winrate": winrate})
+        elif self.path == "/ema_auto_trade_status":
+            with ema_auto_trade_lock:
+                cfg = dict(ema_auto_trade_state)
+            with _ema_history_lock:
+                state = _load_ema_history()
+            live_items = [v for v in state["items"].values()
+                          if v.get("status") == "open" and v.get("live")]
+            balance = None
+            try:
+                balance = _gate_get_balance()
+            except Exception:
+                pass
+            cfg["live_count"] = len(live_items)
+            cfg["live_positions"] = [
+                {"symbol": v["symbol"], "dir": v["dir"], "entry": v["price"],
+                 "sl": v["sl"], "tp": v["tp"], "size": v.get("live_size"),
+                 "leverage": v.get("live_leverage"), "notional": v.get("live_notional"),
+                 "opened_at": v["opened_at"]}
+                for v in live_items
+            ]
+            cfg["balance"] = balance
+            cfg["gate_configured"] = bool(GATE_KEY and GATE_SECRET)
+            self._json(cfg)
         elif self.path == "/ema_signal_history_clear":
             # v2.1: кнопка очистки истории сигналов — стирает все записи
             # (открытые тоже, чтобы не оставались "осиротевшие" open-статусы
@@ -10513,6 +10776,50 @@ class Handler(http.server.BaseHTTPRequestHandler):
             _save_gate_cfg()
             self._json({"ok": True})
 
+        elif self.path == "/ema_auto_trade_settings":
+            # v2.7: настройки автоторговли EMA — можно менять на ходу, без
+            # рестарта потока (ema_auto_trade_state читается "на лету" из
+            # _ema_maybe_open_live_trade на каждый новый сигнал).
+            try:
+                if "enabled" in body:
+                    enabled = bool(body["enabled"])
+                    if enabled and not (GATE_KEY and GATE_SECRET):
+                        self._json({"ok": False, "msg": "Не настроены Gate.io ключи (/gate_cfg)"}); return
+                    with ema_auto_trade_lock:
+                        ema_auto_trade_state["enabled"] = enabled
+                if "position_pct" in body:
+                    pct = float(body["position_pct"])
+                    assert 0.1 <= pct <= 100.0, f"position_pct вне диапазона: {pct}"
+                    with ema_auto_trade_lock:
+                        ema_auto_trade_state["position_pct"] = pct
+                if "risk_pct" in body:
+                    rp = float(body["risk_pct"])
+                    assert 0.1 <= rp <= 100.0, f"risk_pct вне диапазона: {rp}"
+                    with ema_auto_trade_lock:
+                        ema_auto_trade_state["risk_pct"] = rp
+                if "max_concurrent" in body:
+                    mc = body["max_concurrent"]
+                    mc = int(mc) if mc not in (None, "", "null") else None
+                    with ema_auto_trade_lock:
+                        ema_auto_trade_state["max_concurrent"] = mc
+            except Exception as e:
+                self._json({"ok": False, "msg": f"Некорректные параметры: {e}"}); return
+            _save_ema_auto_trade_cfg()
+            with ema_auto_trade_lock:
+                olog(f"[ema_auto_trade] настройки обновлены: {dict(ema_auto_trade_state)}")
+            self._json({"ok": True})
+
+        elif self.path == "/ema_auto_trade_close":
+            # Ручное принудительное закрытие одной реальной позиции монеты
+            sym = (body.get("symbol") or "").strip()
+            if not sym:
+                self._json({"ok": False, "msg": "Не указан symbol"}); return
+            try:
+                _gate_close_position(sym)
+                self._json({"ok": True})
+            except Exception as e:
+                self._json({"ok": False, "msg": str(e)})
+
         elif self.path == "/auto_trade_start":
             global _auto_trade_thread
             sym      = body.get("sym",      "BTC_USDT")
@@ -10622,6 +10929,7 @@ def main():
     # Сохранённые через UI настройки имеют приоритет над env (если есть файл)
     _load_alert_cfg()
     _load_gate_cfg()
+    _load_ema_auto_trade_cfg()
     _load_fitness_weights()
     _load_last_symbol()
     threading.Thread(target=_watchdog_loop, daemon=True).start()
