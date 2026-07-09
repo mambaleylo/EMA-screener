@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
 """
+EMA Bounce Dossier v2.5 (fork of SMC Optimizer v3.52.96)
+- v2.5: диагностика убыточных (SL) сигналов. При создании сигнала теперь
+  сохраняется больше контекста входа (atr_v, dist_atr — дистанция касания
+  EMA в ATR, лесенка EMA, число касаний). При закрытии по SL сигнал
+  помечается "на разбор" и через EMA_DIAG_WAIT_BARS баров после закрытия
+  анализируется постфактум (_ema_run_diagnostics/_ema_diagnose_one):
+  дошла бы цена до TP, если бы не стоп (стоп был тесный) — или продолжила
+  идти против сигнала (направление было неверным) — или боковик/шум.
+  Полная запись пишется в ~/ema_signal_diagnostics.jsonl, короткий вердикт
+  дублируется в основной лог через olog. Не считается сразу в момент SL —
+  цена ещё в движении, судить рано.
 EMA Bounce Dossier v2.4 (fork of SMC Optimizer v3.52.96)
 - v2.4: КРИТИЧНЫЙ ФИКС по живому кейсу — PEPE_USDT LONG, entry 0.000002616,
   SL и TP ОБА показывали 0.000003 (одинаковые!), сделка закрылась по такому
@@ -1984,7 +1995,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "2.4"
+APP_VERSION  = "2.5"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4377,6 +4388,14 @@ def _ema_history_update_open():
                 item["status"] = outcome
                 item["closed_at"] = int(time.time())
                 item["close_price"] = outcome_price
+                # v2.5: убыточные сигналы ставим "на разбор" — сразу в
+                # момент срабатывания SL ещё нельзя сказать, был ли стоп
+                # преждевременным (цена дальше развернулась и ушла бы в
+                # TP) или направление сигнала было в принципе неверным
+                # (цена продолжила против). Ответ появляется только через
+                # время — см. _ema_run_diagnostics.
+                if outcome == "sl":
+                    item["diag_status"] = "pending"
                 updated[key] = item
         except Exception as e:
             olog(f"[ema_history] статус {item.get('symbol')} ошибка: {e}")
@@ -4384,6 +4403,132 @@ def _ema_history_update_open():
         with _ema_history_lock:
             state2 = _load_ema_history()
             for key, item in updated.items():
+                state2["items"][key] = item
+            _save_ema_history(state2)
+
+# ─── v2.5: диагностика убыточных сигналов ──────────────────────────────────
+# Цель — не просто знать, что сигнал закрылся в минус, а понять ПОЧЕМУ:
+# 1) стоп был слишком тесный (цена выбила SL и тут же развернулась туда,
+#    куда и предполагал сигнал — не хватило "воздуха");
+# 2) сетап был в принципе неверный (цена после SL продолжила идти против
+#    направления сигнала — отскока не было вообще, тренд пробил уровень);
+# 3) ничего особенного — шум/боковик, MFE до стопа был около нуля.
+# Разбор делается не сразу в момент срабатывания SL (цена ещё в движении —
+# рано о чём-то судить), а через EMA_DIAG_WAIT_BARS баров ПОСЛЕ закрытия,
+# когда уже видно, куда пошла цена дальше.
+EMA_DIAG_FILE          = os.path.expanduser("~/ema_signal_diagnostics.jsonl")
+EMA_DIAG_WAIT_BARS     = 20   # ждать столько баров после SL, прежде чем разбирать
+EMA_DIAG_LOOKBACK_PAD  = 5    # запас баров сверху при фетче свечей
+_ema_diag_lock = threading.Lock()
+
+def _ema_diag_log_write(record):
+    try:
+        with _ema_diag_lock:
+            with open(EMA_DIAG_FILE, "a") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        olog(f"[ema_diag] ошибка записи лога: {e}")
+
+def _ema_diagnose_one(item):
+    """Разбирает один закрытый по SL сигнал: смотрит на свечи от входа
+    (bar_t) до сейчас, вычисляет MFE до стопа (насколько близко подходило
+    к TP перед тем, как выбило) и что случилось ПОСЛЕ стопа — вернулась ли
+    цена в сторону сигнала (стоп был тесный) или продолжила против
+    (направление было неверным). Возвращает dict-запись для лога или None,
+    если данных ещё недостаточно (сработала защита от гонки — теоретически
+    не должно случаться, т.к. вызывающий код уже ждёт EMA_DIAG_WAIT_BARS)."""
+    symbol, tf, ema_period = item["symbol"], item["tf"], item["ema_period"]
+    direction = item["dir"]
+    entry, sl, tp = item["price"], item["sl"], item["tp"]
+    bar_t, closed_at = item["bar_t"], item["closed_at"]
+    fetch_tf = "1d" if tf == "1w" else tf
+    span_sec = max(1, int(time.time()) - bar_t)
+    days = math.ceil(span_sec / 86400) + EMA_DIAG_LOOKBACK_PAD
+    raw = _fetch_candles(symbol, fetch_tf, days)
+    candles = _resample_to_weekly(raw) if tf == "1w" else raw
+    if not candles:
+        return None
+    during = [c for c in candles if bar_t <= c["t"] < closed_at]
+    after  = [c for c in candles if c["t"] >= closed_at]
+    if len(after) < EMA_DIAG_WAIT_BARS:
+        return None   # ещё рано — не набралось баров после закрытия
+    risk = abs(entry - sl)
+    if direction == "long":
+        mfe = max([c["high"] for c in during], default=entry) - entry
+        post_high = max(c["high"] for c in after[:EMA_DIAG_WAIT_BARS])
+        post_low  = min(c["low"]  for c in after[:EMA_DIAG_WAIT_BARS])
+        would_hit_tp   = post_high >= tp
+        continued_down = post_low <= sl - risk   # ушла ещё на риск дальше стопа
+    else:
+        mfe = entry - min([c["low"] for c in during], default=entry)
+        post_high = max(c["high"] for c in after[:EMA_DIAG_WAIT_BARS])
+        post_low  = min(c["low"]  for c in after[:EMA_DIAG_WAIT_BARS])
+        would_hit_tp   = post_low <= tp
+        continued_down = post_high >= sl + risk
+    mfe_r_atr = round(mfe / item["atr_v"], 2) if item.get("atr_v") else None
+    bars_to_sl = len(during)
+    if would_hit_tp:
+        verdict = ("стоп преждевременный: цена выбила SL, но в следующие "
+                    f"{EMA_DIAG_WAIT_BARS} баров всё же дошла до уровня TP — "
+                    "направление было угадано верно, не хватило запаса по стопу")
+    elif continued_down:
+        verdict = ("сетап был неверным: после SL цена продолжила движение "
+                    "против сигнала ещё как минимум на такой же риск — "
+                    "отскока от EMA не было, уровень был пробит трендом")
+    elif mfe_r_atr is not None and mfe_r_atr < 0.15:
+        verdict = ("шум/боковик: цена почти не двигалась в сторону сигнала "
+                    "ни до, ни после стопа — касание EMA было случайным, "
+                    "не реальным отскоком")
+    else:
+        verdict = ("смешанная картина: небольшое движение в пользу сигнала "
+                    "было, но недостаточное ни для TP, ни для явного "
+                    "продолжения тренда против — типичный шумовой стоп")
+    record = {
+        "ts": int(time.time()), "symbol": symbol, "tf": tf,
+        "ema_period": ema_period, "dir": direction,
+        "entry": entry, "sl": sl, "tp": tp,
+        "bounce_rate": item.get("bounce_rate"), "touches": item.get("touches"),
+        "dist_atr_at_entry": item.get("dist_atr"), "ladder_at_entry": item.get("ladder"),
+        "bars_to_sl": bars_to_sl,
+        "mfe_atr_before_sl": mfe_r_atr,
+        "post_sl_hit_tp": would_hit_tp,
+        "post_sl_continued_against": continued_down,
+        "verdict": verdict,
+    }
+    return record
+
+def _ema_run_diagnostics():
+    """Проходит по истории, ищет закрытые в минус сигналы с diag_status
+    'pending', для которых уже прошло достаточно времени (EMA_DIAG_WAIT_BARS
+    баров их же ТФ), и разбирает их. Пишет короткую сводку в olog (видно
+    сразу в основном логе) и полную запись — в EMA_DIAG_FILE."""
+    with _ema_history_lock:
+        state = _load_ema_history()
+    pending = [(k, v) for k, v in state["items"].items()
+               if v.get("status") == "sl" and v.get("diag_status") == "pending"]
+    if not pending:
+        return
+    done = {}
+    for key, item in pending:
+        tf_sec = TF_SECONDS.get("1d" if item["tf"] == "1w" else item["tf"], 3600)
+        if int(time.time()) - item["closed_at"] < EMA_DIAG_WAIT_BARS * tf_sec:
+            continue   # ещё не прошло достаточно времени
+        try:
+            record = _ema_diagnose_one(item)
+        except Exception as e:
+            olog(f"[ema_diag] {item.get('symbol')} ошибка разбора: {e}")
+            continue
+        if record is None:
+            continue
+        _ema_diag_log_write(record)
+        olog(f"[ema_diag] {record['symbol']} {record['tf']} EMA{record['ema_period']} "
+             f"{record['dir']} SL → {record['verdict']}")
+        item["diag_status"] = "done"
+        done[key] = item
+    if done:
+        with _ema_history_lock:
+            state2 = _load_ema_history()
+            for key, item in done.items():
                 state2["items"][key] = item
             _save_ema_history(state2)
 
@@ -4572,11 +4717,20 @@ def _ema_check_symbol_signal(symbol, pick):
         return None
     if direction == "short" and not (tp_r < price < sl_r):
         return None
+    # v2.5: доп. контекст входа для диагностики убыточных сигналов
+    # (_ema_run_diagnostics) — atr_v/dist_atr/лесенка/touches. Без этого
+    # разбор проигрышей после факта невозможен: не восстановить, насколько
+    # далеко цена была от EMA в момент касания и куда смотрела лесенка.
+    dist_atr = round(abs(live_price - ema_v) / atr_v, 3) if atr_v else None
+    ladder_snapshot = {str(p): _round_price(v) for p, v in
+                        zip(ctx["ladder_periods"], ladder_vals_live)}
     return {
         "symbol": symbol, "tf": tf, "ema_period": ema_period, "dir": direction,
         "price": price, "ema_value": ema_r,
         "sl": sl_r, "tp": tp_r, "rr": EMA_SIGNAL_RR,
         "bounce_rate": pick["bounce_rate"], "bar_t": int(time.time()),
+        "touches": pick.get("touches"), "atr_v": _round_price(atr_v),
+        "dist_atr": dist_atr, "ladder": ladder_snapshot,
     }
 
 def _ema_signal_loop():
@@ -4612,6 +4766,7 @@ def _ema_signal_loop():
                 _send_alert(msg)
                 olog(f"[ema_live] новый сигнал {symbol} {sig['tf']} EMA{sig['ema_period']} {sig['dir']}")
             _ema_history_update_open()   # v1.7: проверяем открытые сигналы на TP/SL
+            _ema_run_diagnostics()       # v2.5: разбор убыточных сигналов, готовых к анализу
         except Exception as e:
             olog(f"[ema_live] ошибка цикла: {e}")
         # v2.2: этот цикл живёт часами/сутками без единого respawn'а — если
