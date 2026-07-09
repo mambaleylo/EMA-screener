@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 """
+EMA Bounce Dossier v3.0.1 (fork of SMC Optimizer v3.52.96)
+- v3.0.1: убрал внутренний вертикальный скролл у карточек таблиц
+  (max-height:520px + overflow-y:auto) — раз списки истории/досье теперь и
+  так постраничные (15/20 строк), лишний скролл внутри карточки был не
+  нужен, только мешал. Горизонтальный overflow-x:auto оставлен (пригодится
+  на узких экранах).
 EMA Bounce Dossier v3.0 (fork of SMC Optimizer v3.52.96)
 - v3.0: редизайн /ema. Таблицы обёрнуты в карточки-секции (единый визуальный
   язык с модалками Автоторговли/Алертов), заголовки таблиц залипающие,
@@ -2083,7 +2089,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.0"
+APP_VERSION  = "3.0.1"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -5089,7 +5095,7 @@ input:checked + .slider:before{transform:translateX(20px)}
 .filter-row{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap}
 .filter-btn{background:#21262d;border:1px solid #30363d;color:#8b949e;padding:4px 12px;font-size:12px;margin:0;border-radius:14px;cursor:pointer}
 .filter-btn.active{background:#1f6feb;border-color:#1f6feb;color:#fff}
-.table-scroll{overflow-x:auto;margin-top:10px;max-height:520px;overflow-y:auto;border-radius:6px}
+.table-scroll{overflow-x:auto;margin-top:10px;border-radius:6px}
 .status-pill{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;white-space:nowrap}
 .status-pill.tp{background:#0d2818;color:#3fb950;border:1px solid #23643a}
 .status-pill.sl{background:#2a0f0f;color:#f85149;border:1px solid #6e2323}
@@ -5160,7 +5166,7 @@ details[open] summary:before{content:"▾ "}
 
 <div class="section-card">
   <h3>&#128276; Живые сигналы</h3>
-  <div class="table-scroll" style="max-height:none">
+  <div class="table-scroll">
     <table id="live"><thead><tr><th>Монета</th><th>ТФ</th><th>EMA</th><th>Направление</th><th>Цена</th><th>SL</th><th>TP</th><th>Bounce rate</th></tr></thead><tbody></tbody></table>
   </div>
 </div>
