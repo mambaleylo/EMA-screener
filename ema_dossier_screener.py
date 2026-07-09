@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 """
+EMA Bounce Dossier v2.1 (fork of SMC Optimizer v3.52.96)
+- v2.1: кнопка очистки истории сигналов в UI (запрос: "добавь кнопку
+  очистки истории сигналов"). Новый эндпоинт GET /ema_signal_history_clear
+  — стирает все записи истории целиком, включая ещё открытые (иначе
+  остались бы "осиротевшие" open-статусы, которые нечем закрыть после
+  очистки). Кнопка с подтверждением (confirm), т.к. действие необратимо.
 EMA Bounce Dossier v2.0 (fork of SMC Optimizer v3.52.96)
 - v2.0: КРИТИЧНОЕ несоответствие методичке — периоды EMA не были привязаны
   к таймфрейму вообще. До этой версии один и тот же универсальный набор
@@ -1924,7 +1930,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "2.0"
+APP_VERSION  = "2.1"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4475,7 +4481,8 @@ th{color:#8b949e}
 <div id="status"></div>
 <h3>&#128276; Живые сигналы</h3>
 <table id="live"><thead><tr><th>Монета</th><th>ТФ</th><th>EMA</th><th>Направление</th><th>Цена</th><th>SL</th><th>TP</th><th>Bounce rate</th></tr></thead><tbody></tbody></table>
-<h3>&#128203; История сигналов <span id="histSummary" style="font-weight:normal;font-size:13px;color:#8b949e"></span></h3>
+<h3>&#128203; История сигналов <span id="histSummary" style="font-weight:normal;font-size:13px;color:#8b949e"></span>
+<button onclick="clearHistory()" style="margin-left:10px;padding:2px 10px;font-size:12px;background:#3a1414;border:1px solid #f85149;color:#f85149;border-radius:4px;cursor:pointer">Очистить историю</button></h3>
 <table id="history"><thead><tr><th>Монета</th><th>ТФ</th><th>EMA</th><th>Направление</th><th>Вход</th><th>SL</th><th>TP</th><th>Статус</th><th>Когда</th></tr></thead><tbody></tbody></table>
 <details id="dossierBlock">
 <summary style="cursor:pointer;font-size:15px;margin-top:16px">Досье по монетам (лучшая EMA на каждом ТФ, включая недельный) — <span id="dossierCount">0</span> строк</summary>
@@ -4485,6 +4492,11 @@ th{color:#8b949e}
 async function startScan(){
   const r = await fetch('/ema_dossier_start'); const d = await r.json();
   document.getElementById('status').innerText = d.msg;
+}
+async function clearHistory(){
+  if(!confirm('Точно очистить всю историю сигналов? Открытые сделки тоже сотрутся, отменить нельзя.')) return;
+  await fetch('/ema_signal_history_clear');
+  refresh();
 }
 function fmtAgo(ts){
   const s = Math.floor(Date.now()/1000) - ts;
@@ -9675,6 +9687,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             winrate = round(tp_n / len(closed) * 100, 1) if closed else None
             self._json({"items": items, "closed": len(closed), "tp": tp_n,
                          "sl": len(closed) - tp_n, "winrate": winrate})
+        elif self.path == "/ema_signal_history_clear":
+            # v2.1: кнопка очистки истории сигналов — стирает все записи
+            # (открытые тоже, чтобы не оставались "осиротевшие" open-статусы
+            # без возможности их закрыть после очистки)
+            with _ema_history_lock:
+                _save_ema_history({"items": {}})
+            olog("[ema_history] история сигналов очищена вручную")
+            self._json({"ok": True})
         elif self.path == "/ema_dossier_start":
             with _ema_dossier_lock:
                 if _ema_dossier_running["v"]:
