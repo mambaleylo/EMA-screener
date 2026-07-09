@@ -1,5 +1,21 @@
 #!/usr/bin/env python3
 """
+EMA Bounce Dossier v2.9.2 (fork of SMC Optimizer v3.52.96)
+- v2.9.2: два бага из-за неполного переноса из SMC Optimizer.
+  1) /alert_cfg (POST) на бэкенде безусловно перезаписывал HC_URL
+     (`HC_URL = body.get("hc_url") or ""`), даже если в запросе такого поля
+     вообще нет. У EMA-модалки Алертов нет полей watchdog/hc_url (в отличие
+     от полной формы в SMC Optimizer) — значит, при каждом сохранении
+     алертов со страницы /ema сохранённый heartbeat-URL (healthchecks.io)
+     тихо стирался. Поле теперь обновляется только если явно передано в
+     теле запроса — как уже было сделано для watchdog_enabled/timeout.
+  2) testAlert() в модалке Алертов вызывал saveAlertSettings(), которая
+     закрывает модалку при успехе (это верно для кнопки "Сохранить", но не
+     для теста) — в оригинале SMC Optimizer алерты вообще не в модалке, а в
+     постоянно видимой карточке сайдбара, и там для теста используется
+     отдельная не закрывающая ничего saveAlertCfgSync(). Добавлена
+     аналогичная saveAlertSettingsSync() — теперь результат теста
+     ("✅ отправлено" / ошибка) реально виден в открытой модалке.
 EMA Bounce Dossier v2.9.1 (fork of SMC Optimizer v3.52.96)
 - v2.9.1: фикс кнопки "Тест" в модалке Алертов — testAlert() слал
   fetch('/alert_test') без метода (т.е. GET), а этот роут зарегистрирован
@@ -2053,7 +2069,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "2.9.1"
+APP_VERSION  = "2.9.2"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -5193,9 +5209,19 @@ async function saveAlertSettings(){
   if(!d.ok){ msg.innerText = d.msg || 'Ошибка сохранения'; return; }
   closeAlertSettings();
 }
+async function saveAlertSettingsSync(){
+  const payload = {
+    tg_token: document.getElementById('alTgToken').value.trim(),
+    tg_chat:  document.getElementById('alTgChat').value.trim(),
+    ntfy_url: document.getElementById('alNtfyUrl').value.trim(),
+  };
+  const r = await fetch('/alert_cfg', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+  return r.json();
+}
 async function testAlert(){
   const msg = document.getElementById('alertMsg'); msg.style.color = '#8b949e'; msg.innerText = 'Отправляю...';
-  await saveAlertSettings();
+  const saved = await saveAlertSettingsSync();
+  if(!saved.ok){ msg.style.color = '#f85149'; msg.innerText = saved.msg || 'Ошибка сохранения'; return; }
   const r = await fetch('/alert_test', {method:'POST'}); const d = await r.json();
   msg.style.color = d.ok ? '#3fb950' : '#f85149';
   msg.innerText = d.ok ? '✅ Тестовое сообщение отправлено' : ('Ошибка: ' + (d.error||''));
@@ -10777,7 +10803,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             TG_TOKEN = (body.get("tg_token") or "").strip()
             TG_CHAT  = (body.get("tg_chat")  or "").strip()
             NTFY_URL = (body.get("ntfy_url") or "").strip()
-            HC_URL   = (body.get("hc_url")   or "").strip()
+            if "hc_url" in body:
+                HC_URL = (body.get("hc_url") or "").strip()
             if "watchdog_enabled" in body:
                 WATCHDOG_ENABLED = bool(body.get("watchdog_enabled"))
             if "watchdog_timeout_min" in body:
