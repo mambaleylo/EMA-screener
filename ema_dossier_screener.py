@@ -1,5 +1,23 @@
 #!/usr/bin/env python3
 """
+EMA Bounce Dossier v2.3 (fork of SMC Optimizer v3.52.96)
+- v2.3: КРИТИЧНЫЙ ФИКС по наблюдению пользователя — "сигналы приходят
+  в кратные ТФ моменты времени, работает ли лайв свеча?". Причина:
+  EMA_LIVE_POLL_SEC=60с — а TF_SECONDS["1m"]=60с (скальпинг-ТФ добавлен в
+  v2.0), т.е. опрос совпадал по длительности с самим баром 1:1 — живая
+  цена по факту проверялась примерно РАЗ ЗА БАР, ровно на его границе.
+  Плюс сам _fetch_candles (весь исторический массив, от 1 дня до 400+ на
+  медленных ТФ) дёргался на КАЖДОМ опросе впустую — между закрытиями бара
+  он физически не может вернуть ничего нового. Добавлен _ema_get_closed_ctx
+  — кэширует контекст с закрытых свечей (ema_closed/atr_v/лесенка) и
+  пересчитывает его ТОЛЬКО когда по времени должен был закрыться новый бар
+  (без похода в API, чистая арифметика от TF_SECONDS), а живую цену
+  (_gate_get_price, дешёвый тикер-запрос) можно опрашивать чаще без
+  лишней нагрузки на candlesticks-эндпоинт. EMA_LIVE_POLL_SEC снижен с 60
+  до 15с — теперь на 1m-баре ~4 живых замера цены за бар вместо одного,
+  на медленных ТФ (4h/1d/1w) нагрузка на API наоборот УМЕНЬШИЛАСЬ (фетч
+  раз в бар вместо раз в 60с). RSS-лог в _ema_signal_loop (v2.2)
+  скорректирован на новую частоту (раз в ~120 итераций = ~30 минут).
 EMA Bounce Dossier v2.2 (fork of SMC Optimizer v3.52.96)
 - v2.2: расследование повторяющегося "Process completed (signal 9)" в
   Termux. Прошёлся по всей EMA-цепочке (треды, кэши, subprocess-вызовы) —
@@ -1949,7 +1967,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "2.2"
+APP_VERSION  = "2.3"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4243,7 +4261,13 @@ def _run_ema_dossier_scan(top_n=50):
 # исключительно вручную через старую кнопку в UI, и с текущим режимом никак
 # не связана.
 EMA_LIVE_FILE      = os.path.expanduser("~/ema_live_signals.json")
-EMA_LIVE_POLL_SEC  = 60
+# v2.3: было 60с — совпадало 1:1 с длиной бара на tf="1m" (TF_SECONDS["1m"]=60,
+# добавлен в v2.0), т.е. живая цена по факту проверялась примерно РАЗ ЗА БАР,
+# ровно на его границе ("сигналы приходят кратно ТФ"). Теперь дорогой фетч
+# свечей кэшируется по бару (см. _ema_get_closed_ctx) и не зависит от частоты
+# опроса — можно опрашивать live-цену (дешёвый тикер-запрос) заметно чаще,
+# не наваливая лишнюю нагрузку на candlesticks-эндпоинт.
+EMA_LIVE_POLL_SEC  = 15
 _ema_live_lock  = threading.Lock()
 _ema_live_state = {"signals": {}, "updated_at": 0}   # symbol -> last signal dict
 
@@ -4365,6 +4389,7 @@ def _days_for_live_check(tf, ema_period):
     return max(3, days)
 
 _ema_touch_state = {}   # v1.8: symbol|tf|ema_period -> сейчас ли цена в зоне касания
+_ema_ctx_cache   = {}   # v2.3: symbol|tf|ema_period -> кэш контекста с закрытых свечей
 
 def _ema_live_value(prev_ema, live_price, period):
     """v1.8-b: экстраполирует EMA на текущий момент — смешивает последнее
@@ -4381,6 +4406,53 @@ def _ema_live_value(prev_ema, live_price, period):
     k = 2.0 / (period + 1)
     return live_price * k + prev_ema * (1 - k)
 
+def _ema_get_closed_ctx(symbol, tf, ema_period):
+    """v2.3: КРИТИЧНЫЙ ФИКС — раньше _fetch_candles (весь исторический массив,
+    от 1 дня до 400+ дней в зависимости от ТФ) дёргался КАЖДЫЙ опрос
+    (EMA_LIVE_POLL_SEC), хотя между закрытиями бара он физически не может
+    вернуть ничего нового — closed-свечи не меняются, пока текущий бар не
+    закрылся. Для tf="1m" (скальпинг, добавлен в v2.0) это совпадало по
+    длительности с самим опросом (60с=60с) — то есть "живая" цена
+    фактически проверялась примерно РАЗ ЗА БАР, ровно на его границе:
+    отсюда наблюдение "сигналы приходят кратно ТФ". Теперь контекст с
+    закрытых свечей (ema_closed/atr_v/close лестницы) кэшируется и
+    пересчитывается только когда реально должен был закрыться новый бар
+    (по времени, без лишнего похода в API) — а live-цену (_gate_get_price,
+    дешёвый тикер-запрос) можно опрашивать заметно чаще, не наваливая
+    лишнюю нагрузку на candlesticks-эндпоинт и не пересчитывая EMA/ATR по
+    сотням баров впустую на каждый опрос."""
+    key = f"{symbol}|{tf}|{ema_period}"
+    now = time.time()
+    cached = _ema_ctx_cache.get(key)
+    if cached and now < cached["next_close_t"]:
+        return cached
+    days = _days_for_live_check(tf, ema_period)
+    fetch_tf = "1d" if tf == "1w" else tf
+    raw = _fetch_candles(symbol, fetch_tf, days)
+    candles = _resample_to_weekly(raw) if tf == "1w" else raw
+    if len(candles) < ema_period + 5:
+        return None
+    closes = [c["close"] for c in candles]
+    ema_arr = _ema(closes, ema_period)
+    atr_arr = _atr(candles, 14)
+    i = len(candles) - 1
+    ema_closed, atr_v = ema_arr[i], atr_arr[i]
+    if ema_closed is None or not atr_v:
+        return None
+    ladder_periods = _ladder_periods_for(tf, ema_period)
+    ladder_ema_closed = [_ema(closes, p)[i] for p in ladder_periods]
+    interval_sec = TF_SECONDS.get("1d" if tf == "1w" else tf, 3600)
+    # +2с запас на задержку API/рассинхрон часов — не критично, следующий
+    # опрос всё равно подтянет актуальные данные, если бар уже закрылся
+    next_close_t = candles[i]["t"] + interval_sec + 2
+    ctx = {
+        "close_i": closes[i], "ema_closed": ema_closed, "atr_v": atr_v,
+        "ladder_periods": ladder_periods, "ladder_ema_closed": ladder_ema_closed,
+        "next_close_t": next_close_t,
+    }
+    _ema_ctx_cache[key] = ctx
+    return ctx
+
 def _ema_check_symbol_signal(symbol, pick):
     """v1.8: РЕАЛЬНОЕ время. Раньше смотрели ТОЛЬКО на последнюю ЗАКРЫТУЮ
     свечу — но _fetch_candles намеренно отбрасывает ещё не закрытый бар
@@ -4388,25 +4460,17 @@ def _ema_check_symbol_signal(symbol, pick):
     коснулась EMA и уже успела среагировать (откатить/вырасти) ВНУТРИ этой
     же свечи, к моменту, когда свеча закрылась и мы её увидели, close уже
     далеко от уровня — вход по такому close это вход ПОСЛЕ реакции, а не
-    "жду когда придёт к линии, и работаю с реакцией" (методичка). ATR
-    по-прежнему считается по закрытым свечам (волатильность, реже нужно
-    обновлять live). А вот EMA, лесенка, само касание и цена входа — все
-    приведены к текущему моменту через _ema_live_value на живой цене
+    "жду когда придёт к линии, и работаю с реакцией" (методичка). v2.3: ATR/
+    EMA-контекст с закрытых свечей теперь кэшируется в _ema_get_closed_ctx
+    (не дёргаем весь исторический фетч на каждый опрос — см. комментарий
+    там же). А вот САМО касание и цена входа — по живой цене
     (_gate_get_price), опрашиваемой каждые EMA_LIVE_POLL_SEC. tf="1w" —
-    Gate.io такого интервала не отдаёт, поэтому берём дневные свечи и
-    ресемплим в недельные тем же способом, что и в досье."""
+    Gate.io такого интервала не отдаёт, поэтому контекст берётся из дневных
+    свечей, ресемплированных в недельные тем же способом, что и в досье."""
     tf, ema_period = pick["tf"], pick["ema_period"]
-    days = _days_for_live_check(tf, ema_period)
-    fetch_tf = "1d" if tf == "1w" else tf
-    raw = _fetch_candles(symbol, fetch_tf, days)
-    candles = _resample_to_weekly(raw) if tf == "1w" else raw
-    if len(candles) < ema_period + 5: return None
-    closes = [c["close"] for c in candles]
-    ema_arr = _ema(closes, ema_period)
-    atr_arr = _atr(candles, 14)
-    i = len(candles) - 1   # последняя ЗАКРЫТАЯ свеча
-    ema_closed, atr_v = ema_arr[i], atr_arr[i]
-    if ema_closed is None or not atr_v: return None
+    ctx = _ema_get_closed_ctx(symbol, tf, ema_period)
+    if ctx is None: return None
+    ema_closed, atr_v = ctx["ema_closed"], ctx["atr_v"]
     live_price = _gate_get_price(symbol)
     if not live_price: return None
     ema_v = _ema_live_value(ema_closed, live_price, ema_period)   # v1.8-b: EMA "сейчас"
@@ -4420,15 +4484,15 @@ def _ema_check_symbol_signal(symbol, pick):
     _ema_touch_state[key] = touched_now
     if not touched_now or was_in_zone:
         return None   # либо не у линии, либо уже отработали этот подход
-    side_above = closes[i] > ema_closed   # направление — по последнему закрытию (стабильно)
+    side_above = ctx["close_i"] > ema_closed   # направление — по последнему закрытию (стабильно)
     direction = "long" if side_above else "short"   # отскок от EMA как от support/resistance
     # v1.4/v1.8-b: подтверждаем ПОЛНОЙ лесенкой (7/14/28 + промежуточные EMA
     # до касаемого уровня), каждая приведена к текущему моменту так же, как
     # ema_v выше — иначе лесенка могла бы "залипнуть" в устаревшем состоянии
     # ещё почти целый бар в быстром развороте (кейс YFI: памп → обвал сквозь
     # EMA100, лесенка ещё не развернулась вниз, а мы чуть не отдали LONG).
-    ladder_periods = _ladder_periods_for(tf, ema_period)
-    ladder_vals_live = [_ema_live_value(_ema(closes, p)[i], live_price, p) for p in ladder_periods]
+    ladder_vals_live = [_ema_live_value(v, live_price, p)
+                         for v, p in zip(ctx["ladder_ema_closed"], ctx["ladder_periods"])]
     ladder = _ladder_order([live_price] + ladder_vals_live)
     expected = "up" if side_above else "down"
     # v1.6-b: см. комментарий в _detect_ema_bounces — откатил строгий reject
@@ -4503,14 +4567,19 @@ def _ema_signal_loop():
         # v2.2: этот цикл живёт часами/сутками без единого respawn'а — если
         # где-то в нём всё же есть утечка (растущий кэш, незакрытые объекты),
         # respawn-диагностика из _make_pool её не покажет, т.к. respawn'ов
-        # тут вообще нет. Логируем RSS раз в ~30 итераций (~30 минут при
-        # EMA_LIVE_POLL_SEC=60), чтобы при следующем сигнале 9 в логе был
-        # виден реальный тренд памяти, а не только факт "убило" постфактум.
+        # тут вообще нет. Логируем RSS раз в ~30 минут (v2.3: с учётом
+        # EMA_LIVE_POLL_SEC=15 — было /30 при 60с, теперь /120), чтобы при
+        # следующем сигнале 9 в логе был виден реальный тренд памяти, а не
+        # только факт "убило" постфактум. _ema_ctx_cache (v2.3) — ещё одна
+        # потенциальная точка утечки, добавленная этой же версией: размер
+        # ограничен количеством уникальных symbol|tf|ema_period в досье
+        # (бounded, обновляется, а не растёт бесконечно), но стоит иметь в
+        # виду при разборе, если RSS всё же поползёт вверх.
         _iter += 1
-        if _iter % 30 == 0:
+        if _iter % 120 == 0:
             _rss = _rss_mb()
             if _rss is not None:
-                olog(f"[ema_live] RSS {_rss} МБ (итерация {_iter})")
+                olog(f"[ema_live] RSS {_rss} МБ (итерация {_iter}, ctx_cache={len(_ema_ctx_cache)})")
             gc.collect()
         time.sleep(EMA_LIVE_POLL_SEC)
 EMA_HTML_PAGE = """<!DOCTYPE html>
