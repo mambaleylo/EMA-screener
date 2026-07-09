@@ -1917,7 +1917,20 @@ _check_version()
 # ─────────────────────────────────────────────────────────────────────────────
 
 GATE_API     = "https://api.gateio.ws/api/v4"
-NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
+# v3.52.97: NUM_WORKERS раньше был cpu_count()-1 без верхней границы — на
+# Android/Termux ProcessPoolExecutor(spawn) пересоздаётся заново на каждое
+# закрытие бара (см. run_optimizer, ~раз в tf_sec), т.е. КАЖДЫЙ respawn — это
+# n_workers холодных стартов python-интерпретатора. На телефонах с 8 ядрами
+# это было 7 процессов на каждый respawn, десятки раз за сессию — вероятная
+# причина постепенного исчерпания памяти и SIGKILL (LMK) на длинных прогонах,
+# при этом сам Termux (родительский шелл) не убивался, т.к. LMK убивает
+# конкретный process, а не сессию. Теперь верхняя граница + override через
+# env SMC_NUM_WORKERS для ручной подстройки под конкретное устройство без
+# правки кода.
+NUM_WORKERS  = max(1, min(
+    int(os.environ.get("SMC_NUM_WORKERS", 3)),
+    (multiprocessing.cpu_count() or 2) - 1
+))
 _ema_dossier_lock = threading.Lock()
 _ema_dossier_running = {"v": False}
 
@@ -6270,11 +6283,7 @@ def run_optimizer():
 
     n_workers = NUM_WORKERS
     olog(f"⚙ Запуск {'ThreadPool' if _POOL_TYPE=='thread' else 'ProcessPool'} ({n_workers} {'потоков' if _POOL_TYPE=='thread' else 'процессов'})...")
-    pool = _PoolExecutor(
-        max_workers=n_workers,
-        initializer=_worker_init,
-        initargs=(candles, risk)
-    )
+    pool = _make_pool(n_workers, candles, risk)
 
     # v3.50.2: SL/TP из UI — минимальные границы оптимизатора
     PARAM_SPACE["sl_pct"]["min"] = sl_p
@@ -6504,15 +6513,8 @@ def run_optimizer():
                     olog(f"⚠ Не удалось обновить свечи: {_fe}")
                 if fresh_candles and len(fresh_candles) >= 100:
                     candles = fresh_candles
-                    try:
-                        pool.shutdown(wait=True)
-                    except Exception:
-                        pass
-                    pool = _PoolExecutor(
-                        max_workers=n_workers,
-                        initializer=_worker_init,
-                        initargs=(candles, risk)
-                    )
+                    _shutdown_pool_safely(pool)
+                    pool = _make_pool(n_workers, candles, risk)
                     # best/топ-20 посчитаны на старом окне свечей — несравнимы
                     # с новым окном напрямую (та же стратегия даст другой fitness).
                     # v3.52.21: вместо полного сброса top20=[] лениво пере-оцениваем
@@ -6863,10 +6865,12 @@ def run_optimizer():
                 _do_announce(*_pending_announce)
             except Exception as e:
                 olog(f"⚠ Не удалось отправить отложенный best: {e}")
-        try:
-            pool.shutdown(wait=False)
-        except Exception:
-            pass
+        # v3.52.97: было shutdown(wait=False) — не дожидается завершения
+        # дочерних процессов вообще. При каждом Стоп/рестарте оптимизатора
+        # (и это самая частая операция за сессию) воркеры могли оставаться
+        # висеть в фоне как orphan-процессы — за много Стоп/Старт циклов это
+        # реалистичный источник постепенной утечки памяти до SIGKILL.
+        _shutdown_pool_safely(pool)
 
     olog("⏹ Остановлено")
     with opt_lock: opt_state["running"] = False
@@ -6922,6 +6926,57 @@ def _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk, max_sl_p=1.0, max_tp_
                 if nfit > best_fit:
                     best_fit, best_params, best_result = nfit, nb_p, nb_r
     return {"sym": sym, "params": best_params, "result": best_result} if best_result else None
+
+def _rss_mb():
+    """v3.52.97: текущий RSS процесса в МБ — для диагностики роста памяти
+    вокруг respawn'ов ProcessPool в логе (ru_maxrss на Linux/Android в КБ)."""
+    try:
+        import resource
+        return round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1)
+    except Exception:
+        return None
+
+def _make_pool(n_workers, candles, risk):
+    """v3.52.97: обёртка создания ProcessPool/ThreadPool с диагностическим
+    логом памяти до/после — чтобы было видно в логе (`olog`), растёт ли RSS
+    от respawn'а к respawn'у, вместо гадания постфактум по симптому 'убило
+    сигналом 9'."""
+    _before = _rss_mb()
+    pool = _PoolExecutor(
+        max_workers=n_workers,
+        initializer=_worker_init,
+        initargs=(candles, risk)
+    )
+    _after = _rss_mb()
+    if _before is not None and _after is not None:
+        olog(f"⚙ pool respawn: {n_workers} {'потоков' if _POOL_TYPE=='thread' else 'процессов'}, "
+             f"RSS {_before}→{_after} МБ")
+    return pool
+
+def _shutdown_pool_safely(pool):
+    """v3.52.97: обычный pool.shutdown(wait=True) на Termux/Android иногда не
+    гарантирует, что дочерние процессы (spawn) реально завершились и отдали
+    память ОС — если какой-то воркер завис, shutdown может вернуться, оставив
+    zombie/orphan процесс живым. При частом respawn'е (каждое закрытие бара)
+    такие утечки накапливаются за долгую сессию и, вероятно, вносят вклад в
+    постепенный OOM/SIGKILL. Здесь — явный terminate() всех ещё живых
+    дочерних процессов после shutdown, плюс gc.collect() (только для
+    ProcessPool, ThreadPool потоков это не касается)."""
+    try:
+        pool.shutdown(wait=True, cancel_futures=True)
+    except Exception as e:
+        olog(f"⚠ pool.shutdown: {e}")
+    if _POOL_TYPE == "process":
+        try:
+            for proc in (getattr(pool, "_processes", {}) or {}).values():
+                if proc.is_alive():
+                    olog(f"⚠ pool respawn: воркер pid={proc.pid} не завершился штатно — terminate()")
+                    proc.terminate()
+                    proc.join(timeout=3)
+        except Exception as e:
+            olog(f"⚠ pool cleanup: {e}")
+    import gc
+    gc.collect()
 
 def _worker_init(candles, risk):
     """Инициализатор ProcessPool — загружает свечи в глобали воркера один раз."""
@@ -10128,6 +10183,3 @@ if __name__ == "__main__":
     except RuntimeError:
         pass
     main()
-
-
-
