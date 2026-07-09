@@ -1,6 +1,37 @@
 #!/usr/bin/env python3
 """
-EMA Bounce Dossier v1.7 (fork of SMC Optimizer v3.52.96)
+EMA Bounce Dossier v1.9 (fork of SMC Optimizer v3.52.96)
+- v1.9: даже с живой ценой входа (v1.8) сама EMA/лесенка (контекст для
+  направления и подтверждения тренда) всё ещё считались только по закрытым
+  свечам — в быстром развороте это давало то же "залипание" контекста
+  почти на целый бар (проверил на кейсе типа YFI: если поймать момент
+  прямо в начале обвала, пока закрытые свечи ещё не отразили разворот,
+  сигнал всё ещё мог выдать LONG). Добавлена _ema_live_value() —
+  экстраполирует EMA на текущий момент рекурсивной формулой (live_price как
+  close текущего формирующегося бара). Применена и к EMA самого касаемого
+  уровня, и ко всей лесенке 7/14/28+ — для медленных периодов (100/200) k
+  мал, они почти не сдвигаются от закрытого значения, это ожидаемо (так и
+  задумано методичкой — медленный EMA лагает больше).
+- v1.8: КРИТИЧНЫЙ ФИКС по методичке — реальный вопрос от пользователя:
+  "сделку надо открывать при касании EMA и реакции от неё, но индикатор
+  ждёт закрытия свечи, в итоге вход происходит после реакции и отката/
+  роста цены". Подтвердилось: _fetch_candles намеренно отбрасывает ещё не
+  закрытый бар (защита от другого бага из fork SMC Optimizer), а
+  _ema_check_symbol_signal брал close именно ПОСЛЕДНЕЙ ЗАКРЫТОЙ свечи как
+  цену входа — если реакция от EMA уже случилась внутри этой свечи, к
+  моменту закрытия цена уже далеко от уровня, и вход был по факту
+  "вдогонку" тренду, а не "жду когда придёт к линии, и работаю с реакцией"
+  (дословно из методички). Теперь EMA/ATR/лесенка по-прежнему считаются на
+  закрытых свечах (стабильно, EMA лагает медленно, скачок между барами не
+  критичен), а САМО касание и цена входа проверяются по живой цене
+  (_gate_get_price) на каждом опросе (раз в EMA_LIVE_POLL_SEC=60с).
+  Добавлено состояние _ema_touch_state (вход/выход из зоны касания per
+  symbol|tf|ema_period) — сигнал стреляет один раз при СВЕЖЕМ заходе цены в
+  зону, не повторяется, пока цена сидит там же, и готов сработать заново
+  после того, как цена ушла и вернулась. Старый дедуп по bar_t закрытой
+  свечи убран (bar_t теперь — момент живого входа). _ema_history_update_open
+  тоже переведён на живую цену как основной способ проверки TP/SL (свечи —
+  запасной путь на случай простоя между опросами).
 - v1.7: отслеживание живых сигналов до закрытия. Каждый выданный сигнал
   теперь логируется отдельной записью в ema_signal_history.json (не
   перезатирается следующим сигналом по той же монете, как _ema_live_state)
@@ -1867,7 +1898,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "1.7"
+APP_VERSION  = "1.9"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4096,7 +4127,6 @@ EMA_LIVE_FILE      = os.path.expanduser("~/ema_live_signals.json")
 EMA_LIVE_POLL_SEC  = 60
 _ema_live_lock  = threading.Lock()
 _ema_live_state = {"signals": {}, "updated_at": 0}   # symbol -> last signal dict
-_ema_alert_seen = {}                                  # symbol -> последний t алерченной свечи
 
 # v1.7: история сигналов — каждый выданный сигнал логируется отдельной
 # записью (не перезаписывает предыдущий, в отличие от _ema_live_state) и
@@ -4139,11 +4169,16 @@ def _ema_history_add(sig):
         _save_ema_history(state)
 
 def _ema_history_update_open():
-    """Проходит по всем сигналам со статусом 'open', тянет свечи с момента
-    входа и проверяет, что сработало раньше — TP или SL. Если в одной и той
-    же свече задето и то, и другое (быстрая волатильная свеча, порядок
-    внутри бара неизвестен) — консервативно засчитываем SL (хуже сценарий,
-    так безопаснее для статистики, чем случайно завысить винрейт)."""
+    """Проходит по всем сигналам со статусом 'open' и проверяет, что
+    сработало раньше — TP или SL. v1.8: вход теперь по живой цене (см.
+    _ema_check_symbol_signal), часто СРЕДИ бара — поэтому основная проверка
+    тоже по живой цене (гранулярность ~EMA_LIVE_POLL_SEC, точнее, чем ждать
+    закрытия бара и смотреть его high/low целиком, который включал бы и
+    движение ДО входа). Разбор свечей — запасной путь на случай, если между
+    опросами был перерыв (сервис не работал) и живую цену не увидели: тогда
+    смотрим свечи ПОСЛЕ момента входа. Если в одной свече/опросе задето и
+    то, и другое — консервативно засчитываем SL (хуже сценарий, безопаснее
+    для статистики, чем случайно завысить винрейт)."""
     with _ema_history_lock:
         state = _load_ema_history()
     open_items = [(k, v) for k, v in state["items"].items() if v["status"] == "open"]
@@ -4152,21 +4187,32 @@ def _ema_history_update_open():
     updated = {}
     for key, item in open_items:
         try:
-            fetch_tf = "1d" if item["tf"] == "1w" else item["tf"]
-            days = _days_for_live_check(item["tf"], item["ema_period"])
-            raw = _fetch_candles(item["symbol"], fetch_tf, days)
-            candles = _resample_to_weekly(raw) if item["tf"] == "1w" else raw
-            fwd = [c for c in candles if c["t"] > item["bar_t"]]
             outcome, outcome_price = None, None
-            for c in fwd:
+            live_price = _gate_get_price(item["symbol"])
+            if live_price:
                 if item["dir"] == "long":
-                    hit_tp, hit_sl = c["high"] >= item["tp"], c["low"] <= item["sl"]
+                    if live_price <= item["sl"]: outcome, outcome_price = "sl", item["sl"]
+                    elif live_price >= item["tp"]: outcome, outcome_price = "tp", item["tp"]
                 else:
-                    hit_tp, hit_sl = c["low"] <= item["tp"], c["high"] >= item["sl"]
-                if hit_sl:
-                    outcome, outcome_price = "sl", item["sl"]; break
-                if hit_tp:
-                    outcome, outcome_price = "tp", item["tp"]; break
+                    if live_price >= item["sl"]: outcome, outcome_price = "sl", item["sl"]
+                    elif live_price <= item["tp"]: outcome, outcome_price = "tp", item["tp"]
+            if not outcome:
+                # запасной путь по свечам — ловим то, что могли пропустить
+                # между опросами (сервис был офлайн, сеть недоступна и т.п.)
+                fetch_tf = "1d" if item["tf"] == "1w" else item["tf"]
+                days = _days_for_live_check(item["tf"], item["ema_period"])
+                raw = _fetch_candles(item["symbol"], fetch_tf, days)
+                candles = _resample_to_weekly(raw) if item["tf"] == "1w" else raw
+                fwd = [c for c in candles if c["t"] > item["bar_t"]]
+                for c in fwd:
+                    if item["dir"] == "long":
+                        hit_tp, hit_sl = c["high"] >= item["tp"], c["low"] <= item["sl"]
+                    else:
+                        hit_tp, hit_sl = c["low"] <= item["tp"], c["high"] >= item["sl"]
+                    if hit_sl:
+                        outcome, outcome_price = "sl", item["sl"]; break
+                    if hit_tp:
+                        outcome, outcome_price = "tp", item["tp"]; break
             if outcome:
                 item["status"] = outcome
                 item["closed_at"] = int(time.time())
@@ -4199,11 +4245,37 @@ def _days_for_live_check(tf, ema_period):
     days = math.ceil(bars_needed * (TF_SECONDS.get(src_tf, 3600) if tf != "1w" else 86400*7) / 86400)
     return max(3, days)
 
+_ema_touch_state = {}   # v1.8: symbol|tf|ema_period -> сейчас ли цена в зоне касания
+
+def _ema_live_value(prev_ema, live_price, period):
+    """v1.8-b: экстраполирует EMA на текущий момент — смешивает последнее
+    ЗАКРЫТОЕ значение с живой ценой по стандартной рекурсивной формуле EMA
+    (как будто live_price — это close текущего, ещё формирующегося бара).
+    Без этого EMA и лесенка отставали бы на целый бар от реальности: в
+    быстром развороте (кейс YFI) контекст мог "залипнуть" в старом состоянии
+    ещё почти целый бар после того, как реальный тренд уже изменился — та
+    же природа проблемы, что и с ценой входа, просто на уровне индикатора,
+    а не только на уровне цены. k мал для медленных периодов (100/200) —
+    там и должно почти не сдвигаться от закрытого значения, это ожидаемо
+    (медленный EMA лагает больше — так и задумано методичкой)."""
+    if prev_ema is None: return None
+    k = 2.0 / (period + 1)
+    return live_price * k + prev_ema * (1 - k)
+
 def _ema_check_symbol_signal(symbol, pick):
-    """Смотрит ПОСЛЕДНЮЮ закрытую свечу — новое ли это касание EMA, и если
-    да — в какую сторону (long/short). Возвращает None, если сигнала нет.
-    tf="1w" — Gate.io такого интервала не отдаёт, поэтому берём дневные
-    свечи и ресемплим в недельные тем же способом, что и в досье."""
+    """v1.8: РЕАЛЬНОЕ время. Раньше смотрели ТОЛЬКО на последнюю ЗАКРЫТУЮ
+    свечу — но _fetch_candles намеренно отбрасывает ещё не закрытый бар
+    (см. комментарий там же, защита от другого бага), а значит если цена
+    коснулась EMA и уже успела среагировать (откатить/вырасти) ВНУТРИ этой
+    же свечи, к моменту, когда свеча закрылась и мы её увидели, close уже
+    далеко от уровня — вход по такому close это вход ПОСЛЕ реакции, а не
+    "жду когда придёт к линии, и работаю с реакцией" (методичка). ATR
+    по-прежнему считается по закрытым свечам (волатильность, реже нужно
+    обновлять live). А вот EMA, лесенка, само касание и цена входа — все
+    приведены к текущему моменту через _ema_live_value на живой цене
+    (_gate_get_price), опрашиваемой каждые EMA_LIVE_POLL_SEC. tf="1w" —
+    Gate.io такого интервала не отдаёт, поэтому берём дневные свечи и
+    ресемплим в недельные тем же способом, что и в досье."""
     tf, ema_period = pick["tf"], pick["ema_period"]
     days = _days_for_live_check(tf, ema_period)
     fetch_tf = "1d" if tf == "1w" else tf
@@ -4213,37 +4285,38 @@ def _ema_check_symbol_signal(symbol, pick):
     closes = [c["close"] for c in candles]
     ema_arr = _ema(closes, ema_period)
     atr_arr = _atr(candles, 14)
-    i = len(candles) - 1
-    ema_v, atr_v = ema_arr[i], atr_arr[i]
-    if ema_v is None or not atr_v: return None
-    lo, hi = candles[i]["low"], candles[i]["high"]
+    i = len(candles) - 1   # последняя ЗАКРЫТАЯ свеча
+    ema_closed, atr_v = ema_arr[i], atr_arr[i]
+    if ema_closed is None or not atr_v: return None
+    live_price = _gate_get_price(symbol)
+    if not live_price: return None
+    ema_v = _ema_live_value(ema_closed, live_price, ema_period)   # v1.8-b: EMA "сейчас"
     tol = EMA_DOSSIER_TOUCH_ATR * atr_v
-    # v1.6: см. константу EMA_TOUCH_CLOSE_MAX_ATR — без этого условия
-    # огромная по диапазону свеча (гэп/обвал внутри дня) засчитывала бы
-    # "касание", даже если реальное закрытие ушло от EMA на десятки ATR
-    # (кейс LAB_USDT: close 5.75, EMA28 15.3, оба технически "в свече").
-    touched = ((lo - tol) <= ema_v <= (hi + tol) and
-               abs(closes[i] - ema_v) <= EMA_TOUCH_CLOSE_MAX_ATR * atr_v)
-    prev_close = closes[i-1]
-    if not touched or abs(prev_close - ema_v) <= tol:
-        return None
-    side_above = prev_close > ema_v
+    touched_now = abs(live_price - ema_v) <= tol
+    # v1.8: "заходили ли мы уже в зону этого касания" — фиксируем состояние
+    # ПЕРЕД любыми return, чтобы при выходе из зоны (цена ушла) следующий
+    # реальный подход снова считался свежим касанием
+    key = f"{symbol}|{tf}|{ema_period}"
+    was_in_zone = _ema_touch_state.get(key, False)
+    _ema_touch_state[key] = touched_now
+    if not touched_now or was_in_zone:
+        return None   # либо не у линии, либо уже отработали этот подход
+    side_above = closes[i] > ema_closed   # направление — по последнему закрытию (стабильно)
     direction = "long" if side_above else "short"   # отскок от EMA как от support/resistance
-    # v1.4: подтверждаем ПОЛНОЙ лесенкой (7/14/28 + промежуточные EMA до
-    # касаемого уровня, не только базовая тройка) — по методичке трейдера
-    # сигнал валиден только в здоровом тренде (лесенка выстроена по
-    # порядку). Если лесенка спутана или прямо противоречит стороне касания
-    # — это ровно кейс YFI (памп → обвал сквозь EMA100, лесенка ещё не
-    # развернулась вниз, а мы чуть не отдали LONG) — сигнал не выдаём.
+    # v1.4/v1.8-b: подтверждаем ПОЛНОЙ лесенкой (7/14/28 + промежуточные EMA
+    # до касаемого уровня), каждая приведена к текущему моменту так же, как
+    # ema_v выше — иначе лесенка могла бы "залипнуть" в устаревшем состоянии
+    # ещё почти целый бар в быстром развороте (кейс YFI: памп → обвал сквозь
+    # EMA100, лесенка ещё не развернулась вниз, а мы чуть не отдали LONG).
     ladder_periods = _ladder_periods_for(ema_period)
-    ladder_arrs = [_ema(closes, p) for p in ladder_periods]
-    ladder = _ladder_order([closes[i]] + [arr[i] for arr in ladder_arrs])
+    ladder_vals_live = [_ema_live_value(_ema(closes, p)[i], live_price, p) for p in ladder_periods]
+    ladder = _ladder_order([live_price] + ladder_vals_live)
     expected = "up" if side_above else "down"
     # v1.6-b: см. комментарий в _detect_ema_bounces — откатил строгий reject
     # на None обратно к permissive (отклоняем только явное противоречие)
     if ladder is not None and ladder != expected:
         return None
-    price = candles[i]["close"]
+    price = live_price   # v1.8: вход по живой цене, а не по close закрытой свечи
     # v1.5: оценка стопа и тейка. Стоп — за EMA-уровнем (если пробили дальше
     # этого — "отскок" не состоялся, сетап отменён), тейк — по фиксированному
     # risk:reward от входа/стопа. Это ориентир, а не гарантия — методичка
@@ -4270,7 +4343,7 @@ def _ema_check_symbol_signal(symbol, pick):
         "symbol": symbol, "tf": tf, "ema_period": ema_period, "dir": direction,
         "price": price, "ema_value": round(ema_v, 6),
         "sl": round(sl, 6), "tp": round(tp, 6), "rr": EMA_SIGNAL_RR,
-        "bounce_rate": pick["bounce_rate"], "bar_t": candles[i]["t"],
+        "bounce_rate": pick["bounce_rate"], "bar_t": int(time.time()),
     }
 
 def _ema_signal_loop():
@@ -4289,9 +4362,10 @@ def _ema_signal_loop():
                 if not pick: continue
                 sig = _ema_check_symbol_signal(symbol, pick)
                 if not sig: continue
-                if _ema_alert_seen.get(symbol) == sig["bar_t"]:
-                    continue  # уже алертили эту свечу — не спамим
-                _ema_alert_seen[symbol] = sig["bar_t"]
+                # v1.8: дедуп теперь на уровне _ema_touch_state (вход/выход
+                # из зоны касания) внутри _ema_check_symbol_signal — старая
+                # проверка по bar_t закрытой свечи убрана, т.к. bar_t теперь
+                # это момент живого входа и всегда новый
                 with _ema_live_lock:
                     _ema_live_state["signals"][symbol] = sig
                     _ema_live_state["updated_at"] = int(time.time())
