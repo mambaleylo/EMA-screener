@@ -1,5 +1,24 @@
 #!/usr/bin/env python3
 """
+EMA Bounce Dossier v2.2 (fork of SMC Optimizer v3.52.96)
+- v2.2: расследование повторяющегося "Process completed (signal 9)" в
+  Termux. Прошёлся по всей EMA-цепочке (треды, кэши, subprocess-вызовы) —
+  прямой утечки не нашёл: нет растущих без ограничения структур, батарея
+  через subprocess.run (сам всё закрывает), треды-таймеры бounded. Нашёл
+  один реальный риск: _run_ema_dossier_scan создавал ProcessPoolExecutor
+  через `with ... as ex:` — тот же класс проблемы, что уже чинили для
+  оптимизатора (_shutdown_pool_safely/_make_pool, v3.52.97): обычный
+  shutdown(wait=True) на Termux/Android не гарантирует, что spawn-процессы
+  реально отдали память ОС, повисший воркер может остаться orphan'ом. Теперь
+  и здесь используется _shutdown_pool_safely (explicit terminate зависших +
+  gc.collect), плюс RSS-лог до/после скана. Второе: сигнал 9 может быть
+  и Android LMK, убивающим фоновый Termux вообще без утечки в коде — это
+  код починить не может, но теперь _ema_signal_loop (вечный цикл, живёт
+  часами/сутками без единого respawn'а) раз в ~30 итераций (~30 мин)
+  логирует RSS и делает gc.collect() — если проблема повторится, в логе
+  будет видно, растёт ли память реально или это внешний kill. Если растёт —
+  будет с чем разбираться предметно; если нет — дело в LMK, и решение уже
+  не в коде (termux-wake-lock + auto-restart обёртка снаружи).
 EMA Bounce Dossier v2.1 (fork of SMC Optimizer v3.52.96)
 - v2.1: кнопка очистки истории сигналов в UI (запрос: "добавь кнопку
   очистки истории сигналов"). Новый эндпоинт GET /ema_signal_history_clear
@@ -1910,7 +1929,7 @@ SMC Optimizer v3.43
   (а не просто фиксирует факт отправки HTTP-запроса), для ntfy — код ответа.
   Эндпоинты: GET /alert_cfg, POST /alert_cfg, POST /alert_test.
 """
-import os, sys, json, time, math, random, threading, base64, hashlib, subprocess, io
+import os, sys, json, time, math, random, threading, base64, hashlib, subprocess, io, gc
 import multiprocessing
 import http.server, urllib.request, urllib.parse
 from functools import lru_cache
@@ -1930,7 +1949,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "2.1"
+APP_VERSION  = "2.2"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4173,12 +4192,26 @@ def _save_ema_dossier_state(state):
 def _run_ema_dossier_scan(top_n=50):
     """Топ-N монет по объёму, досье по каждой параллельно (ProcessPoolExecutor,
     как в run_screener). Пишет прогресс в EMA_DOSSIER_FILE по ходу скана —
-    можно смотреть частичный результат, не дожидаясь конца."""
+    можно смотреть частичный результат, не дожидаясь конца.
+    v2.2: раньше пул создавался через `with ProcessPoolExecutor(...) as ex:`
+    — на выходе из `with` вызывается shutdown(wait=True), но НЕ гарантирует
+    (см. _shutdown_pool_safely выше — тот же вывод сделан для пула
+    оптимизатора), что дочерние spawn-процессы на Termux/Android реально
+    отдали память ОС; повисший воркер мог остаться orphan-процессом. Теперь
+    та же защита (explicit terminate() зависших + gc.collect()), что и в
+    оптимизаторе, плюс RSS-лог до/после — чтобы в следующий раз падение по
+    сигналу 9 было видно в логе с конкретными цифрами, а не только по
+    факту "убило"."""
     symbols = _fetch_all_symbols()[:top_n]
     state = {"status": "running", "results": {}, "total": len(symbols),
              "done": 0, "updated_at": int(time.time())}
     _save_ema_dossier_state(state)
-    with ProcessPoolExecutor(max_workers=NUM_WORKERS) as ex:
+    _before = _rss_mb()
+    ex = _PoolExecutor(max_workers=NUM_WORKERS)
+    if _before is not None:
+        olog(f"[ema_dossier] скан старт: {len(symbols)} монет, "
+             f"{NUM_WORKERS} {'потоков' if _POOL_TYPE=='thread' else 'процессов'}, RSS {_before} МБ")
+    try:
         futs = {ex.submit(_build_coin_dossier, sym): sym for sym in symbols}
         for fut in _as_completed(futs):
             sym = futs[fut]
@@ -4189,6 +4222,11 @@ def _run_ema_dossier_scan(top_n=50):
             state["done"] += 1
             state["updated_at"] = int(time.time())
             _save_ema_dossier_state(state)
+    finally:
+        _shutdown_pool_safely(ex)
+    _after = _rss_mb()
+    if _before is not None and _after is not None:
+        olog(f"[ema_dossier] пул закрыт, RSS {_before}→{_after} МБ")
     state["status"] = "done"
     _save_ema_dossier_state(state)
     olog(f"[ema_dossier] скан завершён: {len(symbols)} монет")
@@ -4431,6 +4469,7 @@ def _ema_signal_loop():
     """Фоновый цикл: раз в EMA_LIVE_POLL_SEC проверяет все монеты из
     последнего готового досье на новые live-касания и алертит в Telegram."""
     time.sleep(30)
+    _iter = 0
     while True:
         try:
             state = _load_ema_dossier_state()
@@ -4461,6 +4500,18 @@ def _ema_signal_loop():
             _ema_history_update_open()   # v1.7: проверяем открытые сигналы на TP/SL
         except Exception as e:
             olog(f"[ema_live] ошибка цикла: {e}")
+        # v2.2: этот цикл живёт часами/сутками без единого respawn'а — если
+        # где-то в нём всё же есть утечка (растущий кэш, незакрытые объекты),
+        # respawn-диагностика из _make_pool её не покажет, т.к. respawn'ов
+        # тут вообще нет. Логируем RSS раз в ~30 итераций (~30 минут при
+        # EMA_LIVE_POLL_SEC=60), чтобы при следующем сигнале 9 в логе был
+        # виден реальный тренд памяти, а не только факт "убило" постфактум.
+        _iter += 1
+        if _iter % 30 == 0:
+            _rss = _rss_mb()
+            if _rss is not None:
+                olog(f"[ema_live] RSS {_rss} МБ (итерация {_iter})")
+            gc.collect()
         time.sleep(EMA_LIVE_POLL_SEC)
 EMA_HTML_PAGE = """<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
