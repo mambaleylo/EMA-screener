@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 """
+EMA Bounce Dossier v2.9.1 (fork of SMC Optimizer v3.52.96)
+- v2.9.1: фикс кнопки "Тест" в модалке Алертов — testAlert() слал
+  fetch('/alert_test') без метода (т.е. GET), а этот роут зарегистрирован
+  только в do_POST, поэтому запрос 404-ился и тест молча не работал.
+  Добавлен {method:'POST'}, как уже сделано в аналогичной кнопке SMC
+  Optimizer.
 EMA Bounce Dossier v2.9 (fork of SMC Optimizer v3.52.96)
 - v2.9: убрана отдельная кнопка/модалка "🔑 Gate.io API" — поля key/secret
   перенесены внутрь модалки "⚙️ Автоторговля" (логичнее: ключи нужны именно
@@ -2047,7 +2053,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "2.9"
+APP_VERSION  = "2.9.1"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -5190,7 +5196,7 @@ async function saveAlertSettings(){
 async function testAlert(){
   const msg = document.getElementById('alertMsg'); msg.style.color = '#8b949e'; msg.innerText = 'Отправляю...';
   await saveAlertSettings();
-  const r = await fetch('/alert_test'); const d = await r.json();
+  const r = await fetch('/alert_test', {method:'POST'}); const d = await r.json();
   msg.style.color = d.ok ? '#3fb950' : '#f85149';
   msg.innerText = d.ok ? '✅ Тестовое сообщение отправлено' : ('Ошибка: ' + (d.error||''));
 }
