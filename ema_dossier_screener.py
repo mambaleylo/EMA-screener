@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
 """
+EMA Bounce Dossier v3.0 (fork of SMC Optimizer v3.52.96)
+- v3.0: редизайн /ema. Таблицы обёрнуты в карточки-секции (единый визуальный
+  язык с модалками Автоторговли/Алертов), заголовки таблиц залипающие,
+  строки с ховером. Главное: "История сигналов" и "Досье по монетам" раньше
+  рендерили ВЕСЬ массив целиком (история — до 500 записей, досье — до ~250
+  строк) без пагинации, из-за чего список рос бесконечно и было неудобно
+  листать на телефоне. Теперь обе таблицы постранично (15/20 строк на
+  страницу) с кнопками "Назад/Вперёд" и индикатором страницы. У истории
+  добавлены фильтры Все/Открытые/TP/SL. Закрытые сигналы стали заметнее и
+  информативнее: статус — это цветная плашка с итоговым % результата прямо
+  внутри ("✅ TP +2.34%" / "❌ SL −1.10%", считается от dir/price/close_price),
+  строка подсвечивается мягким зелёным/красным фоном, в колонке "Когда"
+  под временем открытия отдельной строкой — сколько сделка длилась
+  (closed_at − opened_at).
 EMA Bounce Dossier v2.9.2 (fork of SMC Optimizer v3.52.96)
 - v2.9.2: два бага из-за неполного переноса из SMC Optimizer.
   1) /alert_cfg (POST) на бэкенде безусловно перезаписывал HC_URL
@@ -2069,7 +2083,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "2.9.2"
+APP_VERSION  = "3.0"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -5042,10 +5056,14 @@ EMA_HTML_PAGE = """<!DOCTYPE html>
 <style>
 body{background:#0d1117;color:#c9d1d9;font-family:system-ui,sans-serif;margin:0;padding:16px}
 h1{font-size:20px}
-button{background:#238636;color:#fff;border:0;padding:10px 16px;border-radius:6px;font-size:14px;margin:6px 6px 6px 0}
-table{width:100%;border-collapse:collapse;margin-top:12px;font-size:13px}
-th,td{padding:6px 8px;text-align:left;border-bottom:1px solid #21262d}
-th{color:#8b949e}
+h3{font-size:15px;margin:0}
+button{background:#238636;color:#fff;border:0;padding:10px 16px;border-radius:6px;font-size:14px;margin:6px 6px 6px 0;cursor:pointer}
+table{width:100%;border-collapse:collapse;margin-top:0;font-size:13px}
+th,td{padding:6px 8px;text-align:left;border-bottom:1px solid #21262d;white-space:nowrap}
+th{color:#8b949e;position:sticky;top:0;background:#161b22}
+tbody tr:hover{background:#1c2128}
+tr.row-tp{background:rgba(63,185,80,.06)}
+tr.row-sl{background:rgba(248,81,73,.06)}
 .long{color:#3fb950}.short{color:#f85149}
 .tp{color:#3fb950}.sl{color:#f85149}.open{color:#8b949e}
 #status{color:#8b949e;font-size:13px;margin-top:8px}
@@ -5063,6 +5081,27 @@ th{color:#8b949e}
 .slider:before{content:"";position:absolute;height:18px;width:18px;left:3px;bottom:3px;background:#fff;border-radius:50%;transition:.2s}
 input:checked + .slider{background:#238636}
 input:checked + .slider:before{transform:translateX(20px)}
+.section-card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:14px;margin-top:14px}
+.section-head{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px}
+.btn-danger-sm{background:#3a1414;border:1px solid #f85149;color:#f85149;padding:4px 10px;font-size:12px;border-radius:6px;margin:0}
+.summary-line{font-size:13px;color:#8b949e;margin-top:6px}
+.summary-line b{color:#c9d1d9}
+.filter-row{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap}
+.filter-btn{background:#21262d;border:1px solid #30363d;color:#8b949e;padding:4px 12px;font-size:12px;margin:0;border-radius:14px;cursor:pointer}
+.filter-btn.active{background:#1f6feb;border-color:#1f6feb;color:#fff}
+.table-scroll{overflow-x:auto;margin-top:10px;max-height:520px;overflow-y:auto;border-radius:6px}
+.status-pill{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;white-space:nowrap}
+.status-pill.tp{background:#0d2818;color:#3fb950;border:1px solid #23643a}
+.status-pill.sl{background:#2a0f0f;color:#f85149;border:1px solid #6e2323}
+.status-pill.open{background:#2a2410;color:#d29922;border:1px solid #6e5a1f}
+.dur{font-size:11px;color:#6e7681;margin-top:2px}
+.pager{display:flex;align-items:center;justify-content:center;gap:10px;margin-top:10px;font-size:12px;color:#8b949e}
+.pager button{background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:4px 12px;font-size:12px;margin:0;border-radius:6px}
+.pager button:disabled{opacity:.35;cursor:default}
+details summary{cursor:pointer;font-size:15px;list-style:none}
+details summary::-webkit-details-marker{display:none}
+details summary:before{content:"▸ ";color:#8b949e}
+details[open] summary:before{content:"▾ "}
 </style></head><body>
 <h1>&#9889; EMA Bounce Dossier</h1>
 <button onclick="startScan()">Запустить скан (топ-50)</button>
@@ -5119,14 +5158,37 @@ input:checked + .slider:before{transform:translateX(20px)}
   </div>
 </div>
 
-<h3>&#128276; Живые сигналы</h3>
-<table id="live"><thead><tr><th>Монета</th><th>ТФ</th><th>EMA</th><th>Направление</th><th>Цена</th><th>SL</th><th>TP</th><th>Bounce rate</th></tr></thead><tbody></tbody></table>
-<h3>&#128203; История сигналов <span id="histSummary" style="font-weight:normal;font-size:13px;color:#8b949e"></span>
-<button onclick="clearHistory()" style="margin-left:10px;padding:2px 10px;font-size:12px;background:#3a1414;border:1px solid #f85149;color:#f85149;border-radius:4px;cursor:pointer">Очистить историю</button></h3>
-<table id="history"><thead><tr><th>Монета</th><th>ТФ</th><th>EMA</th><th>Направление</th><th>Вход</th><th>SL</th><th>TP</th><th>Статус</th><th>Когда</th></tr></thead><tbody></tbody></table>
-<details id="dossierBlock">
-<summary style="cursor:pointer;font-size:15px;margin-top:16px">Досье по монетам (лучшая EMA на каждом ТФ, включая недельный) — <span id="dossierCount">0</span> строк</summary>
-<table id="dossier"><thead><tr><th>Монета</th><th>Взлёт</th><th>ТФ</th><th>Лучшая EMA</th><th>Bounce rate</th></tr></thead><tbody></tbody></table>
+<div class="section-card">
+  <h3>&#128276; Живые сигналы</h3>
+  <div class="table-scroll" style="max-height:none">
+    <table id="live"><thead><tr><th>Монета</th><th>ТФ</th><th>EMA</th><th>Направление</th><th>Цена</th><th>SL</th><th>TP</th><th>Bounce rate</th></tr></thead><tbody></tbody></table>
+  </div>
+</div>
+
+<div class="section-card">
+  <div class="section-head">
+    <h3>&#128203; История сигналов</h3>
+    <button onclick="clearHistory()" class="btn-danger-sm">Очистить историю</button>
+  </div>
+  <div id="histSummary" class="summary-line"></div>
+  <div class="filter-row" id="histFilterRow">
+    <button class="filter-btn active" data-f="all" onclick="setHistFilter('all')">Все</button>
+    <button class="filter-btn" data-f="open" onclick="setHistFilter('open')">&#8987; Открытые</button>
+    <button class="filter-btn" data-f="tp" onclick="setHistFilter('tp')">&#9989; TP</button>
+    <button class="filter-btn" data-f="sl" onclick="setHistFilter('sl')">&#10060; SL</button>
+  </div>
+  <div class="table-scroll">
+    <table id="history"><thead><tr><th>Монета</th><th>ТФ</th><th>EMA</th><th>Направление</th><th>Вход</th><th>SL</th><th>TP</th><th>Статус</th><th>Когда</th></tr></thead><tbody></tbody></table>
+  </div>
+  <div class="pager" id="historyPager"></div>
+</div>
+
+<details id="dossierBlock" class="section-card">
+<summary>Досье по монетам (лучшая EMA на каждом ТФ, включая недельный) — <span id="dossierCount">0</span> строк</summary>
+<div class="table-scroll">
+  <table id="dossier"><thead><tr><th>Монета</th><th>Взлёт</th><th>ТФ</th><th>Лучшая EMA</th><th>Bounce rate</th></tr></thead><tbody></tbody></table>
+</div>
+<div class="pager" id="dossierPager"></div>
 </details>
 <script>
 async function startScan(){
@@ -5252,6 +5314,76 @@ function fmtAgo(ts){
   if(s < 86400) return Math.floor(s/3600)+'ч назад';
   return Math.floor(s/86400)+'д назад';
 }
+function fmtDuration(s){
+  if(s < 60) return s+'с';
+  if(s < 3600) return Math.floor(s/60)+'м';
+  if(s < 86400) return Math.floor(s/3600)+'ч '+Math.floor((s%3600)/60)+'м';
+  return Math.floor(s/86400)+'д '+Math.floor((s%86400)/3600)+'ч';
+}
+function renderPager(elId, page, totalPages, onChange){
+  const el = document.getElementById(elId);
+  if(totalPages <= 1){ el.innerHTML = ''; return; }
+  el.innerHTML = `<button id="${elId}_prev" ${page<=0?'disabled':''}>&#8249; Назад</button>`
+    + `<span>стр. ${page+1} из ${totalPages}</span>`
+    + `<button id="${elId}_next" ${page>=totalPages-1?'disabled':''}>Вперёд &#8250;</button>`;
+  document.getElementById(elId+'_prev').onclick = () => onChange(page-1);
+  document.getElementById(elId+'_next').onclick = () => onChange(page+1);
+}
+
+// ─── История сигналов: фильтр + пагинация (v3.0 — раньше рендерился весь
+// массив целиком, список рос без ограничений и был неудобен на мобильном) ──
+const HIST_PAGE_SIZE = 15;
+let histFilter = 'all', histPage = 0, histAllItems = [];
+function setHistFilter(f){
+  histFilter = f; histPage = 0;
+  document.querySelectorAll('#histFilterRow .filter-btn').forEach(b => b.classList.toggle('active', b.dataset.f === f));
+  renderHistoryTable();
+}
+function renderHistoryTable(){
+  const filtered = histFilter === 'all' ? histAllItems : histAllItems.filter(it => it.status === histFilter);
+  const totalPages = Math.max(1, Math.ceil(filtered.length / HIST_PAGE_SIZE));
+  if(histPage >= totalPages) histPage = totalPages - 1;
+  if(histPage < 0) histPage = 0;
+  const pageItems = filtered.slice(histPage*HIST_PAGE_SIZE, histPage*HIST_PAGE_SIZE + HIST_PAGE_SIZE);
+  const tbody3 = document.querySelector('#history tbody'); tbody3.innerHTML = '';
+  const statusLabel = {open:'&#9203; Открыт', tp:'&#9989; TP', sl:'&#10060; SL'};
+  for(const it of pageItems){
+    const tr = document.createElement('tr');
+    const dcls = it.dir === 'long' ? 'long' : 'short';
+    const liveBadge = it.live ? '<span class="livebadge">LIVE</span>' : '';
+    let pctStr = '', whenCell = fmtAgo(it.opened_at);
+    if((it.status === 'tp' || it.status === 'sl') && it.close_price != null){
+      const pct = it.dir === 'long'
+        ? (it.close_price - it.price) / it.price * 100
+        : (it.price - it.close_price) / it.price * 100;
+      pctStr = ' ' + (pct >= 0 ? '+' : '') + pct.toFixed(2) + '%';
+      tr.classList.add('row-' + it.status);
+      if(it.closed_at) whenCell += `<div class="dur">длилась ${fmtDuration(it.closed_at - it.opened_at)}</div>`;
+    }
+    const badge = `<span class="status-pill ${it.status}">${statusLabel[it.status]||it.status}${pctStr}</span>${liveBadge}`;
+    tr.innerHTML = `<td>${it.symbol}</td><td>${it.tf}</td><td>EMA${it.ema_period}</td><td class="${dcls}">${it.dir.toUpperCase()}</td><td>${it.price}</td><td>${it.sl}</td><td>${it.tp}</td><td>${badge}</td><td>${whenCell}</td>`;
+    tbody3.appendChild(tr);
+  }
+  renderPager('historyPager', histPage, totalPages, p => { histPage = p; renderHistoryTable(); });
+}
+
+// ─── Досье по монетам: та же пагинация (список тоже мог быть до ~250 строк) ─
+const DOSSIER_PAGE_SIZE = 20;
+let dossierPage = 0, dossierAllRows = [];
+function renderDossierTable(){
+  const totalPages = Math.max(1, Math.ceil(dossierAllRows.length / DOSSIER_PAGE_SIZE));
+  if(dossierPage >= totalPages) dossierPage = totalPages - 1;
+  if(dossierPage < 0) dossierPage = 0;
+  const pageRows = dossierAllRows.slice(dossierPage*DOSSIER_PAGE_SIZE, dossierPage*DOSSIER_PAGE_SIZE + DOSSIER_PAGE_SIZE);
+  const tbody = document.querySelector('#dossier tbody'); tbody.innerHTML = '';
+  for(const row of pageRows){
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${row.sym}</td><td>${row.pumpLabel}</td><td>${row.tf}</td><td>EMA${row.ema}</td><td>${(row.rate*100).toFixed(0)}%</td>`;
+    tbody.appendChild(tr);
+  }
+  renderPager('dossierPager', dossierPage, totalPages, p => { dossierPage = p; renderDossierTable(); });
+}
+
 async function refresh(){
   try{
     const r2 = await fetch('/ema_live_signals'); const d2 = await r2.json();
@@ -5264,17 +5396,11 @@ async function refresh(){
     }
 
     const r3 = await fetch('/ema_signal_history'); const d3 = await r3.json();
-    document.getElementById('histSummary').innerText = d3.closed
-      ? `закрыто ${d3.closed} (TP ${d3.tp} / SL ${d3.sl}) — винрейт ${d3.winrate}%` : '';
-    const tbody3 = document.querySelector('#history tbody'); tbody3.innerHTML = '';
-    const statusLabel = {open:'⏳ открыт', tp:'✅ TP', sl:'❌ SL'};
-    for(const it of (d3.items||[])){
-      const tr = document.createElement('tr');
-      const dcls = it.dir === 'long' ? 'long' : 'short';
-      const liveBadge = it.live ? '<span class="livebadge">LIVE</span>' : '';
-      tr.innerHTML = `<td>${it.symbol}</td><td>${it.tf}</td><td>EMA${it.ema_period}</td><td class="${dcls}">${it.dir.toUpperCase()}</td><td>${it.price}</td><td>${it.sl}</td><td>${it.tp}</td><td class="${it.status}">${statusLabel[it.status]||it.status}${liveBadge}</td><td>${fmtAgo(it.opened_at)}</td>`;
-      tbody3.appendChild(tr);
-    }
+    document.getElementById('histSummary').innerHTML = d3.closed
+      ? `закрыто <b>${d3.closed}</b> &nbsp;·&nbsp; <span class="tp">&#9989; TP ${d3.tp}</span> &nbsp;·&nbsp; <span class="sl">&#10060; SL ${d3.sl}</span> &nbsp;·&nbsp; винрейт <b>${d3.winrate}%</b>`
+      : 'пока нет закрытых сигналов';
+    histAllItems = d3.items || [];
+    renderHistoryTable();
 
     const r = await fetch('/ema_dossier_status'); const d = await r.json();
     document.getElementById('status').innerText =
@@ -5293,12 +5419,8 @@ async function refresh(){
     }
     rows.sort((a,b) => b.rate - a.rate);
     document.getElementById('dossierCount').innerText = rows.length;
-    const tbody = document.querySelector('#dossier tbody'); tbody.innerHTML = '';
-    for(const row of rows){
-      const tr = document.createElement('tr');
-      tr.innerHTML = `<td>${row.sym}</td><td>${row.pumpLabel}</td><td>${row.tf}</td><td>EMA${row.ema}</td><td>${(row.rate*100).toFixed(0)}%</td>`;
-      tbody.appendChild(tr);
-    }
+    dossierAllRows = rows;
+    renderDossierTable();
   }catch(e){}
 }
 refresh(); setInterval(refresh, 5000);
