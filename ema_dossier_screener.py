@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 """
+EMA Bounce Dossier v2.8 (fork of SMC Optimizer v3.52.96)
+- v2.8: на /ema добавлены ещё 2 кнопки настроек — "🔔 Алерты" и
+  "🔑 Gate.io API". Ничего нового на бэкенде не потребовалось: /alert_cfg и
+  /gate_cfg уже были общими для всего процесса (не привязаны к SMC), просто
+  раньше к ним не было доступа со страницы /ema — теперь есть свои модалки,
+  использующие те же самые эндпоинты. Алерты: token/chat/ntfy + кнопка
+  "Тест" (шлёт настоящее тестовое сообщение через /alert_test). Gate.io:
+  ключ+секрет сохраняются вместе (оба поля обязательны разом, чтобы не
+  затереть один из них пустым по ошибке) — без них /ema_auto_trade_settings
+  откажется включать автоторговлю.
 EMA Bounce Dossier v2.7 (fork of SMC Optimizer v3.52.96)
 - v2.7: реальная автоторговля по EMA-сигналам через Gate.io (переиспользует
   универсальные _gate_open_position/_gate_close_position/_gate_get_position
@@ -2025,7 +2035,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "2.7"
+APP_VERSION  = "2.8"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -5022,6 +5032,8 @@ input:checked + .slider:before{transform:translateX(20px)}
 <h1>&#9889; EMA Bounce Dossier</h1>
 <button onclick="startScan()">Запустить скан (топ-50)</button>
 <button onclick="openSettings()" style="background:#21262d;border:1px solid #30363d">&#9881;&#65039; Автоторговля</button>
+<button onclick="openAlertSettings()" style="background:#21262d;border:1px solid #30363d">&#128276; Алерты</button>
+<button onclick="openGateSettings()" style="background:#21262d;border:1px solid #30363d">&#128273; Gate.io API</button>
 <div id="status"></div>
 <div id="atBox"></div>
 
@@ -5043,6 +5055,42 @@ input:checked + .slider:before{transform:translateX(20px)}
       <button onclick="saveSettings()">Сохранить</button>
     </div>
     <div id="atMsg" style="margin-top:8px;font-size:12px;color:#f85149"></div>
+  </div>
+</div>
+
+<div id="alertModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:50;align-items:center;justify-content:center">
+  <div class="card">
+    <h3 style="margin-top:0">&#128276; Алерты (Telegram / ntfy)</h3>
+    <label>Telegram bot token</label>
+    <input type="text" id="alTgToken" placeholder="123456:AAаа...">
+    <label>Telegram chat id</label>
+    <input type="text" id="alTgChat" placeholder="-1001234567890">
+    <label>ntfy.sh URL (необязательно, запасной канал)</label>
+    <input type="text" id="alNtfyUrl" placeholder="https://ntfy.sh/my-topic">
+    <div class="row">
+      <button onclick="closeAlertSettings()" style="background:#21262d;border:1px solid #30363d">Отмена</button>
+      <div>
+        <button onclick="testAlert()" style="background:#1f6feb">Тест</button>
+        <button onclick="saveAlertSettings()">Сохранить</button>
+      </div>
+    </div>
+    <div id="alertMsg" style="margin-top:8px;font-size:12px;color:#f85149"></div>
+  </div>
+</div>
+
+<div id="gateModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:50;align-items:center;justify-content:center">
+  <div class="card">
+    <h3 style="margin-top:0">&#128273; Gate.io API ключи</h3>
+    <p style="font-size:12px;color:#8b949e;margin-top:0">Ключи нужны для автоторговли (реальные ордера). Оба поля заполняются вместе — при сохранении старые ключи полностью заменяются.</p>
+    <label>API key</label>
+    <input type="text" id="gateKeyInput" placeholder="">
+    <label>API secret</label>
+    <input type="text" id="gateSecretInput" placeholder="">
+    <div class="row">
+      <button onclick="closeGateSettings()" style="background:#21262d;border:1px solid #30363d">Отмена</button>
+      <button onclick="saveGateSettings()">Сохранить</button>
+    </div>
+    <div id="gateMsg" style="margin-top:8px;font-size:12px;color:#f85149"></div>
   </div>
 </div>
 
@@ -5093,6 +5141,57 @@ async function saveSettings(){
 async function closeLivePosition(sym){
   if(!confirm(`Закрыть реальную позицию ${sym} маркетом прямо сейчас?`)) return;
   await fetch('/ema_auto_trade_close', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({symbol: sym})});
+  refreshAutoTradeBox();
+}
+
+function openAlertSettings(){ document.getElementById('alertModal').style.display='flex'; loadAlertSettings(); }
+function closeAlertSettings(){ document.getElementById('alertModal').style.display='none'; }
+async function loadAlertSettings(){
+  try{
+    const r = await fetch('/alert_cfg'); const d = await r.json();
+    document.getElementById('alTgToken').value = d.tg_token || '';
+    document.getElementById('alTgChat').value  = d.tg_chat  || '';
+    document.getElementById('alNtfyUrl').value = d.ntfy_url || '';
+  }catch(e){}
+}
+async function saveAlertSettings(){
+  const msg = document.getElementById('alertMsg'); msg.innerText = '';
+  const payload = {
+    tg_token: document.getElementById('alTgToken').value.trim(),
+    tg_chat:  document.getElementById('alTgChat').value.trim(),
+    ntfy_url: document.getElementById('alNtfyUrl').value.trim(),
+  };
+  const r = await fetch('/alert_cfg', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+  const d = await r.json();
+  if(!d.ok){ msg.innerText = d.msg || 'Ошибка сохранения'; return; }
+  closeAlertSettings();
+}
+async function testAlert(){
+  const msg = document.getElementById('alertMsg'); msg.style.color = '#8b949e'; msg.innerText = 'Отправляю...';
+  await saveAlertSettings();
+  const r = await fetch('/alert_test'); const d = await r.json();
+  msg.style.color = d.ok ? '#3fb950' : '#f85149';
+  msg.innerText = d.ok ? '✅ Тестовое сообщение отправлено' : ('Ошибка: ' + (d.error||''));
+}
+
+function openGateSettings(){ document.getElementById('gateModal').style.display='flex'; loadGateSettings(); }
+function closeGateSettings(){ document.getElementById('gateModal').style.display='none'; }
+async function loadGateSettings(){
+  try{
+    const r = await fetch('/gate_cfg'); const d = await r.json();
+    document.getElementById('gateKeyInput').placeholder = d.has_key ? (d.gate_key + ' (сохранён)') : 'API key';
+    document.getElementById('gateSecretInput').placeholder = d.has_key ? '*** (сохранён)' : 'API secret';
+  }catch(e){}
+}
+async function saveGateSettings(){
+  const msg = document.getElementById('gateMsg'); msg.innerText = '';
+  const key = document.getElementById('gateKeyInput').value.trim();
+  const sec = document.getElementById('gateSecretInput').value.trim();
+  if(!key || !sec){ msg.innerText = 'Введите и ключ, и секрет вместе'; return; }
+  const r = await fetch('/gate_cfg', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({gate_key:key, gate_secret:sec})});
+  const d = await r.json();
+  if(!d.ok){ msg.innerText = 'Ошибка сохранения'; return; }
+  closeGateSettings();
   refreshAutoTradeBox();
 }
 async function refreshAutoTradeBox(){
