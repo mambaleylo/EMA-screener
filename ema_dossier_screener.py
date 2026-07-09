@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
 """
+EMA Bounce Dossier v2.9 (fork of SMC Optimizer v3.52.96)
+- v2.9: убрана отдельная кнопка/модалка "🔑 Gate.io API" — поля key/secret
+  перенесены внутрь модалки "⚙️ Автоторговля" (логичнее: ключи нужны именно
+  для неё). loadSettingsIntoModal/saveSettings теперь заодно читают и пишут
+  /gate_cfg; поля можно оставить пустыми, чтобы не менять уже сохранённые
+  ключи, но если заполнено одно — обязательно и второе.
+  Заодно найден и исправлен баг вёрстки, из-за которого модалка "Алерты"
+  выглядела неоформленной (текст без карточки/фона, наплывал на таблицу
+  позади): CSS-правила .card/label/input были прибиты селектором
+  `#atModal .card` и т.п. ТОЛЬКО к id=atModal, поэтому #alertModal (и бывший
+  #gateModal) их не получали вовсе. Теперь селекторы `#atModal, #alertModal`
+  общие для обеих модалок.
 EMA Bounce Dossier v2.8 (fork of SMC Optimizer v3.52.96)
 - v2.8: на /ema добавлены ещё 2 кнопки настроек — "🔔 Алерты" и
   "🔑 Gate.io API". Ничего нового на бэкенде не потребовалось: /alert_cfg и
@@ -2035,7 +2047,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "2.8"
+APP_VERSION  = "2.9"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -5017,11 +5029,12 @@ th{color:#8b949e}
 #status{color:#8b949e;font-size:13px;margin-top:8px}
 .livebadge{background:#1f6feb;color:#fff;font-size:10px;padding:1px 5px;border-radius:3px;margin-left:4px}
 #atBox{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px 14px;margin-top:10px;font-size:13px}
-#atModal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:50;align-items:center;justify-content:center}
-#atModal .card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:20px;width:min(420px,92vw)}
-#atModal label{display:block;margin-top:12px;font-size:13px;color:#8b949e}
-#atModal input[type=number]{width:100%;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:8px;margin-top:4px;font-size:14px;box-sizing:border-box}
-#atModal .row{display:flex;justify-content:space-between;align-items:center;margin-top:12px}
+#atModal,#alertModal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:50;align-items:center;justify-content:center}
+#atModal .card,#alertModal .card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:20px;width:min(420px,92vw)}
+#atModal label,#alertModal label{display:block;margin-top:12px;font-size:13px;color:#8b949e}
+#atModal input[type=number],#alertModal input[type=number],#atModal input[type=text],#alertModal input[type=text]{width:100%;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:8px;margin-top:4px;font-size:14px;box-sizing:border-box}
+#atModal .row,#alertModal .row{display:flex;justify-content:space-between;align-items:center;margin-top:12px}
+#atModal hr{border:0;border-top:1px solid #30363d;margin:16px 0 4px}
 .switch{position:relative;width:44px;height:24px}
 .switch input{opacity:0;width:0;height:0}
 .slider{position:absolute;inset:0;background:#30363d;border-radius:24px;cursor:pointer;transition:.2s}
@@ -5033,7 +5046,6 @@ input:checked + .slider:before{transform:translateX(20px)}
 <button onclick="startScan()">Запустить скан (топ-50)</button>
 <button onclick="openSettings()" style="background:#21262d;border:1px solid #30363d">&#9881;&#65039; Автоторговля</button>
 <button onclick="openAlertSettings()" style="background:#21262d;border:1px solid #30363d">&#128276; Алерты</button>
-<button onclick="openGateSettings()" style="background:#21262d;border:1px solid #30363d">&#128273; Gate.io API</button>
 <div id="status"></div>
 <div id="atBox"></div>
 
@@ -5050,6 +5062,13 @@ input:checked + .slider:before{transform:translateX(20px)}
     <input type="number" id="atRiskPct" step="0.5" min="0.1" max="100">
     <label>Максимум одновременных позиций (пусто = без ограничений)</label>
     <input type="number" id="atMaxConcurrent" step="1" min="1">
+    <hr>
+    <label style="color:#c9d1d9;font-weight:bold">&#128273; Gate.io API ключи</label>
+    <p style="font-size:12px;color:#8b949e;margin:2px 0 0">Нужны для реальных ордеров. Оставьте пустыми, чтобы не менять сохранённые. Оба поля заполняются вместе.</p>
+    <label>API key</label>
+    <input type="text" id="atGateKey" placeholder="">
+    <label>API secret</label>
+    <input type="text" id="atGateSecret" placeholder="">
     <div class="row">
       <button onclick="closeSettings()" style="background:#21262d;border:1px solid #30363d">Отмена</button>
       <button onclick="saveSettings()">Сохранить</button>
@@ -5075,22 +5094,6 @@ input:checked + .slider:before{transform:translateX(20px)}
       </div>
     </div>
     <div id="alertMsg" style="margin-top:8px;font-size:12px;color:#f85149"></div>
-  </div>
-</div>
-
-<div id="gateModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:50;align-items:center;justify-content:center">
-  <div class="card">
-    <h3 style="margin-top:0">&#128273; Gate.io API ключи</h3>
-    <p style="font-size:12px;color:#8b949e;margin-top:0">Ключи нужны для автоторговли (реальные ордера). Оба поля заполняются вместе — при сохранении старые ключи полностью заменяются.</p>
-    <label>API key</label>
-    <input type="text" id="gateKeyInput" placeholder="">
-    <label>API secret</label>
-    <input type="text" id="gateSecretInput" placeholder="">
-    <div class="row">
-      <button onclick="closeGateSettings()" style="background:#21262d;border:1px solid #30363d">Отмена</button>
-      <button onclick="saveGateSettings()">Сохранить</button>
-    </div>
-    <div id="gateMsg" style="margin-top:8px;font-size:12px;color:#f85149"></div>
   </div>
 </div>
 
@@ -5123,9 +5126,27 @@ async function loadSettingsIntoModal(){
     document.getElementById('atRiskPct').value = d.risk_pct;
     document.getElementById('atMaxConcurrent').value = d.max_concurrent ?? '';
   }catch(e){}
+  try{
+    const rg = await fetch('/gate_cfg'); const dg = await rg.json();
+    document.getElementById('atGateKey').value = '';
+    document.getElementById('atGateSecret').value = '';
+    document.getElementById('atGateKey').placeholder = dg.has_key ? (dg.gate_key + ' (сохранён)') : 'API key';
+    document.getElementById('atGateSecret').placeholder = dg.has_key ? '*** (сохранён)' : 'API secret';
+  }catch(e){}
 }
 async function saveSettings(){
   const msg = document.getElementById('atMsg'); msg.innerText = '';
+  const gateKey = document.getElementById('atGateKey').value.trim();
+  const gateSecret = document.getElementById('atGateSecret').value.trim();
+  if((gateKey && !gateSecret) || (!gateKey && gateSecret)){
+    msg.innerText = 'Введите и ключ, и секрет Gate.io вместе (или оставьте оба пустыми)';
+    return;
+  }
+  if(gateKey && gateSecret){
+    const rg = await fetch('/gate_cfg', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({gate_key:gateKey, gate_secret:gateSecret})});
+    const dg = await rg.json();
+    if(!dg.ok){ msg.innerText = 'Ошибка сохранения ключей Gate.io'; return; }
+  }
   const payload = {
     enabled: document.getElementById('atEnabled').checked,
     position_pct: parseFloat(document.getElementById('atPositionPct').value),
@@ -5174,26 +5195,6 @@ async function testAlert(){
   msg.innerText = d.ok ? '✅ Тестовое сообщение отправлено' : ('Ошибка: ' + (d.error||''));
 }
 
-function openGateSettings(){ document.getElementById('gateModal').style.display='flex'; loadGateSettings(); }
-function closeGateSettings(){ document.getElementById('gateModal').style.display='none'; }
-async function loadGateSettings(){
-  try{
-    const r = await fetch('/gate_cfg'); const d = await r.json();
-    document.getElementById('gateKeyInput').placeholder = d.has_key ? (d.gate_key + ' (сохранён)') : 'API key';
-    document.getElementById('gateSecretInput').placeholder = d.has_key ? '*** (сохранён)' : 'API secret';
-  }catch(e){}
-}
-async function saveGateSettings(){
-  const msg = document.getElementById('gateMsg'); msg.innerText = '';
-  const key = document.getElementById('gateKeyInput').value.trim();
-  const sec = document.getElementById('gateSecretInput').value.trim();
-  if(!key || !sec){ msg.innerText = 'Введите и ключ, и секрет вместе'; return; }
-  const r = await fetch('/gate_cfg', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({gate_key:key, gate_secret:sec})});
-  const d = await r.json();
-  if(!d.ok){ msg.innerText = 'Ошибка сохранения'; return; }
-  closeGateSettings();
-  refreshAutoTradeBox();
-}
 async function refreshAutoTradeBox(){
   try{
     const r = await fetch('/ema_auto_trade_status'); const d = await r.json();
