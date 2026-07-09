@@ -3984,6 +3984,12 @@ EMA_WEEKLY_PERIODS  = EMA_TF_PERIODS["1w"]
 PUMP_LOOKBACK_DAYS  = 7
 PUMP_THRESHOLD_PCT  = 20.0   # v1.1: рост за PUMP_LOOKBACK_DAYS дней, помечаем монету "resent pump"
 EMA_DOSSIER_TOUCH_ATR    = 0.25   # допуск касания EMA, в ATR(14)
+EMA_TOUCH_EXIT_MULT      = 1.8    # v2.6: гистерезис — выход из зоны касания
+                                   # засчитывается только дальше, чем
+                                   # tol*EMA_TOUCH_EXIT_MULT, чтобы шум цены
+                                   # прямо на границе tol не плодил дубли
+                                   # сигналов (см. комментарий в
+                                   # _ema_check_symbol_signal)
 EMA_TOUCH_CLOSE_MAX_ATR  = 1.5    # v1.6: КРИТИЧНЫЙ ФИКС — старое "касание"
                                    # проверяло только (low-tol)<=EMA<=(high+tol),
                                    # т.е. EMA попадает в диапазон [low,high] всей
@@ -4651,14 +4657,32 @@ def _ema_check_symbol_signal(symbol, pick):
     live_price = _gate_get_price(symbol)
     if not live_price: return None
     ema_v = _ema_live_value(ema_closed, live_price, ema_period)   # v1.8-b: EMA "сейчас"
+    dist = abs(live_price - ema_v)
     tol = EMA_DOSSIER_TOUCH_ATR * atr_v
-    touched_now = abs(live_price - ema_v) <= tol
+    # v2.6: КРИТИЧНЫЙ ФИКС — почти-дубликаты сигналов по одной и той же
+    # монете/ТФ/EMA с похожим entry/SL/TP через 10-30 минут (живой кейс:
+    # MU_USDT 1d EMA28 SHORT, XAU_USDT 4h EMA50 SHORT). Причина: вход и
+    # выход из зоны касания раньше проверялись по ОДНОЙ и той же границе
+    # tol — живая цена (_gate_get_price) естественно дрожит прямо у этой
+    # границы (тики/спред), и на соседних опросах флаг was_in_zone мог
+    # успеть сброситься в False и тут же снова стать True, что засчитывалось
+    # как "новый свежий подход" к линии, хотя цена реально топталась почти
+    # на месте. Гистерезис: ВХОД в зону — по tol (как раньше), а вот сброс
+    # "мы ушли и вернёмся заново" — только когда цена реально отошла дальше,
+    # за tol_exit (заметно шире tol). Шум на границе tol больше не
+    # засчитывается как выход из зоны.
+    tol_exit = tol * EMA_TOUCH_EXIT_MULT
+    touched_now = dist <= tol
     # v1.8: "заходили ли мы уже в зону этого касания" — фиксируем состояние
     # ПЕРЕД любыми return, чтобы при выходе из зоны (цена ушла) следующий
     # реальный подход снова считался свежим касанием
     key = f"{symbol}|{tf}|{ema_period}"
     was_in_zone = _ema_touch_state.get(key, False)
-    _ema_touch_state[key] = touched_now
+    if dist > tol_exit:
+        _ema_touch_state[key] = False        # реально ушли из зоны — сброс
+    elif touched_now:
+        _ema_touch_state[key] = True         # внутри узкой зоны касания
+    # иначе (между tol и tol_exit) — состояние не трогаем, "серая зона"
     if not touched_now or was_in_zone:
         return None   # либо не у линии, либо уже отработали этот подход
     side_above = ctx["close_i"] > ema_closed   # направление — по последнему закрытию (стабильно)
