@@ -1,5 +1,27 @@
 #!/usr/bin/env python3
 """
+EMA Bounce Dossier v3.2.1 (fork of SMC Optimizer v3.52.96)
+- v3.2.1: доп. к v3.2.0 — _ema_reconcile_live_positions() теперь сразу
+  снимает (_gate_cancel_orders) зависшие TP/SL price_orders от внешне
+  закрытой позиции, не дожидаясь следующего входа по этой монете (раньше
+  снятие происходило только внутри _gate_open_position перед НОВЫМ входом
+  — до этого момента мёртвый TP/SL продолжал висеть в ордерах на бирже).
+EMA Bounce Dossier v3.2.0 (fork of SMC Optimizer v3.52.96)
+- v3.2.0: КРИТИЧНЫЙ ФИКС — live-сигналы не сверялись с реальной биржей.
+  Статус "открыт"→"tp"/"sl" менялся ТОЛЬКО когда наша живая цена пересекала
+  расчётные sl/tp сигнала. Если реальная позиция на Gate закрывалась ДРУГИМ
+  путём (кнопка "Закрыть" на /ema, ручное закрытие в приложении биржи,
+  ликвидация) раньше, чем цена доходила до этих уровней — /ema дальше
+  показывал сигнал "Открыт LIVE" сколько угодно, при этом блокируя новый
+  сигнал по той же монете. Живой кейс: HYPE_USDT закрылась на Gate за 88с
+  по 67.887, наш SL был 67.8679 (цена туда не доходила) — /ema ещё
+  несколько минут показывал "Открыт". Добавлен _ema_reconcile_live_
+  positions() — по образцу давно работающего _check_position_closed_and_
+  alert() из одиночного SMC-бота, но для каждого live-сигнала из
+  мульти-монетного дневника: если позиции нет на бирже, а мы всё ещё
+  считаем её "open" — берём реальные close_price/pnl через
+  _gate_get_last_pnl и закрываем запись, помечая closed_externally=True
+  (diag_status="skip" для убытков — это не наш SL, разбирать нечего).
 EMA Bounce Dossier v3.1.0 (fork of SMC Optimizer v3.52.96)
 - v3.1.0: разбор первого боевого лога (44 закрытых сигнала, winrate 34%) +
   диагностика 13 стопов. Добавлен фильтр по тренду старшего ТФ (D1, EMA28):
@@ -2098,7 +2120,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.1.0"
+APP_VERSION  = "3.2.1"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4470,6 +4492,73 @@ def _ema_history_add(sig):
         _save_ema_history(state)
         return key
 
+def _ema_reconcile_live_positions():
+    """v3.2: примиряет 'открытые' live-сигналы с реальным состоянием на
+    бирже. До этого статус live-сигнала менялся ТОЛЬКО когда наша живая
+    цена пересекала item['sl']/item['tp'] (см. _ema_history_update_open
+    ниже) — а если реальная позиция на Gate закрылась ДРУГИМ путём (кнопка
+    "Закрыть" на /ema, ручное закрытие в приложении биржи, ликвидация) до
+    того, как цена дошла до наших расчётных уровней — история продолжала
+    показывать "Открыт" сколько угодно (реальный кейс: HYPE_USDT закрылась
+    на Gate за 88с по 67.887, наш SL был 67.8679 — цена туда даже близко не
+    подходила, а /ema ещё несколько минут показывал её "Открыт LIVE"). Это
+    же и блокировало новый сигнал по той же монете — см. проверку
+    `if any(v["symbol"] == symbol ...)` в _ema_maybe_open_live_trade.
+    Использует ту же пару _gate_get_position/_gate_get_last_pnl, что уже
+    много версий работает в одиночном SMC-боте (_check_position_closed_
+    and_alert) — здесь тот же принцип, применённый к каждому live-сигналу
+    из мульти-монетного дневника."""
+    with _ema_history_lock:
+        state = _load_ema_history()
+    live_open = [(k, v) for k, v in state["items"].items()
+                 if v.get("status") == "open" and v.get("live")]
+    if not live_open:
+        return
+    updated = {}
+    for key, item in live_open:
+        contract = item["symbol"].replace("/", "_").upper()
+        try:
+            still_open = _gate_get_position(contract)
+        except Exception as e:
+            olog(f"[ema_reconcile] {item['symbol']}: не смог проверить биржу ({e}) — пропуск")
+            continue
+        if still_open:
+            continue   # реально ещё открыта — наш обычный live-опрос сам разберётся по sl/tp
+        # v3.2.1: позиции уже нет, но её TP/SL price_orders (reduce_only)
+        # могли остаться висеть на бирже (Gate не всегда сам их снимает при
+        # закрытии позиции другим путём). _gate_open_position и так снимает
+        # старые ордера перед КАЖДЫМ новым входом — но пока новый сигнал не
+        # пришёл, "мёртвый" TP/SL от закрытой сделки продолжает висеть в
+        # ордерах (видно в приложении биржи, путает). Снимаем сразу, не
+        # дожидаясь следующего входа.
+        try:
+            _gate_cancel_orders(contract)
+        except Exception as e:
+            olog(f"[ema_reconcile] {item['symbol']}: не смог снять старые ордера ({e})")
+        pnl_info = _gate_get_last_pnl(item["symbol"])
+        close_p  = pnl_info["close_price"] if pnl_info else item.get("sl")
+        won      = bool(pnl_info and pnl_info["pnl"] >= 0)
+        item["status"]            = "tp" if won else "sl"
+        item["closed_at"]         = int(time.time())
+        item["close_price"]       = close_p
+        # v3.2: помечаем отдельно — это НЕ наш стратегический SL/TP, а
+        # внешнее закрытие. diag_status="skip" вместо "pending", чтобы
+        # _ema_run_diagnostics не пытался разбирать "почему сработал стоп"
+        # там, где стопа по нашей логике не было вовсе.
+        item["closed_externally"] = True
+        item["diag_status"]       = None if won else "skip"
+        if pnl_info:
+            item["live_pnl"]     = pnl_info["pnl"]
+            item["live_pnl_pct"] = pnl_info["pnl_pct"]
+        olog(f"[ema_reconcile] {item['symbol']}: реально закрыта на бирже "
+             f"внешним путём (не по нашему TP/SL), close={close_p} pnl={pnl_info}")
+        updated[key] = item
+    if updated:
+        with _ema_history_lock:
+            state = _load_ema_history()
+            state["items"].update(updated)
+            _save_ema_history(state)
+
 def _ema_history_update_open():
     """Проходит по всем сигналам со статусом 'open' и проверяет, что
     сработало раньше — TP или SL. v1.8: вход теперь по живой цене (см.
@@ -5087,6 +5176,7 @@ def _ema_signal_loop():
                 _send_alert(msg)
                 olog(f"[ema_live] новый сигнал {symbol} {sig['tf']} EMA{sig['ema_period']} {sig['dir']}")
                 _ema_maybe_open_live_trade(symbol, sig, hist_key)   # v2.7: реальная автоторговля
+            _ema_reconcile_live_positions()  # v3.2: см. комментарий у функции — сверка live-сигналов с реальной биржей
             _ema_history_update_open()   # v1.7: проверяем открытые сигналы на TP/SL
             _ema_run_diagnostics()       # v2.5: разбор убыточных сигналов, готовых к анализу
         except Exception as e:
