@@ -1,5 +1,28 @@
 #!/usr/bin/env python3
 """
+EMA Bounce Dossier v3.3.0 (fork of SMC Optimizer v3.52.96)
+- v3.3.0: аудит обработки биржевых ошибок в живой торговле, 3 находки:
+  1) Голая позиция без TP/SL — если процесс убило (Termux LMK/Huawei
+     power-saving) ровно между входом и выставлением защиты, или обе
+     попытки при открытии не прошли, единственным следом оставался алерт
+     "выставь вручную", дальше ничего не следило. Добавлен
+     _ema_rearm_missing_protection() — для каждой реально открытой live-
+     позиции проверяет по тегам t-ema-tp/t-ema-sl, что защита на месте, и
+     перевыставляет её по сохранённым в истории sl/tp, если нет.
+     _gate_place_protective_orders вынесена из _gate_open_position в
+     отдельную функцию, чтобы её же использовал и watchdog.
+  2) _save_ema_history писала прямо в файл — килл процесса посреди
+     json.dump оставлял битый файл, _load_ema_history тихо возвращал
+     пустую историю (весь live-учёт, live=True флаги — терялись).
+     Теперь пишем во временный файл + os.replace (атомарно).
+  3) Gate 429 (rate limit) раньше сразу падал в RuntimeError без ретрая
+     (ретраились только сетевые обрывы/таймауты). Теперь 429 ретраится
+     с увеличенной паузой — сама биржа запрос не обработала, повтор
+     безопасен (в отличие от неидемпотентных ордеров, тут логика ретрая
+     осталась прежней — не трогали).
+  Прошлись и по остальным местам (нехватка баланса, невалидные
+  плечо/размер/цена, недоступность контракта, битые ответы биржи) —
+  везде уже стояли явные проверки и понятные алерты, ничего не нашлось.
 EMA Bounce Dossier v3.2.1 (fork of SMC Optimizer v3.52.96)
 - v3.2.1: доп. к v3.2.0 — _ema_reconcile_live_positions() теперь сразу
   снимает (_gate_cancel_orders) зависшие TP/SL price_orders от внешне
@@ -2120,7 +2143,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.2.1"
+APP_VERSION  = "3.3.0"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2349,6 +2372,18 @@ def _gate_req(method, path, params=None, body=None, _retries=3, _retry_delay=2.0
         try:
             r = requests.request(method, url, headers=headers,
                                  data=body_str if body_str else None, timeout=10)
+            if r.status_code == 429:
+                # v3.3: раньше 429 попадал в общий "не r.ok" → RuntimeError,
+                # который _gate_req НЕ ретраит (осознанно, см. коммент выше —
+                # чтобы не задваивать неидемпотентные ордера). Но 429 —
+                # ровно противоположный случай: запрос биржа НЕ обработала
+                # вообще, ретрай с задержкой здесь безопасен и правилен.
+                last_exc = RuntimeError(f"Gate {method} {path} → 429: {r.text[:200]}")
+                if attempt < _retries:
+                    olog(f"⚠ Gate 429 rate limit (попытка {attempt}/{_retries}) — повтор через {_retry_delay*2}с")
+                    time.sleep(_retry_delay * 2)
+                    continue
+                raise last_exc
             if not r.ok:
                 raise RuntimeError(f"Gate {method} {path} → {r.status_code}: {r.text[:200]}")
             return r.json()
@@ -2670,6 +2705,109 @@ def _gate_round_price(price, contract):
         if price > 1:     return f"{price:.4f}"
         return f"{price:.6f}"
 
+def _gate_place_protective_orders(symbol, direction, close_size, sl_px, tp_px, text_prefix="smc"):
+    """Выставляет TP/SL price_orders (reduce_only) для уже открытой позиции.
+    v3.3: вынесено из _gate_open_position в отдельную функцию — раньше это
+    был локальный closure _place_tp_sl только внутри неё, теперь тем же
+    кодом пользуется и watchdog переармирования защиты
+    (_ema_rearm_missing_protection) при потере TP/SL: килл процесса ровно
+    между входом и выставлением защиты, или обе попытки при открытии не
+    прошли — раньше это оставалось голой позицией до ручного вмешательства."""
+    contract = symbol.replace("/", "_").upper()
+    is_long = (direction == "long")
+    _gate_req("POST", "/futures/usdt/price_orders", body={
+        "initial": {
+            "contract":    contract,
+            "size":        close_size,
+            "price":       "0",
+            "tif":         "ioc",
+            "reduce_only": True,
+            "text":        f"t-{text_prefix}-tp",
+        },
+        "trigger": {
+            "strategy_type": 0,
+            "price_type":    0,
+            "price":         _gate_round_price(tp_px, contract),
+            "rule":          1 if is_long else 2,
+            "expiration":    86400,
+        },
+    })
+    _gate_req("POST", "/futures/usdt/price_orders", body={
+        "initial": {
+            "contract":    contract,
+            "size":        close_size,
+            "price":       "0",
+            "tif":         "ioc",
+            "reduce_only": True,
+            "text":        f"t-{text_prefix}-sl",
+        },
+        "trigger": {
+            "strategy_type": 0,
+            "price_type":    0,
+            "price":         _gate_round_price(sl_px, contract),
+            "rule":          2 if is_long else 1,
+            "expiration":    86400,
+        },
+    })
+
+def _gate_has_protective_orders(symbol, text_prefix):
+    """v3.3: смотрит открытые price_orders по контракту и проверяет, есть
+    ли среди них НАШИ TP/SL (по тегу t-{prefix}-tp/-sl). Возвращает
+    (has_tp, has_sl) или None, если не смогли спросить биржу (тогда
+    вызывающий код не должен ничего перевыставлять вслепую)."""
+    contract = symbol.replace("/", "_").upper()
+    try:
+        r = _gate_req("GET", "/futures/usdt/price_orders",
+                       params={"contract": contract, "status": "open"})
+        orders = r if isinstance(r, list) else []
+    except Exception as e:
+        olog(f"⚠ _gate_has_protective_orders {symbol}: {e}")
+        return None
+    tags = {(o.get("initial") or {}).get("text", "") for o in orders}
+    return (f"t-{text_prefix}-tp" in tags, f"t-{text_prefix}-sl" in tags)
+
+def _ema_rearm_missing_protection():
+    """v3.3: watchdog — для каждого live-сигнала, у которого позиция на
+    бирже РЕАЛЬНО ещё открыта, проверяет, что там же висят наши TP/SL
+    (тег t-ema-tp/t-ema-sl). Если нет — позиция голая: либо процесс
+    убило (Termux LMK/Huawei power-saving — известная история) ровно
+    между входом и выставлением защиты, либо обе попытки в
+    _gate_open_position не прошли и алерт "выставь вручную" остался
+    без дальнейших действий. Перевыставляет TP/SL по сохранённым в
+    истории sl/tp, не дожидаясь ручного вмешательства."""
+    with _ema_history_lock:
+        state = _load_ema_history()
+    live_open = [(k, v) for k, v in state["items"].items()
+                 if v.get("status") == "open" and v.get("live")]
+    for key, item in live_open:
+        symbol = item["symbol"]
+        try:
+            pos = _gate_get_position(symbol.replace("/", "_").upper())
+        except Exception:
+            continue   # не смогли проверить — не делаем выводов, повторим на след. тике
+        if not pos:
+            continue   # позицией уже занимается _ema_reconcile_live_positions
+        check = _gate_has_protective_orders(symbol, "ema")
+        if check is None:
+            continue
+        has_tp, has_sl = check
+        if has_tp and has_sl:
+            continue
+        olog(f"[ema_rearm] ⚠ {symbol}: позиция открыта, но TP/SL отсутствуют "
+             f"(has_tp={has_tp} has_sl={has_sl}) — перевыставляю по item sl/tp")
+        close_size = -int(pos["size"]) if pos["dir"] == "long" else int(pos["size"])
+        try:
+            _gate_place_protective_orders(symbol, pos["dir"], close_size,
+                                           item["sl"], item["tp"], text_prefix="ema")
+            olog(f"[ema_rearm] ✓ {symbol}: TP/SL перевыставлены")
+            _send_alert(f"🛡 <b>{symbol} EMA AUTO</b> — TP/SL отсутствовали на голой "
+                        f"позиции, перевыставил автоматически "
+                        f"(SL {_fmt_px(item['sl'])} / TP {_fmt_px(item['tp'])})")
+        except Exception as e:
+            olog(f"[ema_rearm] 🚨 {symbol}: не смог перевыставить TP/SL: {e}")
+            _send_alert(f"🚨 <b>{symbol} EMA AUTO</b> — позиция ГОЛАЯ (без TP/SL), "
+                        f"автоперевыставление не удалось: {e}\nВЫСТАВЬ ВРУЧНУЮ!")
+
 def _gate_open_position(symbol, direction, entry_px, sl_px, tp_px, risk_pct, **kwargs):
     """
     Полный цикл открытия позиции — точно как в WickFill:
@@ -2782,42 +2920,7 @@ def _gate_open_position(symbol, direction, entry_px, sl_px, tp_px, risk_pct, **k
         tp_sl_ok   = False
 
         def _place_tp_sl():
-            # 7. TP
-            _gate_req("POST", "/futures/usdt/price_orders", body={
-                "initial": {
-                    "contract":    contract,
-                    "size":        close_size,
-                    "price":       "0",
-                    "tif":         "ioc",
-                    "reduce_only": True,
-                    "text":        f"t-{text_prefix}-tp",
-                },
-                "trigger": {
-                    "strategy_type": 0,
-                    "price_type":    0,
-                    "price":         _gate_round_price(tp_px, contract),
-                    "rule":          1 if is_long else 2,
-                    "expiration":    86400,
-                },
-            })
-            # 8. SL
-            _gate_req("POST", "/futures/usdt/price_orders", body={
-                "initial": {
-                    "contract":    contract,
-                    "size":        close_size,
-                    "price":       "0",
-                    "tif":         "ioc",
-                    "reduce_only": True,
-                    "text":        f"t-{text_prefix}-sl",
-                },
-                "trigger": {
-                    "strategy_type": 0,
-                    "price_type":    0,
-                    "price":         _gate_round_price(sl_px, contract),
-                    "rule":          2 if is_long else 1,
-                    "expiration":    86400,
-                },
-            })
+            _gate_place_protective_orders(symbol, direction, close_size, sl_px, tp_px, text_prefix)
 
         # Первая попытка
         try:
@@ -4466,8 +4569,18 @@ def _load_ema_history():
         return {"items": {}}
 
 def _save_ema_history(state):
+    """v3.3: атомарная запись — раньше писали прямо в EMA_HISTORY_FILE;
+    килл процесса (Termux LMK/Huawei power-saving — известная история)
+    ровно посреди json.dump оставлял обрезанный, битый файл, и следующий
+    _load_ema_history() тихо возвращал {"items": {}} (весь live-учёт
+    терялся, включая какие символы уже live=True). Пишем во временный файл
+    в той же ФС и атомарно переименовываем — либо старая версия целиком,
+    либо новая целиком, промежуточного битого состояния быть не может."""
     try:
-        with open(EMA_HISTORY_FILE, "w") as f: json.dump(state, f)
+        tmp_path = EMA_HISTORY_FILE + f".tmp{os.getpid()}"
+        with open(tmp_path, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp_path, EMA_HISTORY_FILE)
     except Exception as e:
         olog(f"[ema_history] ошибка сохранения: {e}")
 
@@ -5177,6 +5290,7 @@ def _ema_signal_loop():
                 olog(f"[ema_live] новый сигнал {symbol} {sig['tf']} EMA{sig['ema_period']} {sig['dir']}")
                 _ema_maybe_open_live_trade(symbol, sig, hist_key)   # v2.7: реальная автоторговля
             _ema_reconcile_live_positions()  # v3.2: см. комментарий у функции — сверка live-сигналов с реальной биржей
+            _ema_rearm_missing_protection()  # v3.3: см. комментарий у функции — голые позиции без TP/SL
             _ema_history_update_open()   # v1.7: проверяем открытые сигналы на TP/SL
             _ema_run_diagnostics()       # v2.5: разбор убыточных сигналов, готовых к анализу
         except Exception as e:
