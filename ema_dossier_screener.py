@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
 """
+EMA Bounce Dossier v3.4.0 (fork of SMC Optimizer v3.52.96)
+- v3.4.0: ФИКС "SL -100.00%" в истории сигналов. _gate_get_last_pnl бралa
+  rec.get("close_price", 0) и rec.get("pnl_pct", 0) — а у Gate.io
+  /futures/usdt/position_close ТАКИХ ПОЛЕЙ ВООБЩЕ НЕТ (реальная схема
+  PositionClose: time, contract, side, pnl, pnl_pnl, pnl_fund, pnl_fee,
+  text, max_size, accum_size, first_open_time, long_price, short_price —
+  см. gateapi-python docs/PositionClose.md). .get(...,0) молча
+  подставлял 0 → close_price=0 попадал в историю сигналов и фронтенд
+  считал (0 - price)/price*100 = ровно -100% для LONG независимо от
+  реальной цены закрытия; pnl_pct аналогично всегда был 0% в Telegram-
+  алертах о закрытии позиции. Теперь цена закрытия берётся из
+  long_price/short_price (при side="long" закрывающая цена — в
+  short_price, и наоборот), pnl_pct считается от реального движения
+  entry->close.
 EMA Bounce Dossier v3.3.0 (fork of SMC Optimizer v3.52.96)
 - v3.3.0: аудит обработки биржевых ошибок в живой торговле, 3 находки:
   1) Голая позиция без TP/SL — если процесс убило (Termux LMK/Huawei
@@ -2143,7 +2157,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.3.0"
+APP_VERSION  = "3.4.0"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2598,11 +2612,28 @@ def _gate_get_last_pnl(symbol):
             return None
         rec = data[0]
         pnl       = float(rec.get("pnl",       0))
-        # v3.52.43: Gate.io /position_close возвращает pnl_pct УЖЕ в процентах
-        # (например 5.3 = 5.3%), не как долю. Умножение на 100 давало x100
-        # завышение в Telegram-алертах (530% вместо 5.3%).
-        pnl_pct   = float(rec.get("pnl_pct",   0))
-        close_px  = float(rec.get("close_price", 0))
+        # v3.52.79: у Gate.io /position_close ВООБЩЕ НЕТ полей "pnl_pct" и
+        # "close_price" (реальная схема PositionClose: time, contract, side,
+        # pnl, pnl_pnl, pnl_fund, pnl_fee, text, max_size, accum_size,
+        # first_open_time, long_price, short_price). rec.get(...,0) молча
+        # подставлял 0 для обоих отсутствующих полей -> close_price=0 давало
+        # ровно -100% в истории сигналов, а pnl_pct всегда был 0% в
+        # Telegram-алертах о закрытии позиции. Цена закрытия лежит в
+        # long_price/short_price: когда side="long", closing-цена в
+        # short_price, и наоборот.
+        side      = rec.get("side")
+        long_px   = float(rec.get("long_price", 0) or 0)
+        short_px  = float(rec.get("short_price", 0) or 0)
+        # side="long": вход по long_price, закрытие по short_price; наоборот
+        # для side="short". pnl_pct считаем от движения цены entry->close
+        # (по тому же принципу, что и в /ema история сигналов на фронтенде),
+        # т.к. Gate не отдаёт готовый pnl_pct вовсе.
+        if side == "long":
+            entry_px, close_px = long_px, short_px
+            pnl_pct = (close_px - entry_px) / entry_px * 100.0 if entry_px > 0 else 0.0
+        else:
+            entry_px, close_px = short_px, long_px
+            pnl_pct = (entry_px - close_px) / entry_px * 100.0 if entry_px > 0 else 0.0
         return {"pnl": pnl, "pnl_pct": pnl_pct, "close_price": close_px}
     except Exception as e:
         olog(f"⚠ gate_get_last_pnl: {e}")
