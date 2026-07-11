@@ -1,5 +1,21 @@
 #!/usr/bin/env python3
 """
+EMA Bounce Dossier v3.6.12 (fork of SMC Optimizer v3.52.96)
+- v3.6.12: добавлен блок ЧИСТО ДИАГНОСТИЧЕСКИХ индикаторов — по запросу,
+  чтобы накопить за пару дней/недель данные и по факту решить, какой из
+  них имеет смысл добавлять как реальный фильтр входа (а не гадать
+  заранее). Ни один из них НЕ используется для отклонения сигнала —
+  вход/SL/TP/автоторговля не изменились ни на строчку:
+  RSI(14), ADX(14)+DI/-DI (сила/направленность тренда), объём последней
+  свечи относительно медианы (vol_ratio), перцентиль текущего ATR
+  относительно последних 100 значений (режим волатильности), разброс
+  ribbon (самая быстрая vs самая медленная EMA лесенки, в ATR — сжатие/
+  растяжение), свечной паттерн реакции (пин-бар/поглощение, приведён к
+  направлению конкретного сигнала), торговая сессия по UTC-часу, и
+  htf_trend теперь считается для ВСЕХ ТФ (раньше — только для тех, что
+  реально фильтруются им). Все поля пишутся и в ema_signal_history.json
+  (по каждому сигналу, любой исход), и в ema_signal_diagnostics.jsonl
+  (доп. "_at_entry"-поля к разбору закрытых по SL сделок).
 EMA Bounce Dossier v3.6.11 (fork of SMC Optimizer v3.52.96)
 - v3.6.11: код-ревью по запросу — 4 фикса:
   1) [ema_touch]/[ema_breakeven] теперь дополнительно пишутся построчно
@@ -2368,7 +2384,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.6.11"
+APP_VERSION  = "3.6.12"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3386,6 +3402,149 @@ def _atr(candles, period=14):
         result[i] = s
     return result
 
+# v3.6.12: ДИАГНОСТИЧЕСКИЕ индикаторы — по запросу, чтобы через пару дней/
+# недель накопить в ema_signal_diagnostics.jsonl данные для ответа на
+# вопрос "какая доля SL пришлась на слабый тренд / RSI-дивергенцию / низкий
+# объём / широкий ribbon", и уже ПО ФАКТУ решать, какой из них добавлять
+# как настоящий фильтр входа (см. _ema_check_symbol_signal/_ema_diagnose_
+# one — там же расставлены значения по месту). НИ ОДНА из функций ниже не
+# используется для отклонения сигнала — только считает число и кладёт его
+# в снапшот. Логика входа/SL/TP этим блоком не затронута.
+
+def _rsi(closes, period=14):
+    """RSI(period) методом Wilder, параллельный массив к closes (None, где
+    данных недостаточно)."""
+    n = len(closes)
+    result = [None]*n
+    if n < period + 1:
+        return result
+    gains  = [max(closes[i]-closes[i-1], 0.0) for i in range(1, n)]
+    losses = [max(closes[i-1]-closes[i], 0.0) for i in range(1, n)]
+    avg_gain = sum(gains[:period])/period
+    avg_loss = sum(losses[:period])/period
+    def _val(ag, al):
+        if al == 0: return 100.0
+        rs = ag/al
+        return 100.0 - 100.0/(1.0+rs)
+    result[period] = round(_val(avg_gain, avg_loss), 2)
+    for i in range(period+1, n):
+        avg_gain = (avg_gain*(period-1) + gains[i-1])/period
+        avg_loss = (avg_loss*(period-1) + losses[i-1])/period
+        result[i] = round(_val(avg_gain, avg_loss), 2)
+    return result
+
+def _adx(candles, period=14):
+    """ADX(period) методом Wilder — сила тренда (НЕ направление). Общепринятые
+    ориентиры: <20 флэт/шум, >25 трендовый режим — но здесь это не порог,
+    а просто число для последующего разбора. Возвращает три параллельных
+    candles массива: (adx_arr, plus_di_arr, minus_di_arr)."""
+    n = len(candles)
+    adx_arr, plus_di_arr, minus_di_arr = [None]*n, [None]*n, [None]*n
+    if n < period*2 + 1:
+        return adx_arr, plus_di_arr, minus_di_arr
+    tr, pdm, mdm = [None]*n, [None]*n, [None]*n
+    for i in range(1, n):
+        h, l = candles[i]["high"], candles[i]["low"]
+        ph, pl, pc = candles[i-1]["high"], candles[i-1]["low"], candles[i-1]["close"]
+        up_move, down_move = h - ph, pl - l
+        pdm[i] = up_move if (up_move > down_move and up_move > 0) else 0.0
+        mdm[i] = down_move if (down_move > up_move and down_move > 0) else 0.0
+        tr[i]  = max(h-l, abs(h-pc), abs(l-pc))
+    tr_s  = sum(tr[1:period+1])
+    pdm_s = sum(pdm[1:period+1])
+    mdm_s = sum(mdm[1:period+1])
+    def _fill_di(i, tr_s, pdm_s, mdm_s):
+        pdi = 100.0*pdm_s/tr_s if tr_s > 0 else 0.0
+        mdi = 100.0*mdm_s/tr_s if tr_s > 0 else 0.0
+        plus_di_arr[i]  = round(pdi, 2)
+        minus_di_arr[i] = round(mdi, 2)
+        return 100.0*abs(pdi-mdi)/(pdi+mdi) if (pdi+mdi) > 0 else 0.0
+    dx_hist = [_fill_di(period, tr_s, pdm_s, mdm_s)]
+    adx_prev = None
+    for i in range(period+1, n):
+        tr_s  = tr_s  - tr_s/period  + tr[i]
+        pdm_s = pdm_s - pdm_s/period + pdm[i]
+        mdm_s = mdm_s - mdm_s/period + mdm[i]
+        dx = _fill_di(i, tr_s, pdm_s, mdm_s)
+        dx_hist.append(dx)
+        if len(dx_hist) == period:
+            adx_prev = sum(dx_hist)/period
+            adx_arr[i] = round(adx_prev, 2)
+        elif len(dx_hist) > period:
+            adx_prev = (adx_prev*(period-1) + dx)/period
+            adx_arr[i] = round(adx_prev, 2)
+    return adx_arr, plus_di_arr, minus_di_arr
+
+def _vol_ratio(candles, i, lookback=20):
+    """Объём свечи i относительно медианы предыдущих `lookback` свечей.
+    >1 — объём выше обычного (само по себе не говорит, здоровое это
+    подтверждение или пробой уровня навылет — отсюда сбор статистики)."""
+    if i < lookback or i >= len(candles):
+        return None
+    vols = [candles[j].get("vol") for j in range(i-lookback, i)]
+    vols = [v for v in vols if v]
+    if not vols:
+        return None
+    med = sorted(vols)[len(vols)//2]
+    if med <= 0:
+        return None
+    cur = candles[i].get("vol") or 0
+    return round(cur/med, 3)
+
+def _atr_percentile(atr_arr, i, lookback=100):
+    """Перцентиль текущего ATR относительно последних `lookback` значений —
+    режим волатильности (низкий = тихий рынок, высокий = штормит)."""
+    if i >= len(atr_arr) or atr_arr[i] is None:
+        return None
+    window = [v for v in atr_arr[max(0, i-lookback):i] if v is not None]
+    if len(window) < 10:
+        return None
+    cur = atr_arr[i]
+    rank = sum(1 for v in window if v <= cur)
+    return round(100.0*rank/len(window), 1)
+
+def _ribbon_spread_atr(ladder_vals, atr_v):
+    """Разброс между самой быстрой и самой медленной EMA лесенки,
+    нормированный на ATR — узко (низкое значение) = лесенка сжата
+    (возможен разгон), широко = зрелый растянутый тренд. Та самая
+    ribbon convergence/divergence, упомянутая в комментарии у
+    _ladder_periods_for как возможная замена голому bounce_rate."""
+    vals = [v for v in ladder_vals if v is not None]
+    if len(vals) < 2 or not atr_v:
+        return None
+    return round((max(vals)-min(vals))/atr_v, 3)
+
+def _candle_reaction_pattern(candles, i):
+    """Грубая проверка пин-бара/поглощения на свече i относительно i-1.
+    Возвращает (bullish, bearish) — bool, bool; направление сигнала само
+    решает, какой из двух ему релевантен (см. вызывающий код)."""
+    if i < 1 or i >= len(candles):
+        return False, False
+    c, p = candles[i], candles[i-1]
+    o, h, l, cl = c["open"], c["high"], c["low"], c["close"]
+    rng = h - l
+    if rng <= 0:
+        return False, False
+    body = abs(cl-o)
+    upper_wick = h - max(o, cl)
+    lower_wick = min(o, cl) - l
+    bullish_pin = lower_wick >= body*2 and lower_wick >= rng*0.5
+    bearish_pin = upper_wick >= body*2 and upper_wick >= rng*0.5
+    po, pcl = p["open"], p["close"]
+    bullish_engulf = cl > o and pcl < po and cl >= po and o <= pcl
+    bearish_engulf = cl < o and pcl > po and cl <= po and o >= pcl
+    return (bullish_pin or bullish_engulf), (bearish_pin or bearish_engulf)
+
+def _session_bucket(ts=None):
+    """Грубое деление суток по UTC-часу — просто описательное поле для
+    последующего разбора (какая доля SL приходится на конкретный интервал
+    часов), фильтром не является."""
+    h = time.gmtime(ts if ts is not None else time.time()).tm_hour
+    if 0  <= h < 8:  return "asia"
+    if 8  <= h < 14: return "europe"
+    if 14 <= h < 22: return "us"
+    return "asia"   # 22-24 UTC — снова начинается азиатская сессия
+
 # ─── EMA-bounce dossier engine ──────────────────────────────────────────────
 # Новый индикатор (v1.0): вместо SMC-сигналов (OB/FVG/CHoCH) ищем, от каких
 # EMA чаще всего происходит отскок цены — отдельно для каждой монеты, ТФ и
@@ -4236,6 +4395,19 @@ def _ema_diagnose_one(item):
         "post_sl_hit_tp": would_hit_tp,
         "post_sl_continued_against": continued_down,
         "verdict": verdict,
+        # v3.6.12: диагностические индикаторы на момент входа — см. блок
+        # функций перед _atr. Собираются НЕ как фильтры, а чтобы после
+        # накопления сделок посчитать, какая доля SL приходится на каждое
+        # значение (низкий ADX, RSI-дивергенция, слабый объём и т.д.), и
+        # уже по факту решить, что из этого добавлять как реальный фильтр.
+        "rsi_at_entry": item.get("rsi"), "adx_at_entry": item.get("adx"),
+        "plus_di_at_entry": item.get("plus_di"), "minus_di_at_entry": item.get("minus_di"),
+        "vol_ratio_at_entry": item.get("vol_ratio"),
+        "atr_percentile_at_entry": item.get("atr_percentile"),
+        "ribbon_spread_atr_at_entry": item.get("ribbon_spread_atr"),
+        "candle_pattern_at_entry": item.get("candle_pattern"),
+        "session_at_entry": item.get("session"),
+        "htf_trend_at_entry": item.get("htf_trend"),
     }
     return record
 
@@ -4405,10 +4577,22 @@ def _ema_get_closed_ctx(symbol, tf, ema_period):
     # +2с запас на задержку API/рассинхрон часов — не критично, следующий
     # опрос всё равно подтянет актуальные данные, если бар уже закрылся
     next_close_t = candles[i]["t"] + interval_sec + 2
+    # v3.6.12: диагностические индикаторы (см. блок выше _atr) — считаются
+    # здесь же, чтобы переиспользовать уже загруженные candles/closes и не
+    # плодить лишние фетчи. Ни на что, кроме снапшота сигнала, не влияют.
+    rsi_arr = _rsi(closes, 14)
+    adx_arr, plus_di_arr, minus_di_arr = _adx(candles, 14)
+    bullish_reaction, bearish_reaction = _candle_reaction_pattern(candles, i)
     ctx = {
         "close_i": closes[i], "ema_closed": ema_closed, "atr_v": atr_v,
         "ladder_periods": ladder_periods, "ladder_ema_closed": ladder_ema_closed,
         "next_close_t": next_close_t,
+        "rsi": rsi_arr[i], "adx": adx_arr[i],
+        "plus_di": plus_di_arr[i], "minus_di": minus_di_arr[i],
+        "vol_ratio": _vol_ratio(candles, i),
+        "atr_percentile": _atr_percentile(atr_arr, i),
+        "ribbon_spread_atr": _ribbon_spread_atr(ladder_ema_closed, atr_v),
+        "bullish_reaction": bullish_reaction, "bearish_reaction": bearish_reaction,
     }
     _ema_ctx_cache[key] = ctx
     return ctx
@@ -4529,13 +4713,16 @@ def _ema_check_symbol_signal(symbol, pick):
     # проигрышей. Сам ТФ (1d/1w) не фильтруем — он и есть старший горизонт.
     # permissive: если дневного контекста ещё нет (мало истории по монете),
     # не блокируем — тот же принцип, что и с лесенкой выше.
-    if tf in EMA_HTF_TREND_FILTER_TFS:
-        htf_trend = _get_htf_trend(symbol)
-        if htf_trend is not None:
-            if direction == "long" and htf_trend == "down":
-                return None
-            if direction == "short" and htf_trend == "up":
-                return None
+    # v3.6.12: htf_trend теперь считается ВСЕГДА (не только для ТФ из
+    # EMA_HTF_TREND_FILTER_TFS) — нужен для диагностического снапшота ниже
+    # даже на 1d/1w, где фильтрации им самим по себе нет. Само условие
+    # фильтрации (if tf in ...) не изменилось — поведение входа то же самое.
+    htf_trend = _get_htf_trend(symbol)
+    if tf in EMA_HTF_TREND_FILTER_TFS and htf_trend is not None:
+        if direction == "long" and htf_trend == "down":
+            return None
+        if direction == "short" and htf_trend == "up":
+            return None
     price = live_price   # v1.8: вход по живой цене, а не по close закрытой свечи
     # v1.5: оценка стопа и тейка. Стоп — за EMA-уровнем (если пробили дальше
     # этого — "отскок" не состоялся, сетап отменён), тейк — по фиксированному
@@ -4584,6 +4771,18 @@ def _ema_check_symbol_signal(symbol, pick):
     dist_atr = round(abs(live_price - ema_v) / atr_v, 3) if atr_v else None
     ladder_snapshot = {str(p): _round_price(v) for p, v in
                         zip(ctx["ladder_periods"], ladder_vals_live)}
+    # v3.6.12: чисто диагностический снапшот доп. индикаторов на момент
+    # входа — см. блок функций перед _atr выше. Ни одно из этих полей не
+    # участвует в решении открыть/не открыть сигнал (все return None по
+    # фильтрам уже отработали выше этой строки) — только ложится в историю/
+    # ema_signal_diagnostics.jsonl для последующего разбора. candle_pattern
+    # переводит пару (bullish_reaction, bearish_reaction) из ctx в понятие
+    # "паттерн подтверждает НАПРАВЛЕНИЕ этого конкретного сигнала" —
+    # long ждёт bullish-реакцию (отскок вверх), short — bearish.
+    if direction == "long":
+        candle_pattern = "confirmed" if ctx["bullish_reaction"] else "absent"
+    else:
+        candle_pattern = "confirmed" if ctx["bearish_reaction"] else "absent"
     return {
         "symbol": symbol, "tf": tf, "ema_period": ema_period, "dir": direction,
         "price": price, "ema_value": ema_r,
@@ -4591,6 +4790,13 @@ def _ema_check_symbol_signal(symbol, pick):
         "bounce_rate": pick["bounce_rate"], "bar_t": int(time.time()),
         "touches": pick.get("touches"), "atr_v": _round_price(atr_v),
         "dist_atr": dist_atr, "ladder": ladder_snapshot,
+        "rsi": ctx["rsi"], "adx": ctx["adx"],
+        "plus_di": ctx["plus_di"], "minus_di": ctx["minus_di"],
+        "vol_ratio": ctx["vol_ratio"], "atr_percentile": ctx["atr_percentile"],
+        "ribbon_spread_atr": ctx["ribbon_spread_atr"],
+        "candle_pattern": candle_pattern,
+        "session": _session_bucket(),
+        "htf_trend": htf_trend,
     }
 
 def _ema_signal_loop():
