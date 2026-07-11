@@ -1,5 +1,28 @@
 #!/usr/bin/env python3
 """
+EMA Bounce Dossier v3.6.7 (fork of SMC Optimizer v3.52.96)
+- v3.6.7: продолжение аудита после v3.6.6 (несостыковки в коде, не в
+  логике торговли):
+  1) Docstring _gate_open_position врал: писал "margin = balance *
+     risk_pct%", хотя по факту код (и так с v2.6) считает маржу от
+     position_pct — risk_pct участвует только в формуле плеча
+     (leverage = risk_pct/sl_pct). Комментарий вводил в заблуждение при
+     чтении кода, сам расчёт не менялся.
+  2) Фильтр по спреду (MAX_SPREAD_PCT, из v3.6.6) мог отсеять кандидатов
+     настолько, что итоговый список для скана окажется короче
+     запрошенных top_n (обычно 50) монет — раньше это было видно только
+     косвенно по логу "отсеяно по спреду", без явного итогового
+     предупреждения. Добавлено прямое сравнение len(symbols) vs top_n с
+     явным ⚠ в лог. Заодно лог "скан старт: N монет" раньше молча
+     пропадал целиком, если _rss_mb() возвращал None (RSS недоступен на
+     части Termux-сборок) — теперь считается количество монет и без RSS.
+  3) Удалена мёртвая функция _gate_inspect_open_orders — хардкодила теги
+     t-smc-tp/t-smc-sl и не вызывалась НИГДЕ в текущем коде: её
+     единственный потребитель, SMC single-position автоторговля, был
+     вырезан ещё в v3.6.5. EMA-бот использует независимую
+     reconciliation-логику (_gate_has_protective_orders с тегами
+     t-ema-tp/t-ema-sl), эта функция её не заменяла и не дополняла —
+     просто лежала неиспользуемая, вводя в заблуждение при чтении кода.
 EMA Bounce Dossier v3.6.6 (fork of SMC Optimizer v3.52.96)
 - v3.6.6: два фикса против того, что реализованный убыток по SL иногда
   заметно больше номинального SL% (винрейт 37% — технически выше
@@ -1601,12 +1624,16 @@ SMC Optimizer v3.52.18
   поменяться на противоположное направление, бот считал свою же позицию
   чужой и просто предупреждал, ничего не делая (до тех пор, пока сигнал
   случайно не вернётся к прежнему направлению).
-  Фикс: (1) сразу при armed (постановке на охрану) тред сверяется с
-  биржей через новую _gate_inspect_open_orders() — ищет ОТКРЫТЫЕ TP/SL
-  ордера с тегами t-smc-tp/t-smc-sl (их ставит только этот бот) —
-  находка такого тега это надёжное доказательство "позиция моя", не
-  зависящее от совпадения направления с текущим сигналом, восстанавливает
-  владение немедленно вместо ожидания случайного совпадения направления;
+  Фикс (историческая запись; сама SMC single-position автоторговля и её
+  вспомогательная _gate_inspect_open_orders убраны в v3.6.5 — EMA-бот
+  использует независимую reconciliation-логику ниже, _ema_rearm_missing_
+  protection/_gate_has_protective_orders с тегами t-ema-tp/t-ema-sl):
+  (1) сразу при armed (постановке на охрану) тред сверяется с биржей —
+  ищет ОТКРЫТЫЕ TP/SL ордера с тегами t-smc-tp/t-smc-sl (их ставил только
+  этот бот) — находка такого тега это надёжное доказательство "позиция
+  моя", не зависящее от совпадения направления с текущим сигналом,
+  восстанавливает владение немедленно вместо ожидания случайного
+  совпадения направления;
   (2) /auto_trade_start больше не обнуляет position вслепую если рестарт
   происходит на том же символе — сохраняет уже отслеженную позицию;
   (3) фронтенд: pollGlobalStatus (работает с загрузки страницы независимо
@@ -2277,7 +2304,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.6.6"
+APP_VERSION  = "3.6.7"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2451,40 +2478,6 @@ def _gate_get_position(symbol):
         "size":   abs(size),
         "entry":  float(data.get("entry_price", 0)),
     }
-
-def _gate_inspect_open_orders(symbol):
-    """Смотрит открытые price_orders (TP/SL) по символу на бирже.
-    Возвращает (any_orders, ours, sl_price, tp_price):
-      any_orders — есть ли вообще открытые триггерные ордера по контракту
-      ours       — True только если среди них есть НАШИ теги t-smc-tp/t-smc-sl
-                   (выставляются только этим ботом в _gate_open_position и
-                   в ветке восстановления) — надёжный признак "это моя
-                   забытая после рестарта позиция", а не настоящая чужая
-                   ручная сделка, у которой таких тегов быть не может.
-      sl_price/tp_price — триггерные цены из найденных своих ордеров (для
-                   точного восстановления, без угадывания по текущему сигналу)
-    """
-    contract = symbol.replace("/", "_").upper()
-    sl_price = tp_price = None
-    ours = False
-    orders = []
-    try:
-        r = _gate_req("GET", "/futures/usdt/price_orders",
-                       params={"contract": contract, "status": "open"})
-        orders = r if isinstance(r, list) else []
-    except Exception as e:
-        olog(f"⚠ Проверка открытых TP/SL ордеров: {e}")
-    for o in orders:
-        text = (o.get("initial") or {}).get("text", "")
-        if text in ("t-smc-tp", "t-smc-sl"):
-            ours = True
-            try:
-                px = float((o.get("trigger") or {}).get("price"))
-            except (TypeError, ValueError):
-                px = None
-            if text == "t-smc-tp": tp_price = px
-            else:                  sl_price = px
-    return len(orders) > 0, ours, sl_price, tp_price
 
 def _gate_get_price(symbol):
     """Текущая цена фьючерса (mark price)."""
@@ -2867,7 +2860,8 @@ def _gate_open_position(symbol, direction, entry_px, sl_px, tp_px, risk_pct, **k
     """
     Полный цикл открытия позиции — точно как в WickFill:
       leverage = round(risk_pct / sl_pct)
-      margin   = balance * risk_pct%
+      margin   = balance * position_pct%   (% депо в маржу ОДНОГО входа;
+                 risk_pct участвует только в формуле плеча выше, НЕ в марже)
       size     = (margin * leverage) / (entry_px * qm)
       TP/SL    — price_orders с price="0" (маркет при триггере)
     """
@@ -3554,14 +3548,23 @@ def _run_ema_dossier_scan(top_n=50):
     сигналу 9 было видно в логе с конкретными цифрами, а не только по
     факту "убило"."""
     symbols = _fetch_all_symbols()[:top_n]
+    if len(symbols) < top_n:
+        # v3.6.7: раньше это молча "терялось" — если фильтр по спреду
+        # (MAX_SPREAD_PCT) отсеял слишком много кандидатов, список мог
+        # оказаться короче ожидаемых top_n монет БЕЗ явного предупреждения:
+        # сам скан не падал и не зависал, просто тихо сканировал меньше
+        # монет, чем пользователь ожидал видеть в досье.
+        olog(f"⚠ [ema_dossier] после фильтра по спреду доступно только "
+             f"{len(symbols)} монет из запрошенных {top_n} — список короче "
+             f"ожидаемого (см. лог отсева выше)")
     state = {"status": "running", "results": {}, "total": len(symbols),
              "done": 0, "updated_at": int(time.time())}
     _save_ema_dossier_state(state)
     _before = _rss_mb()
     ex = _PoolExecutor(max_workers=NUM_WORKERS)
-    if _before is not None:
-        olog(f"[ema_dossier] скан старт: {len(symbols)} монет, "
-             f"{NUM_WORKERS} {'потоков' if _POOL_TYPE=='thread' else 'процессов'}, RSS {_before} МБ")
+    olog(f"[ema_dossier] скан старт: {len(symbols)} монет, "
+         f"{NUM_WORKERS} {'потоков' if _POOL_TYPE=='thread' else 'процессов'}"
+         + (f", RSS {_before} МБ" if _before is not None else ""))
     try:
         futs = {ex.submit(_build_coin_dossier, sym): sym for sym in symbols}
         for fut in _as_completed(futs):
