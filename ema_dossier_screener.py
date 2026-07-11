@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
 """
+EMA Bounce Dossier v3.5.0 (fork of SMC Optimizer v3.52.96)
+- v3.5.0: собственная панель логов на /ema (сворачиваемая карточка "📝 Логи"
+  + новый эндпоинт GET /ema_logs), независимая от главной SMC-страницы.
+  Раньше единственный способ увидеть [ema_auto_trade]/gate_open_position
+  записи — открыть отдельную SMC-страницу (id=logBox, /opt_status). olog()
+  по-прежнему пишет в общий opt_state["logs"] (это разделяемый общий буфер
+  процесса, не переписывали) — /ema_logs просто отдаёт тот же буфер под
+  своим путём, ничего в SMC-коде не тронуто. Первый шаг к независимости
+  EMA-страницы от SMC-оптимизатора — дальше по мере необходимости логи
+  можно будет разнести на раздельные буферы (ema vs smc), если понадобится
+  фильтрация.
 EMA Bounce Dossier v3.4.0 (fork of SMC Optimizer v3.52.96)
 - v3.4.0: ФИКС "SL -100.00%" в истории сигналов. _gate_get_last_pnl бралa
   rec.get("close_price", 0) и rec.get("pnl_pct", 0) — а у Gate.io
@@ -2157,7 +2168,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.4.0"
+APP_VERSION  = "3.5.0"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -5396,6 +5407,8 @@ details summary{cursor:pointer;font-size:15px;list-style:none}
 details summary::-webkit-details-marker{display:none}
 details summary:before{content:"▸ ";color:#8b949e}
 details[open] summary:before{content:"▾ "}
+.log-box{background:#010409;border:1px solid #21262d;border-radius:4px;height:200px;overflow-y:auto;padding:6px;font-size:11px;font-family:monospace}
+.log-line{padding:1px 0;border-bottom:1px solid #21262d}
 </style></head><body>
 <h1>&#9889; EMA Bounce Dossier</h1>
 <button onclick="startScan()">Запустить скан (топ-50)</button>
@@ -5450,6 +5463,13 @@ details[open] summary:before{content:"▾ "}
     </div>
     <div id="alertMsg" style="margin-top:8px;font-size:12px;color:#f85149"></div>
   </div>
+</div>
+
+<div class="section-card">
+  <details id="logDetails">
+    <summary><h3 style="display:inline">&#128221; Логи</h3></summary>
+    <div class="card log-box" id="logBox" style="margin-top:8px"></div>
+  </details>
 </div>
 
 <div class="section-card">
@@ -5717,6 +5737,32 @@ async function refresh(){
     renderDossierTable();
   }catch(e){}
 }
+// ─── Логи: собственный поллинг /ema_logs, независимо от SMC-страницы
+// (раньше приходилось смотреть #logBox на главной / странице) ──────────────
+let emaLogsTotal = 0;
+async function pollEmaLogs(){
+  try{
+    const r = await fetch('/ema_logs', {cache:'no-store'});
+    const d = await r.json();
+    const dropped = d.logs_dropped || 0;
+    const totalNow = dropped + (d.logs||[]).length;
+    const newFrom = Math.max(0, emaLogsTotal - dropped);
+    const newLogs = (d.logs||[]).slice(newFrom);
+    const lb = document.getElementById('logBox');
+    const wasOpen = document.getElementById('logDetails').open;
+    const atBottom = !wasOpen || (lb.scrollTop + lb.clientHeight >= lb.scrollHeight - 4);
+    newLogs.forEach(l => {
+      const div = document.createElement('div');
+      div.className = 'log-line';
+      div.innerHTML = `<span style="color:#555">[${l.ts}]</span> ${l.msg}`;
+      lb.appendChild(div);
+    });
+    while(lb.children.length > 300) lb.removeChild(lb.firstChild);
+    if(newLogs.length && atBottom) lb.scrollTop = lb.scrollHeight;
+    emaLogsTotal = totalNow;
+  }catch(e){}
+}
+pollEmaLogs(); setInterval(pollEmaLogs, 4000);
 refresh(); setInterval(refresh, 5000);
 refreshAutoTradeBox(); setInterval(refreshAutoTradeBox, 5000);
 </script></body></html>"""
@@ -10839,6 +10885,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/opt_status":
             with opt_lock:
                 self._json({k:v for k,v in opt_state.items() if k!="chart"})
+        elif self.path == "/ema_logs":
+            # v3.5.0: собственный лог-эндпоинт для /ema — раньше единственная
+            # панель логов жила на главной SMC-странице (id=logBox, из
+            # /opt_status), и чтобы увидеть [ema_auto_trade]/gate_open_position
+            # записи приходилось открывать ДРУГУЮ страницу. olog() пишет в
+            # общий opt_state["logs"] независимо от того, кто вызвал (SMC или
+            # EMA поток) — здесь просто отдаём тот же буфер под своим путём,
+            # не трогая /opt_status и остальной SMC-код (шаг к независимости
+            # EMA-страницы от SMC-оптимизатора).
+            with opt_lock:
+                self._json({"logs": opt_state["logs"], "logs_dropped": opt_state.get("logs_dropped", 0)})
         elif self.path == "/ema_dossier_status":
             self._json(_load_ema_dossier_state())
         elif self.path == "/ema_live_signals":
