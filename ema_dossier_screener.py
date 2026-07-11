@@ -1,5 +1,21 @@
 #!/usr/bin/env python3
 """
+EMA Bounce Dossier v3.6.1 (fork of SMC Optimizer v3.52.96)
+- v3.6.1: три мелких фикса по фидбеку с телефона.
+  1) Оставшийся суффикс "U" вместо "USDT" в колонке ~USDT таблицы открытых
+     live-позиций (баланс в шапке уже чинили в v3.5.1, тут пропустили саму
+     строку таблицы).
+  2) Гонка в openSettings(): модалка автоторговли показывалась СРАЗУ, а
+     текущее состояние (в т.ч. чекбокс enabled) грузилось асинхронно
+     параллельно — быстрый клик по тумблеру ДО ответа сервера перетирался
+     обратно резолвом fetch (внешне "включил — само выключилось", лечилось
+     вторым кликом, когда загрузка уже точно завершалась). Теперь тумблер
+     заблокирован на время загрузки данных модалки.
+  3) Компактный режим (@media max-width:480px) для узких экранов —
+     v3.0-редизайн добавил карточки/паддинги, из-за чего на телефоне все
+     элементы стали заметно крупнее, чем в старой плоской таблице. Уменьшены
+     паддинги карточек/кнопок/ячеек и размеры шрифтов на мобильных экранах,
+     сам card-layout не трогали.
 EMA Bounce Dossier v3.6.0 (fork of SMC Optimizer v3.52.96)
 - v3.6.0: КЛЮЧЕВОЙ фикс автоторговли при маленьком депозите — раньше
   _gate_open_position при size_raw<1 (округление размера позиции в 0
@@ -2190,7 +2206,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.6.0"
+APP_VERSION  = "3.6.1"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -5452,6 +5468,21 @@ details summary:before{content:"▸ ";color:#8b949e}
 details[open] summary:before{content:"▾ "}
 .log-box{background:#010409;border:1px solid #21262d;border-radius:4px;height:200px;overflow-y:auto;padding:6px;font-size:11px;font-family:monospace}
 .log-line{padding:1px 0;border-bottom:1px solid #21262d}
+/* v3.6.1: компактный режим для узких экранов — v3.0-редизайн добавил
+   карточки/паддинги, из-за которых на телефоне всё стало заметно крупнее
+   и требовало больше вертикального скролла, чем плоские таблицы старой
+   версии. Плотность уменьшена, сам card-based layout не трогаем. */
+@media (max-width:480px){
+  body{padding:8px;font-size:13px}
+  h1{font-size:17px}
+  h3{font-size:14px}
+  button{padding:8px 12px;font-size:13px;margin:4px 4px 4px 0}
+  th,td{padding:4px 6px;font-size:12px}
+  .section-card{padding:10px;margin-top:10px}
+  #atBox{padding:8px 10px;font-size:12px}
+  .filter-btn{padding:3px 9px;font-size:11px}
+  .status-pill{padding:1px 6px;font-size:10px}
+}
 </style></head><body>
 <h1>&#9889; EMA Bounce Dossier</h1>
 <button onclick="startScan()">Запустить скан (топ-50)</button>
@@ -5557,7 +5588,19 @@ async function clearHistory(){
   await fetch('/ema_signal_history_clear');
   refresh();
 }
-function openSettings(){ document.getElementById('atModal').style.display='flex'; loadSettingsIntoModal(); }
+async function openSettings(){
+  // v3.6.1: раньше показывали модалку СРАЗУ и параллельно асинхронно грузили
+  // текущее состояние (loadSettingsIntoModal). Модалка была кликабельна, пока
+  // fetch ещё летел — если успеть щёлкнуть тумблер enabled до ответа сервера,
+  // резолв fetch перезаписывал чекбокс обратно на старое значение поверх
+  // клика пользователя ("включил — само выключилось", лечилось вторым
+  // кликом, когда загрузка уже точно завершилась). Теперь тумблер
+  // блокируется на время загрузки, чтобы клик в этом окне был невозможен.
+  document.getElementById('atModal').style.display='flex';
+  document.getElementById('atEnabled').disabled = true;
+  await loadSettingsIntoModal();
+  document.getElementById('atEnabled').disabled = false;
+}
 function closeSettings(){ document.getElementById('atModal').style.display='none'; }
 async function loadSettingsIntoModal(){
   try{
@@ -5653,7 +5696,7 @@ async function refreshAutoTradeBox(){
     const stateTxt = d.enabled ? '🟢 включена' : '⚪ выключена';
     let rows = (d.live_positions||[]).map(p => {
       const cls = p.dir === 'long' ? 'long' : 'short';
-      return `<tr><td>${p.symbol}</td><td class="${cls}">${p.dir.toUpperCase()}</td><td>${p.entry}</td><td>${p.sl}</td><td>${p.tp}</td><td>${p.size ?? ''}</td><td>${p.leverage ?? ''}×</td><td>${p.notional ?? ''}U</td>`
+      return `<tr><td>${p.symbol}</td><td class="${cls}">${p.dir.toUpperCase()}</td><td>${p.entry}</td><td>${p.sl}</td><td>${p.tp}</td><td>${p.size ?? ''}</td><td>${p.leverage ?? ''}×</td><td>${p.notional ?? ''}USDT</td>`
         + `<td><button style="margin:0;padding:3px 8px;font-size:11px;background:#3a1414;border:1px solid #f85149;color:#f85149" onclick="closeLivePosition('${p.symbol}')">Закрыть</button></td></tr>`;
     }).join('');
     box.innerHTML = `<b>Автоторговля:</b> ${stateTxt} &nbsp;|&nbsp; `
