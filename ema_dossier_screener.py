@@ -1,5 +1,27 @@
 #!/usr/bin/env python3
 """
+EMA Bounce Dossier v3.6.0 (fork of SMC Optimizer v3.52.96)
+- v3.6.0: КЛЮЧЕВОЙ фикс автоторговли при маленьком депозите — раньше
+  _gate_open_position при size_raw<1 (округление размера позиции в 0
+  контрактов) ПРОСТО пропускала сигнал ("Недостаточно средств"), даже
+  если реального баланса хватало на 1 минимальный контракт — просто
+  номинальная маржа (position_pct% от депозита, по умолчанию 3%) была
+  слишком мала при округлении для дорогих монет/крупного
+  quanto_multiplier. При депозите ~10-15U это убивало 80-90% сигналов
+  вхолостую (см. историю: 16 сигналов, LIVE только у одного). Теперь: если
+  1 контракт по факту укладывается в доступный баланс (запас 5% на
+  комиссии/проскальзывание) — открываем size=1 вместо пропуска (маржа на
+  этот вход будет выше номинальных position_pct%, но сигнал реально
+  торгуется). В логах такие сделки помечены "[форс-минимум]".
+EMA Bounce Dossier v3.5.2 (fork of SMC Optimizer v3.52.96)
+- v3.5.2: фикс горизонтального обрезания таблицы открытых live-позиций на
+  мобильном — рендерилась голым <table> без обёртки .table-scroll (в
+  отличие от остальных таблиц страницы), на узком экране правые колонки
+  (~USDT, кнопка "Закрыть") уезжали за край экрана без возможности
+  проскроллить. Обернул в тот же .table-scroll, что и остальные таблицы.
+EMA Bounce Dossier v3.5.1 (fork of SMC Optimizer v3.52.96)
+- v3.5.1: суффикс баланса в шапке "Автоторговля" — "U" -> "USDT" (полное
+  название валюты вместо однобуквенного сокращения).
 EMA Bounce Dossier v3.5.0 (fork of SMC Optimizer v3.52.96)
 - v3.5.0: собственная панель логов на /ema (сворачиваемая карточка "📝 Логи"
   + новый эндпоинт GET /ema_logs), независимая от главной SMC-страницы.
@@ -2168,7 +2190,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.5.0"
+APP_VERSION  = "3.6.0"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2900,15 +2922,36 @@ def _gate_open_position(symbol, direction, entry_px, sl_px, tp_px, risk_pct, **k
         margin   = balance * (position_pct / 100.0)
         size_raw = (margin * applied_leverage) / (entry_px * qm)
         size     = round(size_raw)
+        forced_min_size = False
         if size < 1:
-            raise RuntimeError(
-                f"Недостаточно средств: balance={balance:.2f} margin={margin:.2f} "
-                f"lev={applied_leverage}× ep={entry_px} qm={qm} → size={size_raw:.3f} < 1"
-            )
+            # v3.6.0: раньше при size_raw<1 сигнал ПРОСТО пропускался
+            # ("Недостаточно средств"), даже если баланса реально хватало
+            # на 1 минимальный контракт — просто маржа/вход (3% депозита)
+            # для дорогих монет/крупного quanto_multiplier была слишком
+            # мала при округлении. При депозите ~10-15U это убивало
+            # 80-90% сигналов вхолостую. Теперь: если 1 контракт по факту
+            # укладывается в доступный баланс (оставляем 5% запас на
+            # комиссии/проскальзывание), берём size=1 вместо пропуска —
+            # маржа на этот вход будет выше номинальных position_pct%, но
+            # сигнал реально отторгуется, а не теряется.
+            margin_for_one = (entry_px * qm) / applied_leverage
+            if margin_for_one <= balance * 0.95:
+                size = 1
+                forced_min_size = True
+                olog(f"[ema_auto_trade] {symbol}: size_raw={size_raw:.3f}<1 при "
+                     f"номинальной марже {margin:.2f}U — форсирую size=1 "
+                     f"(нужно {margin_for_one:.2f}U маржи, баланс {balance:.2f}U)")
+            else:
+                raise RuntimeError(
+                    f"Недостаточно средств: balance={balance:.2f} margin={margin:.2f} "
+                    f"lev={applied_leverage}× ep={entry_px} qm={qm} → size={size_raw:.3f} < 1, "
+                    f"даже 1 контракт требует {margin_for_one:.2f}U маржи — не помещается в баланс"
+                )
         notional = size * entry_px * qm
         olog(f"🔓 Открываем {direction.upper()} {symbol}: "
              f"balance={balance:.2f} × {position_pct}%(маржа) × {applied_leverage}×(плечо) → позиция~{notional:.2f}U | "
-             f"риск={risk_pct}% | size={size} контр | entry≈{_fmt_px(entry_px)} SL={_fmt_px(sl_px)} TP={_fmt_px(tp_px)}")
+             f"риск={risk_pct}% | size={size} контр{' [форс-минимум]' if forced_min_size else ''} | "
+             f"entry≈{_fmt_px(entry_px)} SL={_fmt_px(sl_px)} TP={_fmt_px(tp_px)}")
 
         # 5. Отменяем старые ордера
         _gate_cancel_orders(symbol)
@@ -5617,9 +5660,9 @@ async function refreshAutoTradeBox(){
       + `маржа/вход ${d.position_pct}% &nbsp;|&nbsp; risk ${d.risk_pct}% &nbsp;|&nbsp; `
       + `лимит позиций: ${d.max_concurrent ?? 'без ограничений'} &nbsp;|&nbsp; `
       + `открыто сейчас: <b>${d.live_count}</b>`
-      + (d.balance != null ? ` &nbsp;|&nbsp; баланс: ${d.balance.toFixed(2)}U` : '')
+      + (d.balance != null ? ` &nbsp;|&nbsp; баланс: ${d.balance.toFixed(2)}USDT` : '')
       + (!d.gate_configured ? ` <span style="color:#f85149">— Gate.io ключи не настроены (/gate_cfg)</span>` : '')
-      + (rows ? `<table style="margin-top:8px"><thead><tr><th>Монета</th><th>Напр.</th><th>Вход</th><th>SL</th><th>TP</th><th>Size</th><th>Плечо</th><th>~USDT</th><th></th></tr></thead><tbody>${rows}</tbody></table>` : '');
+      + (rows ? `<div class="table-scroll"><table style="margin-top:8px"><thead><tr><th>Монета</th><th>Напр.</th><th>Вход</th><th>SL</th><th>TP</th><th>Size</th><th>Плечо</th><th>~USDT</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>` : '');
   }catch(e){}
 }
 function fmtAgo(ts){
