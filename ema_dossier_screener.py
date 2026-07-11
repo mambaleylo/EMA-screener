@@ -1,5 +1,25 @@
 #!/usr/bin/env python3
 """
+EMA Bounce Dossier v3.6.6 (fork of SMC Optimizer v3.52.96)
+- v3.6.6: два фикса против того, что реализованный убыток по SL иногда
+  заметно больше номинального SL% (винрейт 37% — технически выше
+  брейк-ивена для RR 1:2 в 33%, — а баланс всё равно снижался):
+  1) SL был чистым маркет-ордером (price="0", tif="ioc") — на неликвидных
+     контрактах при резком движении исполнялся сильно хуже уровня триггера
+     (стакан на нужной цене кончается). История сигналов уже показывает
+     РЕАЛЬНУЮ цену закрытия с биржи (v3.4.0), а не номинальный SL — именно
+     так и было замечено проскальзывание. Теперь SL — bounded-limit: лимит
+     на SL_SLIPPAGE_BUFFER_PCT=0.3% хуже триггера (не точно в него — риск
+     не исполниться при гэпе), tif=gtc чтобы неисполненный остаток не
+     сгорал молча. Худший случай теперь ограничен буфером.
+  2) Топ-50/100 монет отбирались чисто по 24h-объёму — шумная метрика:
+     токенизированные акции/металлы (XAU/XAG/SPCX/MU/SNDK/SKHYNIX/CRCLX,
+     цена в сотнях-тысячах → большой номинальный объём при малом кол-ве
+     сделок) и альты с разовыми объёмными всплесками могут иметь большой
+     объём, но тонкий стакан именно в момент исполнения. Добавлен фильтр
+     по спреду bid/ask (MAX_SPREAD_PCT=0.15%, поля уже есть в тикере, доп.
+     запрос не нужен) — прямая мера риска проскальзывания вместо косвенной
+     через объём. Отсеянные по спреду логируются отдельной строкой.
 EMA Bounce Dossier v3.6.5 (fork of SMC Optimizer v3.52.96)
 - v3.6.5: БОЛЬШАЯ чистка — файл был форкнут из SMC Optimizer целиком, и
   примерно половина кода (11462 → 5297 строк, -54%) была SMC-only и ни разу
@@ -2257,7 +2277,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.6.5"
+APP_VERSION  = "3.6.6"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2720,6 +2740,12 @@ def _gate_round_price(price, contract):
         if price > 1:     return f"{price:.4f}"
         return f"{price:.6f}"
 
+# v3.6.6: см. коммент в _gate_place_protective_orders — насколько хуже
+# триггера разрешаем исполниться SL-ордеру (bounded-limit вместо чистого
+# маркета). 0.3% — компромисс между защитой от неограниченного
+# проскальзывания и разумным шансом на фактическое исполнение.
+SL_SLIPPAGE_BUFFER_PCT = 0.3
+
 def _gate_place_protective_orders(symbol, direction, close_size, sl_px, tp_px, text_prefix="smc"):
     """Выставляет TP/SL price_orders (reduce_only) для уже открытой позиции.
     v3.3: вынесено из _gate_open_position в отдельную функцию — раньше это
@@ -2747,12 +2773,26 @@ def _gate_place_protective_orders(symbol, direction, close_size, sl_px, tp_px, t
             "expiration":    86400,
         },
     })
+    # v3.6.6: SL исполнялся как чистый маркет-ордер (price="0", tif="ioc") —
+    # на неликвидных монетах (в топ-50/100 по 24h-объёму попадают и
+    # токенизированные акции/металлы вроде XAU/XAG/SPCX/MU/SNDK с иным
+    # профилем ликвидности, и альты с разовыми объёмными всплесками) при
+    # резком движении маркет-заявка может исполниться СИЛЬНО хуже уровня
+    # триггера — стакан на нужной цене просто кончается. Реальная цена
+    # закрытия (не номинальный SL%) видна в истории сигналов (см. v3.4.0) —
+    # именно так было замечено, что реализованный убыток иногда заметно
+    # больше номинального SL. Теперь SL — bounded-limit: лимит выставлен на
+    # SL_SLIPPAGE_BUFFER_PCT ХУЖЕ уровня триггера (не точно в него — тогда
+    # заявка рисковала бы вообще не исполниться при гэпе) и tif=gtc, чтобы
+    # неисполненный остаток НЕ сгорал молча, а висел до факта. Худший случай
+    # ограничен буфером, а не "сколько дадут" как раньше.
+    sl_limit_px = sl_px * (1 - SL_SLIPPAGE_BUFFER_PCT/100) if is_long else sl_px * (1 + SL_SLIPPAGE_BUFFER_PCT/100)
     _gate_req("POST", "/futures/usdt/price_orders", body={
         "initial": {
             "contract":    contract,
             "size":        close_size,
-            "price":       "0",
-            "tif":         "ioc",
+            "price":       _gate_round_price(sl_limit_px, contract),
+            "tif":         "gtc",
             "reduce_only": True,
             "text":        f"t-{text_prefix}-sl",
         },
@@ -3024,6 +3064,17 @@ def olog(msg):
             opt_state["logs_dropped"] = opt_state.get("logs_dropped",0) + 200
 
 # ─── Gate.io fetch ──────────────────────────────────────────────────────────
+# v3.6.6: 24h-объём — шумная метрика ликвидности. В топ-100 по объёму
+# регулярно попадают токенизированные акции/металлы (XAU/XAG/SPCX/MU/SNDK/
+# SKHYNIX/CRCLX — цена в сотнях-тысячах, из-за этого большой номинальный
+# объём при малом кол-ве сделок) и альты с разовыми объёмными всплесками —
+# у обоих типов может быть широкий спред и тонкий стакан именно в момент
+# исполнения SL, что и давало проскальзывание сверх номинального SL% (см.
+# коммент в _gate_place_protective_orders). Спред bid/ask — прямая мера
+# риска проскальзывания, а не косвенная через объём, и уже есть в том же
+# тикере (highest_bid/lowest_ask), доп. запрос не нужен.
+MAX_SPREAD_PCT = 0.15  # шире этого — считаем стакан слишком тонким для SL/TP
+
 def _fetch_all_symbols():
     try:
         # Тикеры содержат volume_24h_usd — объём за 24ч в USDT, лучший показатель ликвидности
@@ -3034,8 +3085,29 @@ def _fetch_all_symbols():
         valid = [t for t in data
                  if isinstance(t, dict) and "_USDT" in t.get("contract","")]
         valid.sort(key=lambda t: float(t.get("volume_24h_usd") or t.get("volume_24h_quote") or t.get("volume_24h") or 0), reverse=True)
-        top50 = [t["contract"] for t in valid[:100]]
-        olog(f"Топ-100 по объёму 24h: {', '.join(top50)}")
+        # Берём избыточный набор по объёму (не меньше 150), затем режем по
+        # спреду и уже из прошедших фильтр берём top_n самых объёмных.
+        candidates = valid[:max(150, 100)]
+        filtered = []
+        skipped_spread = []
+        for t in candidates:
+            try:
+                bid = float(t.get("highest_bid") or 0)
+                ask = float(t.get("lowest_ask") or 0)
+                if bid <= 0 or ask <= 0 or ask < bid:
+                    continue  # нет валидных котировок — пропускаем, не рискуем
+                spread_pct = (ask - bid) / ((ask + bid) / 2) * 100
+                if spread_pct <= MAX_SPREAD_PCT:
+                    filtered.append(t)
+                else:
+                    skipped_spread.append(f"{t['contract']}({spread_pct:.2f}%)")
+            except (TypeError, ValueError):
+                continue
+        top50 = [t["contract"] for t in filtered[:100]]
+        olog(f"Топ-100 по объёму 24h (спред ≤{MAX_SPREAD_PCT}%): {', '.join(top50)}")
+        if skipped_spread:
+            olog(f"⚠ Отсеяно по широкому спреду ({len(skipped_spread)}): {', '.join(skipped_spread[:15])}"
+                 + (" ..." if len(skipped_spread) > 15 else ""))
         return top50
     except Exception as e:
         olog(f"fetch_all_symbols error: {e}")
