@@ -1,5 +1,26 @@
 #!/usr/bin/env python3
 """
+EMA Bounce Dossier v3.6.9 (fork of SMC Optimizer v3.52.96)
+- v3.6.9: два фикса по разбору первой боевой диагностики (ema_signal_
+  diagnostics.jsonl, 23 закрытых по SL сигнала за 2 дня — выборка маленькая,
+  но направленно согласована сама с собой):
+  1) 35% (8/23) стопов случались ПОСЛЕ того, как сделка уже набирала 0.5-1.5
+     ATR в свою пользу (одна почти дошла до TP) — SL был статичным всю жизнь
+     сделки, ни безубытка, ни трейлинга не было вообще. Добавлен watchdog
+     _ema_breakeven_watchdog: как только нереализованный профит достигает
+     EMA_BREAKEVEN_TRIGGER_R=0.5 риска, SL переставляется в безубыток (entry
+     + буфер на комиссию). Не полноценный трейлинг (двигает SL один раз) —
+     сознательно консервативно для первой итерации.
+  2) 26% (6/23) стопов имели ОТРИЦАТЕЛЬНЫЙ MFE — цена ни разу не качнулась
+     в сторону сигнала перед тем, как выбить стоп, обычно за 1-2 бара:
+     сигнал открывался МГНОВЕННО на первом касании EMA-уровня, не дожидаясь
+     хоть какого-то намёка на реакцию. Машина состояний касания
+     (_ema_touch_state) получила промежуточное состояние "pending":
+     первое касание больше не открывает сигнал сразу, а ждёт минимум ещё
+     один живой опрос (EMA_TOUCH_CONFIRM_SEC=15с); если цена за это время
+     уже пробила уровень насквозь и вышла из зоны — подход отменяется
+     целиком, сигнала не будет вообще (что и нужно для этого класса
+     проигрышей). Вход по-прежнему по живой цене В МОМЕНТ подтверждения.
 EMA Bounce Dossier v3.6.8 (fork of SMC Optimizer v3.52.96)
 - v3.6.8: NUM_WORKERS — автоопределение по числу ядер устройства
   (cpu_count()-1) вместо фиксированного дефолта 3. Тот дефолт защищал от
@@ -2314,7 +2335,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.6.8"
+APP_VERSION  = "3.6.9"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2875,6 +2896,80 @@ def _ema_rearm_missing_protection():
             olog(f"[ema_rearm] 🚨 {symbol}: не смог перевыставить TP/SL: {e}")
             _send_alert(f"🚨 <b>{symbol} EMA AUTO</b> — позиция ГОЛАЯ (без TP/SL), "
                         f"автоперевыставление не удалось: {e}\nВЫСТАВЬ ВРУЧНУЮ!")
+
+# v3.6.9: диагностика (ema_signal_diagnostics.jsonl) показала — 35% (8/23 в
+# первой контрольной выборке) стопов случались ПОСЛЕ того, как сделка уже
+# успевала набрать 0.5-1.5 ATR в свою пользу (одна почти дошла до TP), а
+# статичный SL просто стоял на месте всю жизнь сделки — не было НИ
+# безубытка, НИ трейлинга вообще. Watchdog ниже переставляет SL в
+# безубыток (+небольшой буфер на комиссию round-trip), как только
+# нереализованная прибыль достигает EMA_BREAKEVEN_TRIGGER_R долей риска (R).
+# Не трейлинг (не двигает SL дальше одного раза) — сознательно консервативно
+# для первой итерации: цель — перестать отдавать УЖЕ пройденный путь целиком
+# обратно в минус, а не оптимизировать exit целиком.
+EMA_BREAKEVEN_TRIGGER_R = 0.5   # доля риска (R) в плюс, после которой двигаем SL
+EMA_BREAKEVEN_FEE_BUF_PCT = 0.10   # запас поверх входа на round-trip комиссию Gate
+
+def _ema_breakeven_watchdog():
+    """v3.6.9: раз в цикл (см. _ema_signal_loop) проверяет все реально живые
+    (live=True, status=open) EMA-сигналы — если нереализованная прибыль по
+    текущей живой цене достигла EMA_BREAKEVEN_TRIGGER_R * risk, переставляет
+    SL в безубыток (entry + небольшой буфер на комиссию, в сторону прибыли).
+    Флаг item['breakeven_done'] — чтобы не переставлять повторно на каждом
+    тике и не тратить лимиты API впустую."""
+    with _ema_history_lock:
+        state = _load_ema_history()
+    live_open = [(k, v) for k, v in state["items"].items()
+                 if v.get("status") == "open" and v.get("live")
+                 and not v.get("breakeven_done")]
+    for key, item in live_open:
+        symbol, direction = item["symbol"], item["dir"]
+        entry, sl = item.get("price"), item.get("sl")
+        if entry is None or sl is None:
+            continue
+        risk = abs(entry - sl)
+        if risk <= 0:
+            continue
+        live_price = _gate_get_price(symbol)
+        if not live_price:
+            continue
+        profit = (live_price - entry) if direction == "long" else (entry - live_price)
+        if profit / risk < EMA_BREAKEVEN_TRIGGER_R:
+            continue
+        contract = symbol.replace("/", "_").upper()
+        try:
+            pos = _gate_get_position(contract)
+        except Exception:
+            continue   # не смогли проверить — не рискуем, повторим на след. тике
+        if not pos:
+            continue   # позицией уже занимается _ema_reconcile_live_positions
+        be_buf = entry * (EMA_BREAKEVEN_FEE_BUF_PCT / 100.0)
+        breakeven_px = entry + be_buf if direction == "long" else entry - be_buf
+        close_size = -int(pos["size"]) if pos["dir"] == "long" else int(pos["size"])
+        try:
+            # Отменяем ОБА старых price_orders (TP+SL — Gate не даёт снять
+            # только один по тегу выборочно) и перевыставляем оба заново с
+            # тем же TP, но новым SL — тот же путь, что уже проверен в
+            # _ema_rearm_missing_protection.
+            _gate_cancel_orders(symbol)
+            _gate_place_protective_orders(symbol, pos["dir"], close_size,
+                                           breakeven_px, item["tp"], text_prefix="ema")
+        except Exception as e:
+            olog(f"[ema_breakeven] ⚠ {symbol}: не удалось переставить SL в "
+                 f"безубыток: {e}")
+            continue
+        olog(f"[ema_breakeven] ✓ {symbol}: профит {profit/risk:.2f}R — SL "
+             f"переставлен в безубыток {_fmt_px(breakeven_px)} (был {_fmt_px(sl)})")
+        _send_alert(f"🔒 <b>{symbol} EMA AUTO</b> — профит достиг "
+                    f"{profit/risk:.2f}R, SL переставлен в безубыток "
+                    f"{_fmt_px(breakeven_px)}")
+        with _ema_history_lock:
+            state2 = _load_ema_history()
+            it2 = state2["items"].get(key)
+            if it2:
+                it2["sl"] = breakeven_px
+                it2["breakeven_done"] = True
+                _save_ema_history(state2)
 
 def _gate_open_position(symbol, direction, entry_px, sl_px, tp_px, risk_pct, **kwargs):
     """
@@ -4085,8 +4180,26 @@ def _days_for_live_check(tf, ema_period):
     days = math.ceil(bars_needed * (TF_SECONDS.get(src_tf, 3600) if tf != "1w" else 86400*7) / 86400)
     return max(3, days)
 
-_ema_touch_state = {}   # v1.8: symbol|tf|ema_period -> сейчас ли цена в зоне касания
+_ema_touch_state = {}   # v3.6.9: symbol|tf|ema_period -> "out" | "pending" | "done"
+                         # (было bool в/вне зоны до v3.6.9 — см. EMA_TOUCH_CONFIRM_SEC)
 EMA_TOUCH_EXIT_MULT = 1.8   # v2.6: гистерезис выхода из зоны касания (см. _ema_check_symbol_signal)
+_ema_touch_pending  = {}   # v3.6.9: symbol|tf|ema_period -> ts первого касания (пока не подтверждено)
+# v3.6.9: диагностика (ema_signal_diagnostics.jsonl) показала — 26% (6/23 в
+# первой контрольной выборке) стопов выбивались за 1-2 бара с ОТРИЦАТЕЛЬНЫМ
+# MFE (цена ни разу не качнулась в сторону сигнала перед тем, как добить
+# стоп) — вход происходил МГНОВЕННО на первом касании уровня, не дожидаясь
+# хоть какого-то начала реакции ("отскока"), хотя вся методичка про это и
+# написана ("жду когда придёт к линии, и работаю с реакцией" — реакция, а
+# не сам факт касания). Раньше сигнал открывался в тот же момент, когда
+# цена впервые попадала в зону касания (tol). Теперь первое касание только
+# ставит подход "в ожидание" (pending) — сигнал открывается лишь если цена
+# ещё остаётся в зоне (с тем же exit-гистерезисом) спустя
+# EMA_TOUCH_CONFIRM_SEC. Если за это время цена уже пробила уровень
+# насквозь и вышла из зоны — подход отменяется целиком, сигнал не
+# появляется вообще (что и требуется для этого класса проигрышей: там
+# реакции не было ни на йоту). Вход всё ещё по живой цене В МОМЕНТ
+# подтверждения (v1.8), не по цене первого касания.
+EMA_TOUCH_CONFIRM_SEC = 15   # = EMA_LIVE_POLL_SEC: минимум один дополнительный опрос
 
 # v2.6: кэш "какие ключи symbol|tf|ema_period сейчас открыты" — иначе
 # _ema_has_open_signal читал бы ema_signal_history.json с диска на КАЖДУЮ
@@ -4220,7 +4333,7 @@ def _ema_check_symbol_signal(symbol, pick):
     tol = EMA_DOSSIER_TOUCH_ATR * atr_v
     dist = abs(live_price - ema_v)
     key = f"{symbol}|{tf}|{ema_period}"
-    was_in_zone = _ema_touch_state.get(key, False)
+    state = _ema_touch_state.get(key, "out")
     # v2.6: КРИТИЧНЫЙ ФИКС дублей — раньше вход/выход из зоны касания
     # проверялись по ОДНОЙ и той же границе tol. Если цена стоит вплотную
     # к этой границе (обычный шум тика туда-обратно на пару пунктов), она
@@ -4228,15 +4341,29 @@ def _ema_check_symbol_signal(symbol, pick):
     # НОВЫМ касанием и плодило почти идентичные сигналы (видно на скринах:
     # MU_USDT 1d EMA28 SHORT/XAU_USDT 4h EMA50 SHORT и т.п. — одна и та же
     # сделка переоткрывается раз в 20-30 минут с чуть другой ценой входа).
-    # Теперь выход из зоны требует отойти ЗАМЕТНО дальше (tol * 1.8), а не
-    # на волосок — простой гистерезис вместо одной границы.
-    if was_in_zone:
-        touched_now = dist <= tol * EMA_TOUCH_EXIT_MULT
-    else:
-        touched_now = dist <= tol
-    _ema_touch_state[key] = touched_now
-    if not touched_now or was_in_zone:
-        return None   # либо не у линии, либо уже отработали этот подход
+    # Выход из зоны (после первого касания) требует отойти ЗАМЕТНО дальше
+    # (tol * 1.8), а не на волосок — простой гистерезис вместо одной границы.
+    touched_now = dist <= tol if state == "out" else dist <= tol * EMA_TOUCH_EXIT_MULT
+    if not touched_now:
+        # Вышли из зоны (или изначально не были в ней) — сброс. Если состояние
+        # было "pending" (касание было, подтвердить не успели) — подход
+        # отменяется целиком, сигнала не будет вообще: v3.6.9, см. коммент у
+        # EMA_TOUCH_CONFIRM_SEC — именно так и должно быть для пробоя без реакции.
+        _ema_touch_state[key] = "out"
+        _ema_touch_pending.pop(key, None)
+        return None
+    if state == "out":
+        # Свежее касание — не открываем сразу, ставим "в ожидание" подтверждения
+        _ema_touch_state[key] = "pending"
+        _ema_touch_pending[key] = time.time()
+        return None
+    if state == "pending":
+        if time.time() - _ema_touch_pending.get(key, 0) < EMA_TOUCH_CONFIRM_SEC:
+            return None   # ещё не прошло ни одного доп. опроса — рано
+        _ema_touch_state[key] = "done"
+        # проваливаемся дальше — строим и открываем сигнал по ТЕКУЩЕЙ живой цене
+    else:   # state == "done"
+        return None   # уже отработали этот подход
     # v2.6: ВТОРОЙ, независимый уровень защиты от дублей — даже если
     # touch_state выше почему-то даст сбой (например process restart из-за
     # signal 9 обнуляет весь in-memory _ema_touch_state, и монета, которая
@@ -4366,6 +4493,7 @@ def _ema_signal_loop():
                 _ema_maybe_open_live_trade(symbol, sig, hist_key)   # v2.7: реальная автоторговля
             _ema_reconcile_live_positions()  # v3.2: см. комментарий у функции — сверка live-сигналов с реальной биржей
             _ema_rearm_missing_protection()  # v3.3: см. комментарий у функции — голые позиции без TP/SL
+            _ema_breakeven_watchdog()        # v3.6.9: перевод SL в безубыток после EMA_BREAKEVEN_TRIGGER_R профита
             _ema_history_update_open()   # v1.7: проверяем открытые сигналы на TP/SL
             _ema_run_diagnostics()       # v2.5: разбор убыточных сигналов, готовых к анализу
         except Exception as e:
