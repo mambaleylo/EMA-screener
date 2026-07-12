@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-EMA Invert Experiment v0.1.1 (fork of EMA Bounce Dossier v3.6.14)
+EMA Invert Experiment v0.1.2 (fork of EMA Bounce Dossier v3.6.14)
 - ЭКСПЕРИМЕНТАЛЬНЫЙ форк, не пушится в git, не участвует в авто-обновлении
   оригинального бота. Живёт и качается вручную отдельным файлом. Отдельные
   файлы состояния/логов/диагностики (см. префикс "ema_invert_" ниже) и
@@ -50,6 +50,18 @@ EMA Invert Experiment v0.1.1 (fork of EMA Bounce Dossier v3.6.14)
      ribbon/candle_pattern/htf_trend/сессия) — чтобы через 20-30+ сделок
      можно было ответить: не слишком ли короткий/длинный time-stop, и стоит
      ли вообще продолжать разворотную гипотезу дальше диагностики.
+EMA Invert Experiment v0.1.2 (fork of EMA Bounce Dossier v3.6.14)
+- v0.1.2: ФИКС форс-минимума размера позиции — раньше потолок маржи при
+  форсировании size=1 (когда номинальные position_pct% не дотягивают до
+  1 контракта) был жёстко зашит на 95% баланса. На маленьком депозите
+  ($10-15) это означало, что форс-минимум фактически вкладывал ПОЧТИ ВЕСЬ
+  депозит в одну сделку вместо настроенных 3% (репорт: депо $12, вошло
+  на $11 маржи при position_pct=3%). Теперь потолок настраивается через
+  UI (max_forced_margin_pct, дефолт 20% депозита) — если даже 1 мин.
+  контракт требует маржи больше потолка, сигнал пропускается целиком
+  (RuntimeError "Недостаточно средств"), а не открывается ценой почти
+  всего депозита. Новое поле добавлено в конфиг автоторговли (сохранение/
+  загрузка), в модалку настроек и в статус-бокс UI.
 EMA Invert Experiment v0.1.1 (fork of EMA Bounce Dossier v3.6.14)
 - откат "wrong_side"-фикса из v3.6.13 (см. запись ниже): этот фикс отменял
   подтверждение касания, если цена уходила на сторону, противоположную
@@ -2472,7 +2484,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.1.1"
+APP_VERSION  = "0.1.2"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3314,22 +3326,34 @@ def _gate_open_position(symbol, direction, entry_px, sl_px, tp_px, risk_pct, **k
             # для дорогих монет/крупного quanto_multiplier была слишком
             # мала при округлении. При депозите ~10-15U это убивало
             # 80-90% сигналов вхолостую. Теперь: если 1 контракт по факту
-            # укладывается в доступный баланс (оставляем 5% запас на
-            # комиссии/проскальзывание), берём size=1 вместо пропуска —
-            # маржа на этот вход будет выше номинальных position_pct%, но
-            # сигнал реально отторгуется, а не теряется.
+            # укладывается в доступный баланс (не больше max_forced_margin_pct%
+            # депозита), берём size=1 вместо пропуска — маржа на этот вход
+            # будет выше номинальных position_pct%, но сигнал реально
+            # отторгуется, а не теряется.
+            # v0.1.2: потолок раньше был жёстко зашит на 95% баланса —
+            # на маленьком депо (~$10-15) это на практике означало "почти
+            # весь депозит в одной сделке" вместо ожидаемых position_pct%
+            # (репорт: депо $12, форс-маржа $11 при настроенных 3%).
+            # Теперь потолок настраивается через UI (max_forced_margin_pct,
+            # по умолчанию 20% депозита) — если даже 1 минимальный контракт
+            # требует БОЛЬШЕ этого потолка, сигнал пропускается целиком,
+            # а не открывается ценой почти всего депозита.
+            max_forced_margin_pct = kwargs.get("max_forced_margin_pct", 20.0)
             margin_for_one = (entry_px * qm) / applied_leverage
-            if margin_for_one <= balance * 0.95:
+            margin_cap = balance * (max_forced_margin_pct / 100.0)
+            if margin_for_one <= margin_cap:
                 size = 1
                 forced_min_size = True
                 olog(f"[ema_auto_trade] {symbol}: size_raw={size_raw:.3f}<1 при "
                      f"номинальной марже {margin:.2f}U — форсирую size=1 "
-                     f"(нужно {margin_for_one:.2f}U маржи, баланс {balance:.2f}U)")
+                     f"(нужно {margin_for_one:.2f}U маржи, потолок "
+                     f"{margin_cap:.2f}U={max_forced_margin_pct}% депо, баланс {balance:.2f}U)")
             else:
                 raise RuntimeError(
                     f"Недостаточно средств: balance={balance:.2f} margin={margin:.2f} "
                     f"lev={applied_leverage}× ep={entry_px} qm={qm} → size={size_raw:.3f} < 1, "
-                    f"даже 1 контракт требует {margin_for_one:.2f}U маржи — не помещается в баланс"
+                    f"даже 1 контракт требует {margin_for_one:.2f}U маржи — это больше "
+                    f"потолка форс-минимума {margin_cap:.2f}U ({max_forced_margin_pct}% депо) — пропуск"
                 )
         notional = size * entry_px * qm
         olog(f"🔓 Открываем {direction.upper()} {symbol}: "
@@ -4381,6 +4405,12 @@ ema_auto_trade_state = {
     "position_pct":   3.0,   # % депозита в маржу ОДНОГО входа
     "risk_pct":       5.0,   # риск% на сделку (плечо = risk_pct/SL%)
     "max_concurrent": None,  # None = без ограничений (сколько хватит маржи)
+    "max_forced_margin_pct": 20.0,  # v0.1.2: потолок маржи при форс-минимуме
+    # размера позиции (когда 1 контракт не влезает в номинальные
+    # position_pct% — см. форс-минимум в _gate_open_position). Раньше был
+    # жёстко зашит на 95% баланса — на маленьком депо (~$10-15) это давало
+    # "почти весь депозит в одной сделке" вместо ожидаемых position_pct%.
+    # Теперь настраивается через UI, по умолчанию 20%.
     "last_error": "",
 }
 
@@ -4389,7 +4419,7 @@ def _load_ema_auto_trade_cfg():
         with open(EMA_AUTO_TRADE_CFG_FILE) as f:
             saved = json.load(f)
         with ema_auto_trade_lock:
-            for k in ("enabled", "position_pct", "risk_pct", "max_concurrent"):
+            for k in ("enabled", "position_pct", "risk_pct", "max_concurrent", "max_forced_margin_pct"):
                 if k in saved:
                     ema_auto_trade_state[k] = saved[k]
     except Exception:
@@ -4399,7 +4429,7 @@ def _save_ema_auto_trade_cfg():
     try:
         with ema_auto_trade_lock:
             snapshot = {k: ema_auto_trade_state[k] for k in
-                        ("enabled", "position_pct", "risk_pct", "max_concurrent")}
+                        ("enabled", "position_pct", "risk_pct", "max_concurrent", "max_forced_margin_pct")}
         with open(EMA_AUTO_TRADE_CFG_FILE, "w") as f:
             json.dump(snapshot, f)
     except Exception as e:
@@ -4418,6 +4448,7 @@ def _ema_maybe_open_live_trade(symbol, sig, hist_key):
         position_pct = ema_auto_trade_state["position_pct"]
         risk_pct     = ema_auto_trade_state["risk_pct"]
         max_c        = ema_auto_trade_state["max_concurrent"]
+        max_forced_margin_pct = ema_auto_trade_state["max_forced_margin_pct"]
     with _ema_history_lock:
         state = _load_ema_history()
         live_items = [v for v in state["items"].values()
@@ -4442,6 +4473,7 @@ def _ema_maybe_open_live_trade(symbol, sig, hist_key):
     pos_info = _gate_open_position(
         symbol, sig["dir"], sig["price"], sig["sl"], sig["tp"], risk_pct,
         position_pct=position_pct, label="EMA INVERT", text_prefix="emainv",
+        max_forced_margin_pct=max_forced_margin_pct,
     )
     if not pos_info:
         return   # _gate_open_position уже залогировала причину и заалертила
@@ -5192,6 +5224,9 @@ details[open] summary:before{content:"▾ "}
     <input type="number" id="atRiskPct" step="0.5" min="0.1" max="100">
     <label>Максимум одновременных позиций (пусто = без ограничений)</label>
     <input type="number" id="atMaxConcurrent" step="1" min="1">
+    <label>Потолок маржи при форс-минимуме размера (% депозита)</label>
+    <input type="number" id="atMaxForcedMarginPct" step="1" min="0.1" max="100">
+    <p style="font-size:12px;color:#8b949e;margin:2px 0 0">Если даже 1 мин. контракт требует маржи больше этого потолка — сигнал пропускается, а не открывается ценой почти всего депозита.</p>
     <hr>
     <label style="color:#c9d1d9;font-weight:bold">&#128273; Gate.io API ключи</label>
     <p style="font-size:12px;color:#8b949e;margin:2px 0 0">Нужны для реальных ордеров. Оставьте пустыми, чтобы не менять сохранённые. Оба поля заполняются вместе.</p>
@@ -5297,6 +5332,7 @@ async function loadSettingsIntoModal(){
     document.getElementById('atPositionPct').value = d.position_pct;
     document.getElementById('atRiskPct').value = d.risk_pct;
     document.getElementById('atMaxConcurrent').value = d.max_concurrent ?? '';
+    document.getElementById('atMaxForcedMarginPct').value = d.max_forced_margin_pct ?? 20;
   }catch(e){}
   try{
     const rg = await fetch('/gate_cfg'); const dg = await rg.json();
@@ -5324,6 +5360,7 @@ async function saveSettings(){
     position_pct: parseFloat(document.getElementById('atPositionPct').value),
     risk_pct: parseFloat(document.getElementById('atRiskPct').value),
     max_concurrent: document.getElementById('atMaxConcurrent').value || null,
+    max_forced_margin_pct: parseFloat(document.getElementById('atMaxForcedMarginPct').value),
   };
   const r = await fetch('/ema_auto_trade_settings', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
   const d = await r.json();
@@ -5389,6 +5426,7 @@ async function refreshAutoTradeBox(){
     }).join('');
     box.innerHTML = `<b>Автоторговля:</b> ${stateTxt} &nbsp;|&nbsp; `
       + `маржа/вход ${d.position_pct}% &nbsp;|&nbsp; risk ${d.risk_pct}% &nbsp;|&nbsp; `
+      + `потолок форс-маржи ${d.max_forced_margin_pct}% &nbsp;|&nbsp; `
       + `лимит позиций: ${d.max_concurrent ?? 'без ограничений'} &nbsp;|&nbsp; `
       + `открыто сейчас: <b>${d.live_count}</b>`
       + (d.balance != null ? ` &nbsp;|&nbsp; баланс: ${d.balance.toFixed(2)}USDT` : '')
@@ -6094,6 +6132,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     mc = int(mc) if mc not in (None, "", "null") else None
                     with ema_auto_trade_lock:
                         ema_auto_trade_state["max_concurrent"] = mc
+                if "max_forced_margin_pct" in body:
+                    mfp = float(body["max_forced_margin_pct"])
+                    assert 0.1 <= mfp <= 100.0, f"max_forced_margin_pct вне диапазона: {mfp}"
+                    with ema_auto_trade_lock:
+                        ema_auto_trade_state["max_forced_margin_pct"] = mfp
             except Exception as e:
                 self._json({"ok": False, "msg": f"Некорректные параметры: {e}"}); return
             _save_ema_auto_trade_cfg()
