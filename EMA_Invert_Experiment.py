@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-EMA Invert Experiment v0.1.4 (fork of EMA Bounce Dossier v3.6.14)
+EMA Invert Experiment v0.1.6 (fork of EMA Bounce Dossier v3.6.14)
 - ЭКСПЕРИМЕНТАЛЬНЫЙ форк, не пушится в git, не участвует в авто-обновлении
   оригинального бота. Живёт и качается вручную отдельным файлом. Отдельные
   файлы состояния/логов/диагностики (см. префикс "ema_invert_" ниже) и
@@ -50,6 +50,27 @@ EMA Invert Experiment v0.1.4 (fork of EMA Bounce Dossier v3.6.14)
      ribbon/candle_pattern/htf_trend/сессия) — чтобы через 20-30+ сделок
      можно было ответить: не слишком ли короткий/длинный time-stop, и стоит
      ли вообще продолжать разворотную гипотезу дальше диагностики.
+EMA Invert Experiment v0.1.6 (fork of EMA Bounce Dossier v3.6.14)
+- ДИАГНОСТИКА: проверил всю историю на баг из v0.1.5 (чужой PnL из
+  /position_close) — кроме уже найденного SPCX_USDT, других заражённых
+  записей нет (|pnl|>60% notional только у него одного). Значит "с каждой
+  сделкой всё меньше" — не это. Рабочая гипотеза №2: комиссии Gate.io.
+  /position_close отдаёт разбивку pnl_pnl (ценовая часть) / pnl_fund
+  (фандинг) / pnl_fee (комиссия) — раньше эти поля не читались вообще,
+  бралось только суммарное "pnl" не проверяя, net оно или нет. Добавил
+  логирование разбивки (olog "[gate_pnl] ...") и сохранение live_pnl_fee/
+  live_pnl_fund/live_pnl_price в историю — по следующему диагностическому
+  архиву будет видно, ест ли комиссия исход на каждой сделке.
+EMA Invert Experiment v0.1.5 (fork of EMA Bounce Dossier v3.6.14)
+- КРИТИЧНЫЙ ФИКС _gate_get_last_pnl: раньше бралась просто "первая запись"
+  из /position_close без проверки, что это именно НАШЕ только что
+  закрытое. Реальный случай из диагностики: SPCX_USDT time_stop, цена
+  ушла на 7.49% против при notional=$16 (макс. теоретическая потеря по
+  марже при 20х ≈ $0.80), а записанный live_pnl=-$17.97 (-112% от
+  notional) — физически невозможно для этой сделки, это была запись о
+  ЧУЖОМ закрытии по этому контракту. Теперь сверяем rec["time"] с
+  моментом вызова (max_age_sec=180) — если запись закрытия старше, она
+  не наша, возвращаем None вместо того, чтобы приписать чужой PnL.
 EMA Invert Experiment v0.1.4 (fork of EMA Bounce Dossier v3.6.14)
 - EMA_INVERT_SAFETY_RR снижен с 2.0 до 1.4 (RR≈0.71 вместо 0.5) по разбору
   диагностического архива: при RR=0.5 безубыток требовал винрейт >=66.7%,
@@ -2500,7 +2521,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.1.4"
+APP_VERSION  = "0.1.6"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2804,10 +2825,23 @@ def _gate_cancel_orders(symbol):
     except Exception as e:
         olog(f"⚠ gate_cancel_orders (price_orders) {contract}: {e}")
 
-def _gate_get_last_pnl(symbol):
+def _gate_get_last_pnl(symbol, max_age_sec=180):
     """Возвращает PnL последней закрытой позиции по символу (USDT).
     Использует /futures/usdt/position_close — Gate отдаёт список закрытий
-    в обратном хронологическом порядке; берём первую запись."""
+    в обратном хронологическом порядке; берём первую запись.
+    v0.1.5: КРИТИЧНЫЙ ФИКС — раньше бралась просто "первая запись" без
+    ПРОВЕРКИ, что это именно ТО закрытие, которое только что произошло у
+    НАС. Если по этому контракту раньше была любая ДРУГАЯ закрытая позиция
+    (ручная сделка, остаток от прошлой сессии бота, гонка при быстром
+    переоткрытии того же символа) — pnl этой чужой записи молча
+    приписывался нашей текущей сделке. Реальный случай: SPCX_USDT,
+    time_stop, цена ушла на 7.49% против при notional=$16, а записанный
+    live_pnl=-$17.97 (-112% от notional) — физически невозможно для этой
+    сделки (макс. потеря по марже при 20х = notional/20 = $0.80). Теперь
+    проверяем rec["time"] — если запись закрытия старше max_age_sec от
+    момента вызова, считаем её НЕ нашей и возвращаем None вместо того,
+    чтобы приписать чужой PnL. Вызывающий код (time_stop watchdog,
+    reconcile) уже трактует None как "не смогли получить PnL" и не падает."""
     try:
         contract = symbol.replace("/", "_").upper()
         data = _gate_req("GET", "/futures/usdt/position_close",
@@ -2815,7 +2849,26 @@ def _gate_get_last_pnl(symbol):
         if not isinstance(data, list) or not data:
             return None
         rec = data[0]
+        rec_time = float(rec.get("time", 0) or 0)
+        age = time.time() - rec_time
+        if rec_time <= 0 or age > max_age_sec:
+            olog(f"⚠ gate_get_last_pnl({symbol}): последняя запись закрытия "
+                 f"старше {max_age_sec}с (age={age:.0f}с) — похоже на ЧУЖОЕ "
+                 f"закрытие (старая ручная сделка/прошлая сессия), а не "
+                 f"наше только что закрытое — игнорирую, PnL не приписываю")
+            return None
         pnl       = float(rec.get("pnl",       0))
+        pnl_fee   = float(rec.get("pnl_fee",   0) or 0)
+        pnl_fund  = float(rec.get("pnl_fund",  0) or 0)
+        pnl_price = float(rec.get("pnl_pnl",   0) or 0)
+        # v0.1.6: раньше комиссию/фандинг не смотрели вообще — "pnl" из
+        # Gate ИЛИ уже net (тогда всё ок), ИЛИ только ценовая часть (тогда
+        # реальный результат хуже того, что мы считаем/логируем). Логируем
+        # разбивку явно, чтобы по факту реальных данных увидеть, что есть
+        # что (pnl_pnl+pnl_fund+pnl_fee должно давать pnl, если "pnl" net).
+        olog(f"[gate_pnl] {symbol}: pnl={pnl:.4f} (price={pnl_price:.4f} "
+             f"fee={pnl_fee:.4f} fund={pnl_fund:.4f} сумма_частей="
+             f"{pnl_price+pnl_fee+pnl_fund:.4f})")
         # v3.52.79: у Gate.io /position_close ВООБЩЕ НЕТ полей "pnl_pct" и
         # "close_price" (реальная схема PositionClose: time, contract, side,
         # pnl, pnl_pnl, pnl_fund, pnl_fee, text, max_size, accum_size,
@@ -2838,7 +2891,8 @@ def _gate_get_last_pnl(symbol):
         else:
             entry_px, close_px = short_px, long_px
             pnl_pct = (entry_px - close_px) / entry_px * 100.0 if entry_px > 0 else 0.0
-        return {"pnl": pnl, "pnl_pct": pnl_pct, "close_price": close_px}
+        return {"pnl": pnl, "pnl_pct": pnl_pct, "close_price": close_px,
+                "pnl_fee": pnl_fee, "pnl_fund": pnl_fund, "pnl_price": pnl_price}
     except Exception as e:
         olog(f"⚠ gate_get_last_pnl: {e}")
         return None
@@ -3162,6 +3216,9 @@ def _ema_invert_timestop_watchdog():
                 if pnl_info:
                     it2["live_pnl"]     = pnl_info["pnl"]
                     it2["live_pnl_pct"] = pnl_info["pnl_pct"]
+                    it2["live_pnl_fee"]   = pnl_info.get("pnl_fee")
+                    it2["live_pnl_fund"]  = pnl_info.get("pnl_fund")
+                    it2["live_pnl_price"] = pnl_info.get("pnl_price")
                 it2["diag_status"] = "pending"   # добор — см. _ema_invert_run_diagnostics
                 _save_ema_history(state2)
                 _ema_invert_diag_schedule(it2)
@@ -4343,6 +4400,9 @@ def _ema_reconcile_live_positions():
         if pnl_info:
             item["live_pnl"]     = pnl_info["pnl"]
             item["live_pnl_pct"] = pnl_info["pnl_pct"]
+            item["live_pnl_fee"]   = pnl_info.get("pnl_fee")
+            item["live_pnl_fund"]  = pnl_info.get("pnl_fund")
+            item["live_pnl_price"] = pnl_info.get("pnl_price")
         olog(f"[ema_reconcile] {item['symbol']}: реально закрыта на бирже "
              f"внешним путём (не по нашему TP/SL), close={close_p} pnl={pnl_info}")
         updated[key] = item
