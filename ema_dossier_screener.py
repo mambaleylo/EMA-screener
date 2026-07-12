@@ -1,5 +1,34 @@
 #!/usr/bin/env python3
 """
+EMA Bounce Dossier v3.6.14 (fork of SMC Optimizer v3.52.96)
+- v3.6.14: по запросу — дневные (и недельные) сигналы больше не торгуются
+  вживую, максимум 4h (EMA_LIVE_TFS = {1m,5m,15m,1h,4h}). Фильтрация в
+  _pick_best_ema_for_symbol — единственная точка, откуда вообще берётся
+  живой сигнал (см. _ema_signal_loop). EMA_DOSSIER_TFS не тронут — "1d"
+  там всё ещё нужен: ресемплинг в "1w" для досье, recent_pump-флаг, и
+  отдельно HTF-фильтр тренда (EMA_HTF_TREND_TF="1d") — это всё не про
+  торгуемые сигналы. Уже ОТКРЫТЫЕ 1d-сделки (если есть) это изменение не
+  закрывает и не трогает — они продолжат вестись до своего SL/TP как
+  обычно, просто новые 1d/1w сигналы больше не появятся.
+EMA Bounce Dossier v3.6.13 (fork of SMC Optimizer v3.52.96)
+- v3.6.13: КРИТИЧНЫЙ ФИКС подтверждения касания (_ema_check_symbol_signal) —
+  найден и подтверждён разбором ema_signal_diagnostics.jsonl на реальных
+  сделках (44% SL, 8 из 18, вошли когда цена уже была по ДРУГУЮ сторону
+  EMA). Раньше подтверждение касания после EMA_TOUCH_CONFIRM_SEC=15с
+  проверяло только |dist|<=tol*1.8 (0.45×ATR) — не глядя на сторону. Цена
+  вполне могла за эти 15с пробить уровень насквозь в сторону, противоположную
+  ожидаемому отскоку, и сигнал всё равно открывался, потому что 0.45×ATR
+  формально укладывалось в допуск (хотя это уже 75% от буфера стопа
+  EMA_SIGNAL_SL_ATR=0.6×ATR) — реальный риск в моменте входа оказывался
+  заметно уже заложенного, причём именно там, где цена уже двигалась против
+  сделки. Теперь при подтверждении дополнительно требуется, чтобы цена
+  всё ещё была НЕ ХУЖЕ уровня (для long — не ниже EMA, для short — не выше);
+  иначе подход отменяется целиком (как обычный пробой без реакции, тот же
+  путь touch_aborted, с reason="wrong_side" в ema_events_diagnostics.jsonl).
+  direction теперь считается в начале функции (раньше — только перед самим
+  открытием сигнала), чтобы быть доступным для этой проверки. Протестировано
+  изолированно (мок ctx/live_price/time) — оба сценария (нормальное
+  подтверждение и обрыв по стороне) ведут себя как задумано.
 EMA Bounce Dossier v3.6.12 (fork of SMC Optimizer v3.52.96)
 - v3.6.12: добавлен блок ЧИСТО ДИАГНОСТИЧЕСКИХ индикаторов — по запросу,
   чтобы накопить за пару дней/недель данные и по факту решить, какой из
@@ -2384,7 +2413,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.6.12"
+APP_VERSION  = "3.6.14"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4446,11 +4475,23 @@ def _ema_run_diagnostics():
                 state2["items"][key] = item
             _save_ema_history(state2)
 
+# v3.6.14: по запросу — дневные (и недельный, он ещё старше) сигналы больше
+# не торгуются вживую, максимум 4h. EMA_DOSSIER_TFS НЕ трогаем — "1d" там
+# всё ещё нужен: от него ресемплится "1w" в досье, считается recent_pump, и
+# он же отдельно используется для HTF-фильтра тренда (EMA_HTF_TREND_TF) —
+# всё это не про сами торгуемые сигналы. Ограничиваем именно то, что может
+# стать live-сигналом — в _pick_best_ema_for_symbol ниже.
+EMA_LIVE_TFS = {"1m", "5m", "15m", "1h", "4h"}
+
 def _pick_best_ema_for_symbol(dossier_entry):
     """Из досье монеты выбирает одну (tf, ema_period) пару с максимальным
-    bounce_rate среди надёжных (touches >= EMA_DOSSIER_MIN_TOUCHES)."""
+    bounce_rate среди надёжных (touches >= EMA_DOSSIER_MIN_TOUCHES).
+    v3.6.14: "1d"/"1w" из досье игнорируются — см. EMA_LIVE_TFS выше, сами
+    по себе в досье они по-прежнему считаются и отображаются."""
     best = None
     for tf, d in (dossier_entry.get("by_tf") or {}).items():
+        if tf not in EMA_LIVE_TFS:
+            continue
         for s in d.get("emas", []):
             if s["touches"] < EMA_DOSSIER_MIN_TOUCHES: continue
             if best is None or s["bounce_rate"] > best["bounce_rate"]:
@@ -4633,6 +4674,13 @@ def _ema_check_symbol_signal(symbol, pick):
     dist = abs(live_price - ema_v)
     key = f"{symbol}|{tf}|{ema_period}"
     state = _ema_touch_state.get(key, "out")
+    # v3.6.13: direction теперь считается ЗДЕСЬ, а не только перед открытием
+    # сигнала — нужен раньше, для проверки стороны цены при подтверждении
+    # касания (см. ниже, блок state=="pending"). Сама логика направления не
+    # изменилась — по последнему ЗАКРЫТОМУ бару (стабильно, не дёргается
+    # внутри бара).
+    side_above = ctx["close_i"] > ema_closed   # направление — по последнему закрытию (стабильно)
+    direction = "long" if side_above else "short"   # отскок от EMA как от support/resistance
     # v2.6: КРИТИЧНЫЙ ФИКС дублей — раньше вход/выход из зоны касания
     # проверялись по ОДНОЙ и той же границе tol. Если цена стоит вплотную
     # к этой границе (обычный шум тика туда-обратно на пару пунктов), она
@@ -4673,6 +4721,38 @@ def _ema_check_symbol_signal(symbol, pick):
     if state == "pending":
         if time.time() - _ema_touch_pending.get(key, 0) < EMA_TOUCH_CONFIRM_SEC:
             return None   # ещё не прошло ни одного доп. опроса — рано
+        # v3.6.13: КРИТИЧНЫЙ ФИКС — раньше подтверждение проверяло только
+        # |dist| <= tol*1.8 (см. touched_now выше), не глядя на СТОРОНУ. За
+        # эти 15с цена вполне могла уже пробить уровень НАСКВОЗЬ в сторону,
+        # противоположную ожидаемому отскоку — и такое всё ещё засчитывалось
+        # как валидное подтверждённое касание, потому что |dist| формально
+        # укладывался в гистерезис (tol*1.8=0.45×ATR), хотя это уже 75% от
+        # самого буфера стопа (EMA_SIGNAL_SL_ATR=0.6×ATR). Разбор
+        # ema_signal_diagnostics.jsonl на реальных сделках подтвердил: 8 из
+        # 18 SL (44%) вошли, когда цена уже была по ДРУГУЮ сторону EMA —
+        # реальный риск в моменте входа оказывался заметно уже заложенного,
+        # причём именно там, где цена уже двигалась против сделки. Теперь
+        # при подтверждении дополнительно требуем, чтобы цена всё ещё была
+        # НЕ ХУЖЕ уровня (для long — не ниже EMA, для short — не выше) —
+        # иначе подход отменяется целиком, как и обычный пробой без реакции.
+        wrong_side = (direction == "long" and live_price < ema_v) or \
+                     (direction == "short" and live_price > ema_v)
+        if wrong_side:
+            _ema_touch_confirm_stats["aborted"] += 1
+            waited = time.time() - _ema_touch_pending.get(key, time.time())
+            olog(f"[ema_touch] {symbol} {tf} EMA{ema_period}: касание отменено — "
+                 f"цена перешла на другую сторону уровня за {waited:.0f}с "
+                 f"(ждали {direction}, live={live_price}, ema={ema_v:.6g}) "
+                 f"(всего отменено={_ema_touch_confirm_stats['aborted']}, "
+                 f"подтверждено={_ema_touch_confirm_stats['confirmed']})")
+            _ema_event_log_write("touch_aborted", symbol=symbol, tf=tf,
+                                  ema_period=ema_period, waited_sec=round(waited, 1),
+                                  reason="wrong_side",
+                                  aborted_total=_ema_touch_confirm_stats["aborted"],
+                                  confirmed_total=_ema_touch_confirm_stats["confirmed"])
+            _ema_touch_state[key] = "out"
+            _ema_touch_pending.pop(key, None)
+            return None
         _ema_touch_state[key] = "done"
         _ema_touch_confirm_stats["confirmed"] += 1
         _ema_event_log_write("touch_confirmed", symbol=symbol, tf=tf,
@@ -4692,8 +4772,6 @@ def _ema_check_symbol_signal(symbol, pick):
     # диске, рестарт процесса её не обнуляет.
     if _ema_has_open_signal(symbol, tf, ema_period):
         return None
-    side_above = ctx["close_i"] > ema_closed   # направление — по последнему закрытию (стабильно)
-    direction = "long" if side_above else "short"   # отскок от EMA как от support/resistance
     # v1.4/v1.8-b: подтверждаем ПОЛНОЙ лесенкой (7/14/28 + промежуточные EMA
     # до касаемого уровня), каждая приведена к текущему моменту так же, как
     # ema_v выше — иначе лесенка могла бы "залипнуть" в устаревшем состоянии
