@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-EMA Invert Experiment v0.1.0 (fork of EMA Bounce Dossier v3.6.14)
+EMA Invert Experiment v0.1.1 (fork of EMA Bounce Dossier v3.6.14)
 - ЭКСПЕРИМЕНТАЛЬНЫЙ форк, не пушится в git, не участвует в авто-обновлении
   оригинального бота. Живёт и качается вручную отдельным файлом. Отдельные
   файлы состояния/логов/диагностики (см. префикс "ema_invert_" ниже) и
@@ -50,6 +50,15 @@ EMA Invert Experiment v0.1.0 (fork of EMA Bounce Dossier v3.6.14)
      ribbon/candle_pattern/htf_trend/сессия) — чтобы через 20-30+ сделок
      можно было ответить: не слишком ли короткий/длинный time-stop, и стоит
      ли вообще продолжать разворотную гипотезу дальше диагностики.
+EMA Invert Experiment v0.1.1 (fork of EMA Bounce Dossier v3.6.14)
+- откат "wrong_side"-фикса из v3.6.13 (см. запись ниже): этот фикс отменял
+  подтверждение касания, если цена уходила на сторону, противоположную
+  ИСХОДНОМУ (bounce) direction. Поскольку в этом форке торговая логика
+  инвертирована, реальная сделка как раз и идёт в ту сторону, которую
+  фикс считал "плохой" — при инверсии он резал нужные подтверждения и
+  пропускал ненужные. direction по-прежнему считается в начале
+  _ema_check_symbol_signal (используется дальше для HTF-фильтра и
+  trade_dir), просто больше не участвует в отмене подтверждения касания.
 EMA Bounce Dossier v3.6.14 (fork of SMC Optimizer v3.52.96)
 - v3.6.14: по запросу — дневные (и недельные) сигналы больше не торгуются
   вживую, максимум 4h (EMA_LIVE_TFS = {1m,5m,15m,1h,4h}). Фильтрация в
@@ -2463,7 +2472,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.1.0"
+APP_VERSION  = "0.1.1"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4901,38 +4910,17 @@ def _ema_check_symbol_signal(symbol, pick):
     if state == "pending":
         if time.time() - _ema_touch_pending.get(key, 0) < EMA_TOUCH_CONFIRM_SEC:
             return None   # ещё не прошло ни одного доп. опроса — рано
-        # v3.6.13: КРИТИЧНЫЙ ФИКС — раньше подтверждение проверяло только
-        # |dist| <= tol*1.8 (см. touched_now выше), не глядя на СТОРОНУ. За
-        # эти 15с цена вполне могла уже пробить уровень НАСКВОЗЬ в сторону,
-        # противоположную ожидаемому отскоку — и такое всё ещё засчитывалось
-        # как валидное подтверждённое касание, потому что |dist| формально
-        # укладывался в гистерезис (tol*1.8=0.45×ATR), хотя это уже 75% от
-        # самого буфера стопа (EMA_SIGNAL_SL_ATR=0.6×ATR). Разбор
-        # ema_signal_diagnostics.jsonl на реальных сделках подтвердил: 8 из
-        # 18 SL (44%) вошли, когда цена уже была по ДРУГУЮ сторону EMA —
-        # реальный риск в моменте входа оказывался заметно уже заложенного,
-        # причём именно там, где цена уже двигалась против сделки. Теперь
-        # при подтверждении дополнительно требуем, чтобы цена всё ещё была
-        # НЕ ХУЖЕ уровня (для long — не ниже EMA, для short — не выше) —
-        # иначе подход отменяется целиком, как и обычный пробой без реакции.
-        wrong_side = (direction == "long" and live_price < ema_v) or \
-                     (direction == "short" and live_price > ema_v)
-        if wrong_side:
-            _ema_touch_confirm_stats["aborted"] += 1
-            waited = time.time() - _ema_touch_pending.get(key, time.time())
-            olog(f"[ema_touch] {symbol} {tf} EMA{ema_period}: касание отменено — "
-                 f"цена перешла на другую сторону уровня за {waited:.0f}с "
-                 f"(ждали {direction}, live={live_price}, ema={ema_v:.6g}) "
-                 f"(всего отменено={_ema_touch_confirm_stats['aborted']}, "
-                 f"подтверждено={_ema_touch_confirm_stats['confirmed']})")
-            _ema_event_log_write("touch_aborted", symbol=symbol, tf=tf,
-                                  ema_period=ema_period, waited_sec=round(waited, 1),
-                                  reason="wrong_side",
-                                  aborted_total=_ema_touch_confirm_stats["aborted"],
-                                  confirmed_total=_ema_touch_confirm_stats["confirmed"])
-            _ema_touch_state[key] = "out"
-            _ema_touch_pending.pop(key, None)
-            return None
+        # v3.6.13-фикс (проверка "wrong_side" при подтверждении касания)
+        # ЗДЕСЬ УБРАН по запросу — логика торговли инвертирована (см. шапку
+        # invert-fork'а), а сам фикс был написан и провалидирован под
+        # ИСХОДНУЮ (bounce) гипотезу: он отменял подтверждение, если цена
+        # уже перешла на сторону, противоположную ИСХОДНОМУ direction. Для
+        # инвертированной логики реальная сделка идёт как раз в сторону,
+        # которую этот фикс считал "плохой" — оставлять его означало бы
+        # систематически резать именно те подтверждения, которые нужны
+        # инвертированной гипотезе. direction по-прежнему считается выше
+        # (используется дальше по коду для HTF-фильтра и trade_dir), просто
+        # больше не участвует в отмене подтверждения касания.
         _ema_touch_state[key] = "done"
         _ema_touch_confirm_stats["confirmed"] += 1
         _ema_event_log_write("touch_confirmed", symbol=symbol, tf=tf,
