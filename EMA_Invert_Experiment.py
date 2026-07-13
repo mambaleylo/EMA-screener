@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-EMA Invert Experiment v0.1.6 (fork of EMA Bounce Dossier v3.6.14)
+EMA Invert Experiment v0.1.9 (fork of EMA Bounce Dossier v3.6.14)
 - ЭКСПЕРИМЕНТАЛЬНЫЙ форк, не пушится в git, не участвует в авто-обновлении
   оригинального бота. Живёт и качается вручную отдельным файлом. Отдельные
   файлы состояния/логов/диагностики (см. префикс "ema_invert_" ниже) и
@@ -50,6 +50,46 @@ EMA Invert Experiment v0.1.6 (fork of EMA Bounce Dossier v3.6.14)
      ribbon/candle_pattern/htf_trend/сессия) — чтобы через 20-30+ сделок
      можно было ответить: не слишком ли короткий/длинный time-stop, и стоит
      ли вообще продолжать разворотную гипотезу дальше диагностики.
+EMA Invert Experiment v0.1.9 (fork of EMA Bounce Dossier v3.6.14)
+- Второй предохранитель форс-минимума размера: forced_size_max_multiple
+  (по умолчанию 3.0×). По факту диагностики implied-баланс от размера
+  реальной маржи ($7-10) совпадал с гипотезой "это 20% депозита", а не
+  "это 3%" — форс-минимум стал ОСНОВНЫМ путём почти для каждой сделки на
+  небольшом депозите, а не редким предохранителем: минимальный контракт
+  почти всегда требовал в 6-7 раз больше номинальной маржи. Абсолютный
+  % депозита (max_forced_margin_pct) не отличал "чуть-чуть не хватило"
+  от "нужно в 7 раз больше" — теперь ДОПОЛНИТЕЛЬНО ограничена кратность
+  превышения номинала; если контракту нужно больше чем в
+  forced_size_max_multiple раз задуманной маржи — сигнал пропускается
+  целиком, а не форсируется. Настраивается через UI, оба потолка
+  сохраняются/загружаются вместе.
+EMA Invert Experiment v0.1.8 (fork of EMA Bounce Dossier v3.6.14)
+- ДВА ФИКСА по ночной диагностике (127 сделок):
+  1) _gate_get_last_pnl: max_age_sec поднят с 180 до 1800. 180с оказалось
+     слишком строго — reconcile-цикл идёт раз за ПОЛНЫЙ обход ~100 символов,
+     а не каждые 15с, и мог опаздывать больше 3 минут после реального
+     закрытия. Итог: 6 из 21 SL-закрытий за ночь остались БЕЗ live_pnl —
+     свои свежие записи резались тем же фильтром, что должен был ловить
+     только настоящий чужой мусор (тот SPCX-случай был на порядки старше).
+  2) _gate_get_balance КРИТИЧНЫЙ ФИКС: раньше читал голый "available" —
+     та же болезнь кросс-маржи, которую v3.51.10 когда-то починил, но
+     только в _gate_get_equity(), не здесь (см. коммент в SMC Optimizer
+     v3.51.9 выше по файлу, "не трогал"). Живой симптом: margin/сделку
+     была $0.4-1.2 весь день (задумано 3% депо), потом без видимой причины
+     подскочила до $7-10 за ночь — это не депозит вырос в 15х, это
+     "available" весь день показывал крохи вместо реального свободного
+     кросс-баланса. Теперь _gate_get_balance берёт cross_margin_balance,
+     когда он есть, как и equity. Плюс добавлено логирование "🔍
+     gate_balance: ..." на каждый вызов — на следующей диагностике будет
+     видно по факту, что там на самом деле происходит.
+EMA Invert Experiment v0.1.7 (fork of EMA Bounce Dossier v3.6.14)
+- Добавлен абсолютный порог ликвидности MIN_VOLUME_24H_USD=$3M в
+  _fetch_all_symbols — раньше отбор был чисто относительный (топ-100 по
+  объёму + спред ≤0.15%), из-за чего в тонком рынке в топ-100 всё равно
+  мог попасть контракт с объёмом на порядок меньше остальных (SPCX_USDT —
+  узкий топ-оф-бук спред при мизерной глубине дальше в стакане, спред-
+  фильтр это не ловит). Теперь такие контракты отсеиваются АБСОЛЮТНЫМ
+  порогом объёма ещё до проверки спреда, независимо от места в топе.
 EMA Invert Experiment v0.1.6 (fork of EMA Bounce Dossier v3.6.14)
 - ДИАГНОСТИКА: проверил всю историю на баг из v0.1.5 (чужой PnL из
   /position_close) — кроме уже найденного SPCX_USDT, других заражённых
@@ -2521,7 +2561,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.1.6"
+APP_VERSION  = "0.1.9"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2757,10 +2797,42 @@ def _gate_get_contract_info(symbol, force_refresh=False):
 def _gate_get_balance():
     """Свободный баланс USDT (для расчёта размера новой позиции — именно
     свободная маржа, а не equity, иначе сайзинг переоценит доступные деньги
-    если уже есть открытая позиция по другому символу)."""
+    если уже есть открытая позиция по другому символу).
+
+    v0.1.8: КРИТИЧНЫЙ ФИКС — раньше эта функция читала ГОЛЫЙ "available",
+    и это НЕ трогали намеренно (см. коммент в SMC Optimizer v3.51.9/v3.51.10
+    выше по файлу) якобы потому что для сайзинга нужна именно свободная
+    маржа, а не equity. Но сам "available" в кросс-марже (margin_mode=1/2)
+    показывает только жалкий остаток на изолированной части счёта — та же
+    самая болезнь, которую v3.51.10 когда-то починил, но ТОЛЬКО в
+    _gate_get_equity(), не здесь. Живой пример из диагностики этого форка:
+    margin/сделку весь день была $0.4-1.2 (при задуманных 3% депозита) —
+    ПОТОМ БЕЗ видимой причины подскочила до $7-10 за одну ночь. Это не рост
+    депозита в 15 раз за одну сделку, это ровно тот занижающий баг: available
+    почти весь день показывал крохи, а не реальный свободный кросс-баланс.
+    Теперь используем ту же cross_margin_balance-логику, что и equity —
+    оговорка: cross_margin_balance это equity ВСЕГО кросс-пула, включая уже
+    занятую под другие открытые позиции маржу, так что при нескольких
+    одновременных live-сделках это чуть оптимистичнее настоящей свободной
+    маржи (сайзинг может слегка переоценить доступное). Раз max_concurrent
+    обычно небольшой — риск ограничен, но держи это в уме."""
     try:
         data = _gate_req("GET", "/futures/usdt/accounts")
-        return float(data.get("available", 0))
+        cross_bal = data.get("cross_margin_balance")
+        avail     = data.get("available")
+        try:
+            cross_bal = float(cross_bal) if cross_bal not in (None, "") else None
+        except (TypeError, ValueError):
+            cross_bal = None
+        try:
+            avail = float(avail) if avail not in (None, "") else 0.0
+        except (TypeError, ValueError):
+            avail = 0.0
+        olog(f"🔍 gate_balance: margin_mode={data.get('margin_mode')} "
+             f"available={avail} cross_margin_balance={cross_bal}")
+        if cross_bal is not None and cross_bal > 0:
+            return cross_bal
+        return avail
     except Exception as e:
         olog(f"⚠ gate_get_balance: {e}")
         return 0.0
@@ -2825,7 +2897,7 @@ def _gate_cancel_orders(symbol):
     except Exception as e:
         olog(f"⚠ gate_cancel_orders (price_orders) {contract}: {e}")
 
-def _gate_get_last_pnl(symbol, max_age_sec=180):
+def _gate_get_last_pnl(symbol, max_age_sec=1800):
     """Возвращает PnL последней закрытой позиции по символу (USDT).
     Использует /futures/usdt/position_close — Gate отдаёт список закрытий
     в обратном хронологическом порядке; берём первую запись.
@@ -2841,7 +2913,16 @@ def _gate_get_last_pnl(symbol, max_age_sec=180):
     проверяем rec["time"] — если запись закрытия старше max_age_sec от
     момента вызова, считаем её НЕ нашей и возвращаем None вместо того,
     чтобы приписать чужой PnL. Вызывающий код (time_stop watchdog,
-    reconcile) уже трактует None как "не смогли получить PnL" и не падает."""
+    reconcile) уже трактует None как "не смогли получить PnL" и не падает.
+    v0.1.8: max_age_sec подняли с 180 до 1800 — 180с оказалось СЛИШКОМ
+    строго: _ema_reconcile_live_positions() вызывается раз за ПОЛНЫЙ обход
+    ~100 символов (не каждые 15с), и на практике мог опоздать больше чем
+    на 3 минуты после реального закрытия на бирже. В диагностике за ночь
+    это давало 6 из 21 SL-закрытий БЕЗ live_pnl вообще — свои же свежие
+    записи резались тем же фильтром, что должен был ловить только
+    настоящий чужой мусор (тот SPCX-случай был на порядки старше 3 минут).
+    30 минут — с большим запасом покрывает медленный reconcile-цикл, но
+    всё ещё отсекает по-настоящему древний мусор."""
     try:
         contract = symbol.replace("/", "_").upper()
         data = _gate_req("GET", "/futures/usdt/position_close",
@@ -3430,22 +3511,41 @@ def _gate_open_position(symbol, direction, entry_px, sl_px, tp_px, risk_pct, **k
             # по умолчанию 20% депозита) — если даже 1 минимальный контракт
             # требует БОЛЬШЕ этого потолка, сигнал пропускается целиком,
             # а не открывается ценой почти всего депозита.
+            # v0.1.9: ВТОРОЙ, смысловой предохранитель поверх первого —
+            # диагностика показала, что %-от-депозита потолок сам по себе
+            # НЕ спасает: при маленьком балансе минимальный контракт почти
+            # ВСЕГДА требует больше номинальных position_pct%, и форс стал
+            # ОСНОВНЫМ путём почти для каждой сделки (implied-баланс по
+            # факту маржи $7-10 совпадал с 20%-гипотезой, а не с 3% —
+            # реальный риск на сделку был ~20%, а не задуманные 3%, почти
+            # всегда). Абсолютный % депозита не отличает "чуть-чуть не
+            # хватило" от "нужно в 7 раз больше" — оба варианта проходили
+            # один и тот же потолок. Теперь ДОПОЛНИТЕЛЬНО ограничиваем
+            # кратность превышения номинальной маржи (сколько раз margin_
+            # for_one больше margin) — если контракту нужно больше чем в
+            # forced_size_max_multiple раз номинала, форсировать НЕ имеет
+            # смысла (это уже не "чуть округлили", а другой по масштабу
+            # риска вход) — пропускаем сигнал целиком.
+            forced_size_max_multiple = kwargs.get("forced_size_max_multiple", 3.0)
             max_forced_margin_pct = kwargs.get("max_forced_margin_pct", 20.0)
             margin_for_one = (entry_px * qm) / applied_leverage
             margin_cap = balance * (max_forced_margin_pct / 100.0)
-            if margin_for_one <= margin_cap:
+            multiple = margin_for_one / margin if margin > 0 else float("inf")
+            if margin_for_one <= margin_cap and multiple <= forced_size_max_multiple:
                 size = 1
                 forced_min_size = True
                 olog(f"[ema_auto_trade] {symbol}: size_raw={size_raw:.3f}<1 при "
                      f"номинальной марже {margin:.2f}U — форсирую size=1 "
-                     f"(нужно {margin_for_one:.2f}U маржи, потолок "
+                     f"(нужно {margin_for_one:.2f}U маржи = {multiple:.1f}× номинала, потолок "
                      f"{margin_cap:.2f}U={max_forced_margin_pct}% депо, баланс {balance:.2f}U)")
             else:
+                reason = (f"{margin_for_one:.2f}U > потолка {margin_cap:.2f}U ({max_forced_margin_pct}% депо)"
+                          if margin_for_one > margin_cap else
+                          f"нужно {multiple:.1f}× номинальной маржи > лимита {forced_size_max_multiple}×")
                 raise RuntimeError(
                     f"Недостаточно средств: balance={balance:.2f} margin={margin:.2f} "
                     f"lev={applied_leverage}× ep={entry_px} qm={qm} → size={size_raw:.3f} < 1, "
-                    f"даже 1 контракт требует {margin_for_one:.2f}U маржи — это больше "
-                    f"потолка форс-минимума {margin_cap:.2f}U ({max_forced_margin_pct}% депо) — пропуск"
+                    f"даже 1 контракт требует {margin_for_one:.2f}U маржи — {reason} — пропуск"
                 )
         notional = size * entry_px * qm
         olog(f"🔓 Открываем {direction.upper()} {symbol}: "
@@ -3583,6 +3683,14 @@ def olog(msg):
 # риска проскальзывания, а не косвенная через объём, и уже есть в том же
 # тикере (highest_bid/lowest_ask), доп. запрос не нужен.
 MAX_SPREAD_PCT = 0.15  # шире этого — считаем стакан слишком тонким для SL/TP
+# v0.1.7: узкий спред топ-оф-бука НЕ гарантирует глубину стакана — контракт
+# с малым 24h-объёмом может иметь мгновенно узкий spread между bid/ask
+# ПРИ ЭТОМ мизерном размере на этих уровнях, а чуть дальше в стакане —
+# пусто. Топ-100 ПО ОТНОСИТЕЛЬНОМУ ранжированию объёма не спасает: если
+# в моменте общий рынок контрактов тонкий, в топ-100 всё равно попадёт
+# что-то с объёмом на порядок меньше остальных. Добавлен АБСОЛЮТНЫЙ пол —
+# ниже него контракт не идёт в отбор вообще, независимо от места в топе.
+MIN_VOLUME_24H_USD = 3_000_000  # $3M/24ч — эмпирический порог, можно крутить
 
 def _fetch_all_symbols():
     try:
@@ -3599,8 +3707,13 @@ def _fetch_all_symbols():
         candidates = valid[:max(150, 100)]
         filtered = []
         skipped_spread = []
+        skipped_volume = []
         for t in candidates:
             try:
+                vol24 = float(t.get("volume_24h_usd") or t.get("volume_24h_quote") or t.get("volume_24h") or 0)
+                if vol24 < MIN_VOLUME_24H_USD:
+                    skipped_volume.append(f"{t.get('contract')}(${vol24:,.0f})")
+                    continue
                 bid = float(t.get("highest_bid") or 0)
                 ask = float(t.get("lowest_ask") or 0)
                 if bid <= 0 or ask <= 0 or ask < bid:
@@ -3613,10 +3726,13 @@ def _fetch_all_symbols():
             except (TypeError, ValueError):
                 continue
         top50 = [t["contract"] for t in filtered[:100]]
-        olog(f"Топ-100 по объёму 24h (спред ≤{MAX_SPREAD_PCT}%): {', '.join(top50)}")
+        olog(f"Топ-100 по объёму 24h (объём ≥${MIN_VOLUME_24H_USD:,.0f}, спред ≤{MAX_SPREAD_PCT}%): {', '.join(top50)}")
         if skipped_spread:
             olog(f"⚠ Отсеяно по широкому спреду ({len(skipped_spread)}): {', '.join(skipped_spread[:15])}"
                  + (" ..." if len(skipped_spread) > 15 else ""))
+        if skipped_volume:
+            olog(f"⚠ Отсеяно по низкому объёму <${MIN_VOLUME_24H_USD:,.0f} ({len(skipped_volume)}): "
+                 f"{', '.join(skipped_volume[:15])}" + (" ..." if len(skipped_volume) > 15 else ""))
         return top50
     except Exception as e:
         olog(f"fetch_all_symbols error: {e}")
@@ -4506,6 +4622,13 @@ ema_auto_trade_state = {
     # жёстко зашит на 95% баланса — на маленьком депо (~$10-15) это давало
     # "почти весь депозит в одной сделке" вместо ожидаемых position_pct%.
     # Теперь настраивается через UI, по умолчанию 20%.
+    "forced_size_max_multiple": 3.0,  # v0.1.9: ВТОРОЙ предохранитель поверх
+    # max_forced_margin_pct — ограничивает, во сколько раз margin_for_one
+    # (маржа за 1 мин. контракт) может превышать номинальную margin
+    # (position_pct% депозита). %-от-депозита сам по себе не отличал
+    # "чуть-чуть не хватило" от "нужно в 7 раз больше" — оба проходили
+    # один и тот же потолок, и на маленьком депо форс стал ОСНОВНЫМ путём
+    # почти для каждой сделки вместо редкого предохранителя.
     "last_error": "",
 }
 
@@ -4514,7 +4637,7 @@ def _load_ema_auto_trade_cfg():
         with open(EMA_AUTO_TRADE_CFG_FILE) as f:
             saved = json.load(f)
         with ema_auto_trade_lock:
-            for k in ("enabled", "position_pct", "risk_pct", "max_concurrent", "max_forced_margin_pct"):
+            for k in ("enabled", "position_pct", "risk_pct", "max_concurrent", "max_forced_margin_pct", "forced_size_max_multiple"):
                 if k in saved:
                     ema_auto_trade_state[k] = saved[k]
     except Exception:
@@ -4524,7 +4647,7 @@ def _save_ema_auto_trade_cfg():
     try:
         with ema_auto_trade_lock:
             snapshot = {k: ema_auto_trade_state[k] for k in
-                        ("enabled", "position_pct", "risk_pct", "max_concurrent", "max_forced_margin_pct")}
+                        ("enabled", "position_pct", "risk_pct", "max_concurrent", "max_forced_margin_pct", "forced_size_max_multiple")}
         with open(EMA_AUTO_TRADE_CFG_FILE, "w") as f:
             json.dump(snapshot, f)
     except Exception as e:
@@ -4544,6 +4667,7 @@ def _ema_maybe_open_live_trade(symbol, sig, hist_key):
         risk_pct     = ema_auto_trade_state["risk_pct"]
         max_c        = ema_auto_trade_state["max_concurrent"]
         max_forced_margin_pct = ema_auto_trade_state["max_forced_margin_pct"]
+        forced_size_max_multiple = ema_auto_trade_state["forced_size_max_multiple"]
     with _ema_history_lock:
         state = _load_ema_history()
         live_items = [v for v in state["items"].values()
@@ -4569,6 +4693,7 @@ def _ema_maybe_open_live_trade(symbol, sig, hist_key):
         symbol, sig["dir"], sig["price"], sig["sl"], sig["tp"], risk_pct,
         position_pct=position_pct, label="EMA INVERT", text_prefix="emainv",
         max_forced_margin_pct=max_forced_margin_pct,
+        forced_size_max_multiple=forced_size_max_multiple,
     )
     if not pos_info:
         return   # _gate_open_position уже залогировала причину и заалертила
@@ -5319,9 +5444,11 @@ details[open] summary:before{content:"▾ "}
     <input type="number" id="atRiskPct" step="0.5" min="0.1" max="100">
     <label>Максимум одновременных позиций (пусто = без ограничений)</label>
     <input type="number" id="atMaxConcurrent" step="1" min="1">
-    <label>Потолок маржи при форс-минимуме размера (% депозита)</label>
+    <label>Потолок маржи при форс-минимуме (% депозита)</label>
     <input type="number" id="atMaxForcedMarginPct" step="1" min="0.1" max="100">
-    <p style="font-size:12px;color:#8b949e;margin:2px 0 0">Если даже 1 мин. контракт требует маржи больше этого потолка — сигнал пропускается, а не открывается ценой почти всего депозита.</p>
+    <label>Потолок форс-минимума по кратности номинала (×)</label>
+    <input type="number" id="atForcedSizeMaxMultiple" step="0.5" min="1" max="20">
+    <p style="font-size:12px;color:#8b949e;margin:2px 0 0">Если 1 мин. контракт требует больше этого потолка ИЛИ больше чем в N раз номинальной маржи — сигнал пропускается, а не открывается ценой почти всего депозита.</p>
     <hr>
     <label style="color:#c9d1d9;font-weight:bold">&#128273; Gate.io API ключи</label>
     <p style="font-size:12px;color:#8b949e;margin:2px 0 0">Нужны для реальных ордеров. Оставьте пустыми, чтобы не менять сохранённые. Оба поля заполняются вместе.</p>
@@ -5428,6 +5555,7 @@ async function loadSettingsIntoModal(){
     document.getElementById('atRiskPct').value = d.risk_pct;
     document.getElementById('atMaxConcurrent').value = d.max_concurrent ?? '';
     document.getElementById('atMaxForcedMarginPct').value = d.max_forced_margin_pct ?? 20;
+    document.getElementById('atForcedSizeMaxMultiple').value = d.forced_size_max_multiple ?? 3;
   }catch(e){}
   try{
     const rg = await fetch('/gate_cfg'); const dg = await rg.json();
@@ -5456,6 +5584,7 @@ async function saveSettings(){
     risk_pct: parseFloat(document.getElementById('atRiskPct').value),
     max_concurrent: document.getElementById('atMaxConcurrent').value || null,
     max_forced_margin_pct: parseFloat(document.getElementById('atMaxForcedMarginPct').value),
+    forced_size_max_multiple: parseFloat(document.getElementById('atForcedSizeMaxMultiple').value),
   };
   const r = await fetch('/ema_auto_trade_settings', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
   const d = await r.json();
@@ -6232,6 +6361,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     assert 0.1 <= mfp <= 100.0, f"max_forced_margin_pct вне диапазона: {mfp}"
                     with ema_auto_trade_lock:
                         ema_auto_trade_state["max_forced_margin_pct"] = mfp
+                if "forced_size_max_multiple" in body:
+                    fsm = float(body["forced_size_max_multiple"])
+                    assert 1.0 <= fsm <= 20.0, f"forced_size_max_multiple вне диапазона: {fsm}"
+                    with ema_auto_trade_lock:
+                        ema_auto_trade_state["forced_size_max_multiple"] = fsm
             except Exception as e:
                 self._json({"ok": False, "msg": f"Некорректные параметры: {e}"}); return
             _save_ema_auto_trade_cfg()
