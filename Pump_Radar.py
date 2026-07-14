@@ -1,14 +1,47 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.1.0 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.4.0 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.4.0: /pump_match переведён на асинхронную схему — сетка перебора
+  выросла до тысяч комбинаций (несколько минут), один блокирующий HTTP-
+  запрос на это время выглядел бы как зависание браузера. Теперь POST
+  /pump_match_run сразу возвращает job_id, сама работа идёт в фоновом
+  потоке, прогресс — через GET /pump_match_status?job_id=... (опрос раз в
+  2с с индикатором "готово X/Y"). Плюс третья независимая гипотеза формулы
+  сигналов — volume_mode="dual_source": зелёная и красная волна вообще из
+  ДВУХ РАЗНЫХ рядов (не просто по-разному сглаженный объём), и несколько
+  сырых источников на выбор (объём/изменение цены/диапазон бара/тени
+  свечи/тело) — по прямому запросу "не привязывайся к одной идее, юзай всё
+  что есть, пока не найдём формулу". Дефолты формы — T_USDT/120 минут.
+- v0.3.0: приоритет /pump_match переставлен на МАКСИМАЛЬНОЕ совпадение формы
+  красной/зелёной волны (по явному запросу — "прям очень много параметров
+  добавить пока не найдём формулу сигналов референса, приоритет максимальная
+  схожесть волн"). combined_score теперь 0.8×стиль + 0.2×время (было 50/50) —
+  позиция окна во времени уже надёжно находится сама (0.98-0.99 на тестах),
+  так что вес отдан подбору формы. Внутри стиля тоже сдвинуто в пользу
+  позиционного совпадения волн: 0.75×позиция + 0.25×баланс (было 0.65/0.35).
+  Сетка перебора сильно расширена: periods [1..20] вместо [2,3,5,8], floor_frac
+  9 значений вместо 4, dual_period пар ×4 больше, добавлена ТРЕТЬЯ независимая
+  гипотеза volume_mode="price_change" (зелёная/красная волна — не из объёма
+  вообще, а из сглаженных прибавок/потерь цены закрытия, как внутренние
+  gain/loss в RSI — принципиально другой источник данных, не просто другое
+  сглаживание объёма). PUMP_MATCH_STYLE_SEARCH_WINDOWS снижен до 1 (позиция
+  времени уже надёжна) — бюджет по времени выполнения переброшен в глубину
+  сетки стиля вместо ширины по времени.
+- APP_VERSION теперь поднимается на каждое реальное изменение — раньше
+  застряла на 0.1.0 несколько итераций подряд, из-за чего нельзя было по
+  `grep APP_VERSION` отличить, обновился ли реально файл после докачки.
 - Отдельный, самостоятельный проект-песочница. Взят как копия рабочего
   EMA_Invert_Experiment.py v0.1.10 (весь EMA-инверт движок ниже перенесён
   1:1, без изменений в логике входа/SL/TP/time-stop/диагностики) + добавлен
   независимый Live Pump Detector (см. секцию "Live Pump Detector" ниже —
   детектит резкий рост цены за короткое окно и шлёт в Telegram картинку в
   стиле стороннего скринера: чёрная линия цены с точками, красно-зелёная
-  гистограмма объёма, сплошная красная база, синяя штрихованная сетка).
+  гистограмма объёма, сплошная красная база, синяя штрихованная сетка) +
+  веб-страница /pump_match — загружаешь скрин-эталон, бот сам ищет и
+  подходящее время (по форме ценовой линии), и параметры отрисовки
+  гистограммы (по форме и балансу красной/зелёной волны), лучшее сразу
+  применяется в реальных алертах.
   Полная история изменений (SMC Optimizer v1.0 → v3.52.96 → EMA Bounce
   Dossier v1.0 → v3.6.14 → EMA Invert Experiment v0.1.0 → v0.1.10) — в
   докстринге EMA_Invert_Experiment.py, здесь сознательно не дублируется
@@ -25,7 +58,7 @@ EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
   резать/переделывать/выключать, ничего в оригинальном EMA_Invert_
   Experiment.py от этого не пострадает.
 """
-import os, sys, json, time, math, random, threading, base64, hashlib, subprocess, io, gc
+import os, sys, json, time, math, random, threading, base64, hashlib, subprocess, io, gc, uuid
 import multiprocessing
 import http.server, urllib.request, urllib.parse
 from functools import lru_cache
@@ -45,7 +78,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.1.0"
+APP_VERSION  = "0.4.0"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2772,26 +2805,25 @@ PUMP_RENDER_PARAMS_FILE = os.path.expanduser("~/pumpradar_render_params.json")
 # не факт. Добавлено поле smoothing_method — /pump_match теперь перебирает
 # НЕСКОЛЬКО типов сглаживания (не только EMA), см. _pm_smooth ниже и
 # PUMP_MATCH_GRID_SMOOTHING_METHODS.
-_pump_render_params = {"volume_mode": "directional", "smoothing_method": "ema",
-                        "ema_period": 3, "ema_period_slow": None, "floor_frac": 0.15}
+_PUMP_PARAM_FIELDS = ("volume_mode", "source", "source_slow", "smoothing_method",
+                      "ema_period", "ema_period_slow", "floor_frac")
+_pump_render_params = {"volume_mode": "directional", "source": "volume", "source_slow": None,
+                        "smoothing_method": "ema", "ema_period": 3, "ema_period_slow": None,
+                        "floor_frac": 0.15}
 
 def _load_pump_render_params():
     global _pump_render_params
     try:
         with open(PUMP_RENDER_PARAMS_FILE) as f:
             saved = json.load(f)
-        _pump_render_params.update({k: saved[k] for k in
-                                     ("volume_mode", "smoothing_method", "ema_period",
-                                      "ema_period_slow", "floor_frac") if k in saved})
+        _pump_render_params.update({k: saved[k] for k in _PUMP_PARAM_FIELDS if k in saved})
         olog(f"[pump_match] загружены сохранённые параметры рендера: {_pump_render_params}")
     except Exception:
         pass  # первый запуск — файла ещё нет, живём с дефолтами выше
 
 def _save_pump_render_params(params):
     global _pump_render_params
-    _pump_render_params.update({k: params[k] for k in
-                                 ("volume_mode", "smoothing_method", "ema_period",
-                                  "ema_period_slow", "floor_frac") if k in params})
+    _pump_render_params.update({k: params[k] for k in _PUMP_PARAM_FIELDS if k in params})
     try:
         with open(PUMP_RENDER_PARAMS_FILE, "w") as f:
             json.dump(_pump_render_params, f)
@@ -2845,28 +2877,62 @@ def _pm_smooth(arr, period, method="ema"):
     return out
 
 
+# v0.4.0: мы НЕ знаем, что реально стоит за красной/зелёной волной на
+# референсе — объём был лишь одной из догадок. Вместо того чтобы упираться
+# в одну идею (объём, цена, RSI-подобное...), даём перебору НЕСКОЛЬКО
+# независимых сырых рядов, которые вообще можно посчитать по OHLCV-свече, и
+# пусть сравнение с эталоном само покажет, какой ближе — было именно это,
+# посчитанное как-то, или что-то совсем другое, а мы так и не найдём.
+PUMP_MATCH_GRID_SOURCES = ["volume", "price_change", "range", "upper_wick", "lower_wick", "body"]
+
+def _pm_source_series(candles, source):
+    """Сырой (несглаженный) ряд по каждой свече — строительный материал
+    и для "directional" (разбивка по направлению свечи), и для
+    "dual_period" (одно и то же, две скорости сглаживания), и для
+    "dual_source" (зелёная и красная волна вообще из РАЗНЫХ рядов)."""
+    if source == "volume":
+        return [c.get("vol", 0) or 0 for c in candles]
+    if source == "price_change":
+        closes = [c["close"] for c in candles]
+        return [abs(closes[i] - closes[i - 1]) if i > 0 else 0.0 for i in range(len(candles))]
+    if source == "range":
+        return [c["high"] - c["low"] for c in candles]
+    if source == "upper_wick":
+        return [c["high"] - max(c["open"], c["close"]) for c in candles]
+    if source == "lower_wick":
+        return [min(c["open"], c["close"]) - c["low"] for c in candles]
+    if source == "body":
+        return [abs(c["close"] - c["open"]) for c in candles]
+    return [c.get("vol", 0) or 0 for c in candles]  # fallback
 
 
 def _render_pump_chart_variant(candles, base_price, volume_mode="directional",
+                                source="volume", source_slow=None,
                                 smoothing_method="ema", ema_period=3,
                                 ema_period_slow=None, floor_frac=0.15):
     """Параметризованная версия рендера — используется и живыми алертами
     (через _render_pump_chart_png ниже, с сохранёнными параметрами), и
     перебором /pump_match (с разными параметрами на кандидата). Требует
     Pillow — если не установлен, возвращает None.
-      volume_mode: "directional" — объём разбит на зелёный/красный по
-                   направлению свечи (bull/bear); "dual_period" — обе линии
-                   строятся из ОДНОГО и того же сырого объёма, но с РАЗНЫМИ
-                   периодами сглаживания (ema_period — быстрая/зелёная,
-                   ema_period_slow — медленная/красная) — визуально две
-                   разные по форме линии, а не одна поверх другой.
+      volume_mode: "directional" — один источник (source) разбит на
+                   зелёный/красный по направлению свечи (bull/bear);
+                   "dual_period" — обе линии из ОДНОГО источника, но с
+                   РАЗНЫМИ периодами сглаживания (ema_period — быстрая/
+                   зелёная, ema_period_slow — медленная/красная);
+                   "dual_source" — зелёная и красная линии вообще из ДВУХ
+                   РАЗНЫХ источников (source — зелёная, source_slow —
+                   красная — то же поле переиспользовано, чтобы не плодить
+                   параметры), с одним и тем же сглаживанием у обеих.
+      source, source_slow: см. PUMP_MATCH_GRID_SOURCES / _pm_source_series —
+                   "volume" (объём), "price_change" (величина изменения
+                   цены закрытия), "range" (диапазон бара high-low),
+                   "upper_wick"/"lower_wick" (тени свечи), "body" (тело).
+                   Мы НЕ знаем, что из этого использует референс — поэтому
+                   не привязываемся к одному, перебор проверяет все.
       smoothing_method: "none"/"sma"/"ema"/"wma"/"rma" — см. _pm_smooth.
-                   "это EMA" была лишь одна из непроверенных гипотез,
-                   поэтому /pump_match перебирает и остальные.
-      ema_period:  для "directional" — период сглаживания (для "none" не
-                   используется); для "dual_period" — период быстрой линии.
-      ema_period_slow: только для "dual_period" — период медленной линии;
-                   если None, берётся ema_period*3.
+      ema_period:  период сглаживания (быстрой линии для dual_*).
+      ema_period_slow: период медленной линии для "dual_period"; для
+                   "dual_source" не используется (обе линии — один период).
       floor_frac:  ось объёма НЕ от нуля — начинается с floor_frac*vmax,
                    поэтому заливка не пропадает полностью в затишье
                    (0 = ось от нуля, как в самой первой версии).
@@ -2890,7 +2956,6 @@ def _render_pump_chart_variant(candles, base_price, volume_mode="directional",
 
     closes = [c["close"] for c in candles]
     opens  = [c["open"] for c in candles]
-    vols   = [c.get("vol", 0) or 0 for c in candles]
     times  = [c["t"] for c in candles]
     n = len(candles)
 
@@ -2899,13 +2964,20 @@ def _render_pump_chart_variant(candles, base_price, volume_mode="directional",
     if pmax <= pmin:
         pmax = pmin + max(abs(pmin) * 0.001, 1e-9)
 
-    if volume_mode == "dual_period":
+    if volume_mode == "dual_source":
+        src_a = _pm_source_series(candles, source)
+        src_b = _pm_source_series(candles, source_slow or source)
+        green_s = _pm_smooth(src_a, ema_period, smoothing_method)
+        red_s   = _pm_smooth(src_b, ema_period, smoothing_method)
+    elif volume_mode == "dual_period":
+        base_series = _pm_source_series(candles, source)
         slow_period = ema_period_slow if ema_period_slow else max(2, ema_period * 3)
-        green_s = _pm_smooth(vols, ema_period, smoothing_method)       # быстрая
-        red_s   = _pm_smooth(vols, slow_period, smoothing_method)      # медленная
+        green_s = _pm_smooth(base_series, ema_period, smoothing_method)       # быстрая
+        red_s   = _pm_smooth(base_series, slow_period, smoothing_method)      # медленная
     else:  # "directional"
-        green_raw = [vols[i] if closes[i] >= opens[i] else 0.0 for i in range(n)]
-        red_raw   = [vols[i] if closes[i] <  opens[i] else 0.0 for i in range(n)]
+        base_series = _pm_source_series(candles, source)
+        green_raw = [base_series[i] if closes[i] >= opens[i] else 0.0 for i in range(n)]
+        red_raw   = [base_series[i] if closes[i] <  opens[i] else 0.0 for i in range(n)]
         green_s = _pm_smooth(green_raw, ema_period, smoothing_method)
         red_s   = _pm_smooth(red_raw, ema_period, smoothing_method)
     vmax = max(max(green_s, default=1.0), max(red_s, default=1.0)) or 1.0
@@ -2988,6 +3060,8 @@ def _render_pump_chart_png(candles, base_price):
     p = _pump_render_params
     return _render_pump_chart_variant(candles, base_price,
                                        volume_mode=p.get("volume_mode", "directional"),
+                                       source=p.get("source", "volume"),
+                                       source_slow=p.get("source_slow"),
                                        smoothing_method=p.get("smoothing_method", "ema"),
                                        ema_period=p.get("ema_period", 3),
                                        ema_period_slow=p.get("ema_period_slow"),
@@ -3231,15 +3305,24 @@ def _shutdown_pool_safely(pool):
 # PUMP_RENDER_PARAMS_FILE и с этого момента используется в реальных алертах
 # (см. _render_pump_chart_png выше — она читает эти же сохранённые параметры).
 
-PUMP_MATCH_GRID_VOLUME_MODES = ["directional", "dual_period"]
-# v0.2.2: "EMA" была непроверенной подсказкой, не факт — перебираем и
-# другие типы сглаживания (см. _pm_smooth). "none" осмысленен только для
-# directional (для dual_period без сглаживания обе линии снова совпадают —
-# та же болезнь, что была у убранного режима "raw").
+PUMP_MATCH_GRID_VOLUME_MODES = ["directional", "dual_period", "dual_source"]
+# v0.3.0: по запросу — "используй всё что есть, пока не совпадёт". Не
+# привязываемся ни к одной идее (ни к EMA, ни к объёму, ни к чему-то
+# конкретному вроде RSI) — перебираем несколько независимых сырых рядов
+# (PUMP_MATCH_GRID_SOURCES/_pm_source_series) и несколько способов их
+# скомбинировать в красную/зелёную волну (PUMP_MATCH_GRID_VOLUME_MODES).
 PUMP_MATCH_GRID_SMOOTHING_METHODS = ["none", "sma", "ema", "wma", "rma"]
-PUMP_MATCH_GRID_EMA_PERIODS  = [2, 3, 5, 8]
-PUMP_MATCH_GRID_DUAL_PAIRS   = [(2, 6), (2, 8), (3, 10), (4, 12)]  # (быстрая, медленная) для dual_period
-PUMP_MATCH_GRID_FLOOR_FRACS  = [0.0, 0.10, 0.15, 0.25]
+PUMP_MATCH_GRID_EMA_PERIODS  = [2, 3, 4, 5, 6, 8, 10, 13]
+PUMP_MATCH_GRID_DUAL_PAIRS   = [(2, 6), (2, 8), (2, 10), (3, 9), (3, 12),
+                                 (4, 12), (4, 16), (5, 15)]  # (быстрая, медленная) для dual_period
+# dual_source: зелёная и красная волна из ДВУХ РАЗНЫХ рядов — самая
+# "агностичная" гипотеза на случай, если это вообще не один и тот же
+# показатель, разложенный двумя способами, а два независимых.
+PUMP_MATCH_GRID_SOURCE_PAIRS = [
+    ("volume", "price_change"), ("volume", "range"), ("volume", "body"),
+    ("upper_wick", "lower_wick"), ("range", "body"), ("price_change", "body"),
+]
+PUMP_MATCH_GRID_FLOOR_FRACS  = [0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.35, 0.50]
 # автопоиск временного окна по форме ценовой линии (см. _pm_find_best_window)
 PUMP_MATCH_WINDOW_COARSE_STEP_MIN = 5
 PUMP_MATCH_WINDOW_REFINE_RADIUS_MIN = 10
@@ -3248,10 +3331,11 @@ PUMP_MATCH_WINDOW_TOP_CANDIDATES = 3
 # цифра (жалоба с реального теста: конец графика обрезан короче референса)
 # — пробуем и её, и несколько соседних вариантов длины окна.
 PUMP_MATCH_DURATION_MULTIPLIERS = [0.7, 1.0, 1.3, 1.6, 2.0]
-# сетка стиля отрисовки перебирается полностью только для топ-N окон по
-# времени (иначе N_windows × полная_сетка растёт слишком быстро) — сам
-# поиск окна (дешёвый) всё равно смотрит на WINDOW_TOP_CANDIDATES позиций.
-PUMP_MATCH_STYLE_SEARCH_WINDOWS = 2
+# сетка стиля отрисовки (теперь ОЧЕНЬ большая, см. выше) перебирается
+# полностью только для топ-N окон по времени — позиция во времени и так
+# надёжно находится сама (0.98-0.99 на тестах), весь бюджет времени
+# выполнения переброшен в глубину перебора стиля, а не в ширину по времени.
+PUMP_MATCH_STYLE_SEARCH_WINDOWS = 1
 
 
 def _pm_parse_multipart(body_bytes, content_type_header):
@@ -3582,37 +3666,79 @@ def _pm_color_balance_ratio(g_profile, r_profile):
     return tr / (tg + tr)
 
 
-def _pm_style_grid_search(candles, base_price, ref_g, ref_r):
+def _pm_grid_total_combos():
+    """Сколько вариантов реально перебирается — для прогресс-бара и оценки
+    времени. Держать формулу синхронной с циклами в _pm_style_grid_search."""
+    per_ff = 0
+    for _src in PUMP_MATCH_GRID_SOURCES:
+        per_ff += 1  # directional "none"
+        per_ff += (len(PUMP_MATCH_GRID_SMOOTHING_METHODS) - 1) * len(PUMP_MATCH_GRID_EMA_PERIODS)
+        per_ff += (len(PUMP_MATCH_GRID_SMOOTHING_METHODS) - 1) * len(PUMP_MATCH_GRID_DUAL_PAIRS)
+    per_ff += (len(PUMP_MATCH_GRID_SOURCE_PAIRS) *
+               (len(PUMP_MATCH_GRID_SMOOTHING_METHODS) - 1) * len(PUMP_MATCH_GRID_EMA_PERIODS))
+    return per_ff * len(PUMP_MATCH_GRID_FLOOR_FRACS)
+
+
+def _pm_style_grid_search(candles, base_price, ref_g, ref_r, progress_cb=None):
     """Перебирает сетку параметров ОТРИСОВКИ (не времени) на уже
     зафиксированном наборе свечей и оценивает каждый вариант по цветовому
-    профилю. Возвращает список результатов, отсортированный по score."""
+    профилю. Возвращает список результатов, отсортированный по score.
+    progress_cb(done, total), если передан, вызывается периодически (не на
+    каждом варианте — лишний оверхед на блокировке при ~4000+ комбинаций)."""
     ref_balance = _pm_color_balance_ratio(ref_g, ref_r)
+    total = _pm_grid_total_combos()
+    done = 0
     results = []
     for ff in PUMP_MATCH_GRID_FLOOR_FRACS:
-        # directional: "none" один раз (период не важен), остальные методы — по сетке периодов
-        results.extend(_pm_try_variant(candles, base_price, ref_g, ref_r, ref_balance,
-                                        "directional", "none", 1, None, ff))
-        for method in PUMP_MATCH_GRID_SMOOTHING_METHODS:
-            if method == "none":
-                continue
-            for ep in PUMP_MATCH_GRID_EMA_PERIODS:
-                results.extend(_pm_try_variant(candles, base_price, ref_g, ref_r, ref_balance,
-                                                "directional", method, ep, None, ff))
-        # dual_period: "none" бессмысленен (обе линии снова совпали бы) — только реальные методы сглаживания
-        for method in PUMP_MATCH_GRID_SMOOTHING_METHODS:
-            if method == "none":
-                continue
-            for fast, slow in PUMP_MATCH_GRID_DUAL_PAIRS:
-                results.extend(_pm_try_variant(candles, base_price, ref_g, ref_r, ref_balance,
-                                                "dual_period", method, fast, slow, ff))
+        for src in PUMP_MATCH_GRID_SOURCES:
+            # directional: "none" один раз на источник (период не важен),
+            # остальные методы — по сетке периодов
+            results.extend(_pm_try_variant(candles, base_price, ref_g, ref_r, ref_balance,
+                                            "directional", src, None, "none", 1, None, ff))
+            done += 1
+            for method in PUMP_MATCH_GRID_SMOOTHING_METHODS:
+                if method == "none":
+                    continue
+                for ep in PUMP_MATCH_GRID_EMA_PERIODS:
+                    results.extend(_pm_try_variant(candles, base_price, ref_g, ref_r, ref_balance,
+                                                    "directional", src, None, method, ep, None, ff))
+                    done += 1
+                    if progress_cb and done % 20 == 0:
+                        progress_cb(done, total)
+            # dual_period: "none" бессмысленен (обе линии снова совпали бы)
+            for method in PUMP_MATCH_GRID_SMOOTHING_METHODS:
+                if method == "none":
+                    continue
+                for fast, slow in PUMP_MATCH_GRID_DUAL_PAIRS:
+                    results.extend(_pm_try_variant(candles, base_price, ref_g, ref_r, ref_balance,
+                                                    "dual_period", src, None, method, fast, slow, ff))
+                    done += 1
+                    if progress_cb and done % 20 == 0:
+                        progress_cb(done, total)
+        # dual_source: зелёная и красная волна из ДВУХ РАЗНЫХ источников —
+        # самая "агностичная" гипотеза, раз мы вообще не знаем формулу
+        for src_a, src_b in PUMP_MATCH_GRID_SOURCE_PAIRS:
+            for method in PUMP_MATCH_GRID_SMOOTHING_METHODS:
+                if method == "none":
+                    continue
+                for ep in PUMP_MATCH_GRID_EMA_PERIODS:
+                    results.extend(_pm_try_variant(candles, base_price, ref_g, ref_r, ref_balance,
+                                                    "dual_source", src_a, src_b, method, ep, None, ff))
+                    done += 1
+                    if progress_cb and done % 20 == 0:
+                        progress_cb(done, total)
+    if progress_cb:
+        progress_cb(total, total)
     results.sort(key=lambda r: r["score"], reverse=True)
     return results
 
 
-def _pm_try_variant(candles, base_price, ref_g, ref_r, ref_balance, vm, method, ep, ep_slow, ff):
+def _pm_try_variant(candles, base_price, ref_g, ref_r, ref_balance, vm, src, src_slow,
+                     method, ep, ep_slow, ff):
     from PIL import Image
     try:
         png = _render_pump_chart_variant(candles, base_price, volume_mode=vm,
+                                          source=src, source_slow=src_slow,
                                           smoothing_method=method, ema_period=ep,
                                           ema_period_slow=ep_slow, floor_frac=ff)
         if not png:
@@ -3626,22 +3752,25 @@ def _pm_try_variant(candles, base_price, ref_g, ref_r, ref_balance, vm, method, 
         # с эталоном, тем ниже, чем сильнее расходится (мат. разница до 1.0)
         balance_score = 1.0 - abs(ref_balance - cand_balance)
     except Exception as e:
-        olog(f"[pump_match] вариант vm={vm} method={method} ep={ep}/{ep_slow} ff={ff} упал: {e}")
+        olog(f"[pump_match] вариант vm={vm} src={src}/{src_slow} method={method} "
+             f"ep={ep}/{ep_slow} ff={ff} упал: {e}")
         return []
     position_score = (sg + sr) / 2
-    # 65% позиционное совпадение, 35% совпадение баланса цветов — баланс
-    # хуже определяет ТОЧНОЕ время, но грубо отсеивает структурно неверные
-    # гипотезы вроде dual_period на не-подходящих данных
-    final_score = position_score * 0.65 + balance_score * 0.35
+    # v0.3.0: приоритет явно сдвинут на форму волны (по прямому запросу) —
+    # 75% позиционное совпадение красной/зелёной волны, 25% баланс (баланс
+    # остаётся только грубым фильтром структурно неверных гипотез, не
+    # решающим фактором).
+    final_score = position_score * 0.75 + balance_score * 0.25
     return [{"score": final_score, "score_g": sg, "score_r": sr,
               "balance_score": balance_score, "ref_balance": round(ref_balance, 3),
               "cand_balance": round(cand_balance, 3),
-              "volume_mode": vm, "smoothing_method": method, "ema_period": ep,
+              "volume_mode": vm, "source": src, "source_slow": src_slow,
+              "smoothing_method": method, "ema_period": ep,
               "ema_period_slow": ep_slow, "floor_frac": ff, "png": png}]
 
 
 def _pump_match_run(image_bytes, symbol, search_start_ts, search_end_ts,
-                     duration_min=120, base_price_override=None):
+                     duration_min=120, base_price_override=None, progress_cb=None):
     """Основной пайплайн подбора:
       1) обрезать эталон, извлечь и цветовой профиль (для стиля отрисовки),
          и профиль формы ценовой линии (для поиска времени);
@@ -3654,7 +3783,10 @@ def _pump_match_run(image_bytes, symbol, search_start_ts, search_end_ts,
       4) для лучших позиций окна перебрать сетку параметров ОТРИСОВКИ и
          оценить по цветовому профилю (включая штраф за дисбаланс
          красный/зелёный — см. _pm_try_variant);
-      5) сохранить и вернуть общий лучший результат (время + длина + стиль)."""
+      5) сохранить и вернуть общий лучший результат (время + длина + стиль).
+    progress_cb(done, total), если передан, транслируется в перебор стиля —
+    сетка сейчас большая (тысячи комбинаций), без прогресса запрос выглядел
+    бы зависшим."""
     from PIL import Image
     try:
         ref_img = Image.open(io.BytesIO(image_bytes))
@@ -3705,11 +3837,11 @@ def _pump_match_run(image_bytes, symbol, search_start_ts, search_end_ts,
     for win_score, start_idx, dur in window_candidates[:PUMP_MATCH_STYLE_SEARCH_WINDOWS]:
         window = day_candles[start_idx:start_idx + dur]
         base_price = base_price_override if base_price_override else min(c["close"] for c in window)
-        style_results = _pm_style_grid_search(window, base_price, ref_g, ref_r)
+        style_results = _pm_style_grid_search(window, base_price, ref_g, ref_r, progress_cb=progress_cb)
         for r in style_results:
             r["window_start_idx"] = start_idx
             r["window_score"] = win_score
-            r["combined_score"] = 0.5 * win_score + 0.5 * r["score"] if ref_price_profile is not None else r["score"]
+            r["combined_score"] = 0.2 * win_score + 0.8 * r["score"] if ref_price_profile is not None else r["score"]
             r["base_price"] = base_price
             r["window"] = window
         all_style_results.extend(style_results)
@@ -3721,6 +3853,7 @@ def _pump_match_run(image_bytes, symbol, search_start_ts, search_end_ts,
     top = all_style_results[:6]
     best = top[0]
     _save_pump_render_params({"volume_mode": best["volume_mode"],
+                               "source": best["source"], "source_slow": best["source_slow"],
                                "smoothing_method": best["smoothing_method"],
                                "ema_period": best["ema_period"],
                                "ema_period_slow": best["ema_period_slow"],
@@ -3737,7 +3870,8 @@ def _pump_match_run(image_bytes, symbol, search_start_ts, search_end_ts,
          f"(время={best['window_score']:.3f} стиль={best['score']:.3f}) "
          f"окно={time.strftime('%H:%M', time.localtime(best_start_t))}-"
          f"{time.strftime('%H:%M', time.localtime(best_end_t))} "
-         f"vm={best['volume_mode']} method={best['smoothing_method']} "
+         f"vm={best['volume_mode']} src={best['source']}/{best['source_slow']} "
+         f"method={best['smoothing_method']} "
          f"ema={best['ema_period']}/{best['ema_period_slow']} "
          f"floor={best['floor_frac']} — сохранён как рабочий")
 
@@ -3752,7 +3886,8 @@ def _pump_match_run(image_bytes, symbol, search_start_ts, search_end_ts,
         "top": [{
             "score": round(r["score"], 3), "score_g": round(r["score_g"], 3),
             "score_r": round(r["score_r"], 3), "combined_score": round(r["combined_score"], 3),
-            "volume_mode": r["volume_mode"], "smoothing_method": r["smoothing_method"],
+            "volume_mode": r["volume_mode"], "source": r["source"], "source_slow": r["source_slow"],
+            "smoothing_method": r["smoothing_method"],
             "ema_period": r["ema_period"],
             "ema_period_slow": r["ema_period_slow"], "floor_frac": r["floor_frac"],
             "balance_score": round(r["balance_score"], 3), "ref_balance": r["ref_balance"],
@@ -3762,6 +3897,48 @@ def _pump_match_run(image_bytes, symbol, search_start_ts, search_end_ts,
             "png_b64": _pm_png_to_b64(r["png"]),
         } for r in top],
     }
+
+
+_pump_match_jobs_lock = threading.Lock()
+_pump_match_jobs = {}  # job_id -> {"status","done","total","result","created_at"}
+_PUMP_MATCH_JOB_TTL_SEC = 3600  # старые завершённые задачи не копим бесконечно
+
+def _pump_match_new_job():
+    """Сетка перебора теперь тысячи комбинаций — один блокирующий HTTP-запрос
+    на несколько минут выглядел бы как зависание. Вместо этого: POST сразу
+    возвращает job_id, сама работа идёт в фоновом потоке, прогресс — через
+    отдельный GET /pump_match_status?job_id=..."""
+    job_id = uuid.uuid4().hex[:12]
+    with _pump_match_jobs_lock:
+        _pump_match_jobs[job_id] = {"status": "running", "done": 0, "total": 0,
+                                     "result": None, "created_at": time.time()}
+        stale = [k for k, v in _pump_match_jobs.items()
+                 if time.time() - v.get("created_at", 0) > _PUMP_MATCH_JOB_TTL_SEC]
+        for k in stale:
+            del _pump_match_jobs[k]
+    return job_id
+
+def _pump_match_run_background(job_id, image_bytes, symbol, search_start_ts, search_end_ts,
+                                duration_min, base_price_override):
+    def progress_cb(done, total):
+        with _pump_match_jobs_lock:
+            if job_id in _pump_match_jobs:
+                _pump_match_jobs[job_id]["done"] = done
+                _pump_match_jobs[job_id]["total"] = total
+    try:
+        result = _pump_match_run(image_bytes, symbol, search_start_ts, search_end_ts,
+                                  duration_min=duration_min, base_price_override=base_price_override,
+                                  progress_cb=progress_cb)
+        with _pump_match_jobs_lock:
+            if job_id in _pump_match_jobs:
+                _pump_match_jobs[job_id]["status"] = "done"
+                _pump_match_jobs[job_id]["result"] = result
+    except Exception as e:
+        olog(f"[pump_match] задача {job_id} упала: {e}")
+        with _pump_match_jobs_lock:
+            if job_id in _pump_match_jobs:
+                _pump_match_jobs[job_id]["status"] = "error"
+                _pump_match_jobs[job_id]["result"] = {"ok": False, "msg": f"Внутренняя ошибка: {e}"}
 
 
 PUMP_MATCH_HTML_PAGE = """<!DOCTYPE html>
@@ -3790,7 +3967,7 @@ details summary{cursor:pointer;font-size:13px;color:#8b949e;margin-top:12px}
   <label>Скрин-эталон</label>
   <input type="file" id="pmImage" accept="image/*">
   <label>Символ (контракт Gate.io)</label>
-  <input type="text" id="pmSymbol" placeholder="XEC_USDT" value="XEC_USDT">
+  <input type="text" id="pmSymbol" placeholder="T_USDT" value="T_USDT">
   <label>Дата (ГГГГ-ММ-ДД)</label>
   <input type="date" id="pmDate">
   <label>Длительность окна на скрине, минут (посчитай по подписям оси времени)</label>
@@ -3839,7 +4016,7 @@ async function runMatch(){
   fd.append('search_end', searchEnd);
   if(base) fd.append('base_price', base);
 
-  statusEl.innerText = 'Ищу время + перебираю варианты отрисовки и сглаживания (может занять 1-2 минуты)...';
+  statusEl.innerText = 'Запускаю подбор...';
   document.getElementById('results').innerHTML = '';
   document.getElementById('previewCard').style.display = 'none';
 
@@ -3847,31 +4024,69 @@ async function runMatch(){
     const r = await fetch('/pump_match_run', {method:'POST', body: fd});
     const d = await r.json();
     if(!d.ok){ statusEl.innerText = '❌ ' + d.msg; return; }
-
-    statusEl.innerHTML = `Просмотрено свечей: ${d.candles_scanned} | Найденное окно: <b>${d.window_start} — ${d.window_end}</b> (совпадение формы цены: ${d.time_match_score}) | База: ${d.base_price} → Последняя: ${d.last_price} (${d.pct>=0?'+':''}${d.pct}%)`;
-
-    document.getElementById('previewImg').src = d.cropped_preview_b64;
-    document.getElementById('previewCard').style.display = 'block';
-
-    const resDiv = document.getElementById('results');
-    d.top.forEach((c, i) => {
-      const div = document.createElement('div');
-      div.className = 'cand' + (i===0 ? ' best' : '');
-      const methodNames = {none:'без сглаживания', sma:'SMA', ema:'EMA', wma:'WMA', rma:'Уайлдер (RMA)'};
-      const mLabel = methodNames[c.smoothing_method] || c.smoothing_method;
-      const paramsLine = c.volume_mode === 'dual_period'
-        ? `dual_period, ${mLabel}: период ${c.ema_period}/${c.ema_period_slow} | floor_frac=${c.floor_frac}`
-        : `directional, ${mLabel}${c.smoothing_method!=='none' ? ' период '+c.ema_period : ''} | floor_frac=${c.floor_frac}`;
-      div.innerHTML = `<div class="score">${i===0?'★ ЛУЧШИЙ — ':''}итог ${c.combined_score} (стиль ${c.score}, баланс ${c.balance_score})</div>`
-        + `<div class="params">${paramsLine} | окно ${c.window_start}-${c.window_end} | (g=${c.score_g} r=${c.score_r}) | доля красного: эталон ${c.ref_balance} / кандидат ${c.cand_balance}</div>`
-        + `<img src="${c.png_b64}">`;
-      resDiv.appendChild(div);
-    });
-    if(d.top.length){
-      statusEl.innerHTML += ' — лучшие параметры сохранены и уже применяются в реальных алертах';
-    }
+    pollMatchStatus(d.job_id);
   }catch(e){
     statusEl.innerText = '❌ ошибка запроса: ' + e;
+  }
+}
+
+async function pollMatchStatus(jobId){
+  const statusEl = document.getElementById('status');
+  try{
+    const r = await fetch('/pump_match_status?job_id=' + jobId, {cache:'no-store'});
+    const d = await r.json();
+    if(!d.ok){ statusEl.innerText = '❌ ' + d.msg; return; }
+    if(d.status === 'running'){
+      const pct = d.total ? Math.round(100*d.done/d.total) : 0;
+      statusEl.innerText = `Перебираю варианты: ${d.done}/${d.total} (${pct}%)...`;
+      setTimeout(() => pollMatchStatus(jobId), 2000);
+      return;
+    }
+    if(d.status === 'error'){
+      statusEl.innerText = '❌ ' + (d.result && d.result.msg ? d.result.msg : 'ошибка выполнения');
+      return;
+    }
+    // status === 'done'
+    renderMatchResult(d.result);
+  }catch(e){
+    statusEl.innerText = '❌ ошибка опроса статуса: ' + e;
+  }
+}
+
+function renderMatchResult(d){
+  const statusEl = document.getElementById('status');
+  if(!d.ok){ statusEl.innerText = '❌ ' + d.msg; return; }
+
+  statusEl.innerHTML = `Просмотрено свечей: ${d.candles_scanned} | Найденное окно: <b>${d.window_start} — ${d.window_end}</b> (совпадение формы цены: ${d.time_match_score}) | База: ${d.base_price} → Последняя: ${d.last_price} (${d.pct>=0?'+':''}${d.pct}%)`;
+
+  document.getElementById('previewImg').src = d.cropped_preview_b64;
+  document.getElementById('previewCard').style.display = 'block';
+
+  const resDiv = document.getElementById('results');
+  d.top.forEach((c, i) => {
+    const div = document.createElement('div');
+    div.className = 'cand' + (i===0 ? ' best' : '');
+    const methodNames = {none:'без сглаживания', sma:'SMA', ema:'EMA', wma:'WMA', rma:'Уайлдер (RMA)'};
+    const srcNames = {volume:'объём', price_change:'изм.цены', range:'диапазон бара',
+                       upper_wick:'верхняя тень', lower_wick:'нижняя тень', body:'тело свечи'};
+    const mLabel = methodNames[c.smoothing_method] || c.smoothing_method;
+    const srcLabel = srcNames[c.source] || c.source;
+    let paramsLine;
+    if(c.volume_mode === 'dual_source'){
+      const srcSlowLabel = srcNames[c.source_slow] || c.source_slow;
+      paramsLine = `dual_source: зелёная=${srcLabel} / красная=${srcSlowLabel}, ${mLabel} период ${c.ema_period} | floor_frac=${c.floor_frac}`;
+    } else if(c.volume_mode === 'dual_period'){
+      paramsLine = `dual_period (${srcLabel}), ${mLabel}: период ${c.ema_period}/${c.ema_period_slow} | floor_frac=${c.floor_frac}`;
+    } else {
+      paramsLine = `directional (${srcLabel}), ${mLabel}${c.smoothing_method!=='none' ? ' период '+c.ema_period : ''} | floor_frac=${c.floor_frac}`;
+    }
+    div.innerHTML = `<div class="score">${i===0?'★ ЛУЧШИЙ — ':''}итог ${c.combined_score} (стиль ${c.score}, баланс ${c.balance_score})</div>`
+      + `<div class="params">${paramsLine} | окно ${c.window_start}-${c.window_end} | (g=${c.score_g} r=${c.score_r}) | доля красного: эталон ${c.ref_balance} / кандидат ${c.cand_balance}</div>`
+      + `<img src="${c.png_b64}">`;
+    resDiv.appendChild(div);
+  });
+  if(d.top.length){
+    statusEl.innerHTML += ' — лучшие параметры сохранены и уже применяются в реальных алертах';
   }
 }
 </script></body></html>"""
@@ -3975,6 +4190,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
             self.end_headers()
             self.wfile.write(body)
+        elif self.path.startswith("/pump_match_status"):
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            job_id = (params.get("job_id") or [""])[0]
+            with _pump_match_jobs_lock:
+                job = _pump_match_jobs.get(job_id)
+            if not job:
+                self._json({"ok": False, "msg": "Задача не найдена (истекла или неверный job_id)"})
+            else:
+                self._json({"ok": True, "status": job["status"], "done": job["done"],
+                            "total": job["total"], "result": job["result"]})
         else:
             self.send_response(404); self.end_headers()
       except Exception as e:
@@ -4147,10 +4373,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 except ValueError:
                     pass
 
-            result = _pump_match_run(image_bytes, symbol.upper(), search_start_ts, search_end_ts,
-                                      duration_min=duration_min,
-                                      base_price_override=base_price_override)
-            self._json(result)
+            job_id = _pump_match_new_job()
+            threading.Thread(
+                target=_pump_match_run_background,
+                args=(job_id, image_bytes, symbol.upper(), search_start_ts, search_end_ts,
+                      duration_min, base_price_override),
+                daemon=True,
+            ).start()
+            self._json({"ok": True, "job_id": job_id})
         except Exception as e:
             olog(f"[pump_match] ⚠ ошибка обработки запроса: {e}")
             try:
