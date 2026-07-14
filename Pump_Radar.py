@@ -1,7 +1,37 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.6.1 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.8.0 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.8.0: ВАЖНАЯ поправка методики Weekly EMA Backtest по прямому запросу —
+  сигнал ищется на недельном графике, но сделка НЕ держится неделями:
+  реальная торговля — мгновенная реакция на 3-4%, иногда 6-10%, сделки на
+  минуты-час максимум. Прежняя версия (v0.7.0) оценивала исход по недельным
+  закрытиям через 1-12 недель — это измеряло НЕ ТО, что реально
+  торгуется. Переписано: детект сигнала остался прежним (недельное
+  касание EMA7/14/28), но оценка исхода теперь — по 1-минутным свечам в
+  первые W минут (дефолт 180) после момента касания: достигнут ли каждый
+  из порогов (3/4/6/10%, настраиваемые) в сторону classic_bias, и за
+  сколько минут (переиспользует _pm_fetch_candles_window из Pump Match).
+  Учтено практическое ограничение: у биржи почти наверняка нет 1m-истории
+  на годы назад — реакция проверяется только для сигналов не старше
+  max_age_days (дефолт 90), для более старых считается только сам факт
+  касания (total_signals), без участия в винрейте по реакции — это явно
+  видно в таблице по числу "n=" (evaluable) у каждой ячейки.
+- v0.7.0: добавлен Weekly EMA Backtest (/weekly_ema_backtest) — по запросу
+  "прогнать исторически все сигналы, посмотреть куда шла цена, составить
+  рейтинг угадывания направления". Проходит всю доступную недельную
+  историю по монетам (не только текущий момент, как живой вотчер), находит
+  ВСЕ прошлые касания EMA7/14/28 без заглядывания вперёд, и оценивает
+  классическую bounce-трактовку на 5 горизонтах разом (1/2/4/8/12 недель) —
+  НЕ на одном произвольном горизонте: на синтетике винрейт скакал от 0% до
+  56% просто от смены горизонта 8->15 недель (совпадение фазы с любой
+  циклической компонентой цены) — один горизонт был бы вводящим в
+  заблуждение числом, а не честной оценкой. Асинхронная задача (тот же
+  паттерн, что у /pump_match — POST возвращает job_id, прогресс через GET),
+  результат сохраняется на диск и переживает рестарт. Таблица на странице:
+  монета/кол-во сигналов/винрейт на каждом горизонте, с фильтром по
+  минимальному числу сигналов (отсеивает шум от 1-2 случайных касаний) и
+  сортировкой по выбранному горизонту.
 - v0.6.1: Weekly EMA Touch Watcher теперь определяет СТОРОНУ подхода к
   уровню (по предыдущей закрытой недельной свече — была она выше или ниже
   EMA) и классическую bounce-трактовку: подход снизу вверх = тест
@@ -106,7 +136,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.6.1"
+APP_VERSION  = "0.8.0"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2131,6 +2161,7 @@ details[open] summary:before{content:"▾ "}
 <p style="color:#8b949e;font-size:13px;max-width:480px">Детектит резкий рост цены (памп) по топ-монетам Gate.io и шлёт алерт в Telegram с картинкой. Старый EMA-инверт движок отключён и не показан — код остался в файле, просто не в фокусе сейчас.</p>
 <button onclick="openAlertSettings()" style="background:#21262d;border:1px solid #30363d">&#128276; Алерты</button>
 <a href="/pump_match" style="text-decoration:none"><button style="background:#8250df">&#127919; Pump Match (подбор параметров отрисовки)</button></a>
+<a href="/weekly_ema_backtest" style="text-decoration:none"><button style="background:#8250df">&#128202; Weekly EMA Backtest</button></a>
 <div id="status"></div>
 
 <div id="alertModal">
@@ -3507,6 +3538,231 @@ def _weekly_ema_touch_loop():
         time.sleep(WEEKLY_EMA_SCAN_POLL_SEC)
 # ─── конец Weekly EMA Touch Watcher ─────────────────────────────────────────
 
+# ─── Weekly EMA Backtest ─────────────────────────────────────────────────────
+# По запросу: "исторически прогнать все возможные сигналы и посмотреть куда
+# и на сколько шла цена, составить рейтинг угадывания направления по каждой
+# монете". ВАЖНАЯ поправка от пользователя: сигнал — это касание на
+# НЕДЕЛЬНОМ графике, но сама сделка — это НЕ удержание позиции неделями, а
+# ставка на МГНОВЕННУЮ реакцию (3-4%, иногда 6-10%) в первые минуты/часы
+# после касания, сделки на минуты-час максимум. Поэтому детект сигнала
+# остаётся на недельных барах (та же логика, что в live-вотчере), а ОЦЕНКА
+# исхода — по 1-минутным свечам сразу после момента касания, не по недельным
+# закрытиям через недели (первая версия этого бэктеста мерила не то, что
+# нужно — недельные горизонты, что было прямой ошибкой относительно того,
+# как реально торгуется этот сигнал).
+# ОГРАНИЧЕНИЕ: у Gate.io 1m-свечи почти наверняка не хранятся годами (в
+# отличие от дневных/недельных) — поэтому реакцию физически можно проверить
+# только на ОТНОСИТЕЛЬНО НЕДАВНИХ касаниях (WEEKLY_EMA_REACTION_MAX_AGE_DAYS).
+# Для более старых сигналов total_signals всё равно посчитает сам факт
+# касания (это не требует минутных данных), но в винрейт по реакции они не
+# попадут — "evaluable" в статистике явно меньше "total_signals", это не
+# баг, а честное отражение того, что для старых сигналов данных физически
+# нет у биржи.
+WEEKLY_EMA_BACKTEST_DEDUP_WEEKS = 2   # не считаем сигнал каждую неделю подряд, пока цена сидит у уровня
+WEEKLY_EMA_BACKTEST_DAYS = 1500        # глубина недельной истории — для самого детекта касаний
+WEEKLY_EMA_BACKTEST_TOP_N = 100
+WEEKLY_EMA_REACTION_WINDOW_MIN = 180       # сколько минут после касания проверяем реакцию (3ч, с запасом над "час максимум")
+WEEKLY_EMA_REACTION_THRESHOLDS = [3, 4, 6, 10]   # % цели, запрошенные явно
+WEEKLY_EMA_REACTION_MAX_AGE_DAYS = 90      # старше — не пытаемся тянуть 1m (почти наверняка их уже нет у биржи)
+WEEKLY_EMA_BACKTEST_FILE = os.path.expanduser("~/pumpradar_weekly_ema_backtest.json")
+
+
+def _weekly_ema_detect_signals(weekly):
+    """Проходит недельные свечи ОДИН РАЗ (без заглядывания вперёд) и находит
+    все touch-события. Возвращает (signals, closes)."""
+    closes = [c["close"] for c in weekly]
+    atr_arr = _atr(weekly, 14)
+    ema_arrays = {p: _ema(closes, p) for p in WEEKLY_EMA_PERIODS}
+    signals = []
+    n = len(weekly)
+    start = max(WEEKLY_EMA_PERIODS) + 1
+    i = start
+    while i < n:
+        atr_v = atr_arr[i]
+        if not atr_v:
+            i += 1
+            continue
+        fired_here = False
+        for period in WEEKLY_EMA_PERIODS:
+            ema_arr = ema_arrays[period]
+            ema_v = ema_arr[i]
+            prev_ema = ema_arr[i - 1]
+            if ema_v is None or prev_ema is None:
+                continue
+            dist = abs(closes[i] - ema_v)
+            tol = WEEKLY_EMA_TOUCH_ATR * atr_v
+            if dist <= tol:
+                side = "from_below" if closes[i - 1] < prev_ema else "from_above"
+                bias = "short" if side == "from_below" else "long"
+                signals.append({"i": i, "period": period, "side": side, "bias": bias,
+                                 "entry": closes[i], "week_t": weekly[i]["t"]})
+                fired_here = True
+        i += WEEKLY_EMA_BACKTEST_DEDUP_WEEKS if fired_here else 1
+    return signals, closes
+
+
+def _weekly_ema_evaluate_intraday(signal, symbol, window_min=WEEKLY_EMA_REACTION_WINDOW_MIN,
+                                   thresholds=WEEKLY_EMA_REACTION_THRESHOLDS):
+    """Тянет 1m-свечи за window_min минут ПОСЛЕ момента касания (переиспо-
+    льзует _pm_fetch_candles_window из Pump Match — тот же принцип: явное
+    окно [start_ts, end_ts], а не 'от now назад'). Считает максимальное
+    благоприятное (MFE) и неблагоприятное (MAE) движение от цены входа в
+    сторону classic_bias, и для каждого порога из thresholds — достигнут ли
+    он и через сколько минут. Возвращает None, если свечей не нашлось
+    (сигнал слишком старый — у биржи почти наверняка уже нет 1m-истории)."""
+    end_ts = signal["week_t"] + window_min * 60
+    candles = _pm_fetch_candles_window(symbol, signal["week_t"], end_ts, interval="1m")
+    if not candles:
+        return None
+    entry_price = signal["entry"]
+    bias = signal["bias"]
+    if not entry_price:
+        return None
+    out = {"mfe_pct": 0.0, "mfe_time_min": None, "mae_pct": 0.0, "mae_time_min": None,
+           "hits": {t: {"hit": False, "time_min": None} for t in thresholds}}
+    t0 = candles[0]["t"]
+    for c in candles:
+        minute = int((c["t"] - t0) / 60)
+        if bias == "long":
+            fav = (c["high"] - entry_price) / entry_price * 100.0
+            adv = (c["low"] - entry_price) / entry_price * 100.0
+        else:
+            fav = (entry_price - c["low"]) / entry_price * 100.0
+            adv = (entry_price - c["high"]) / entry_price * 100.0
+        if fav > out["mfe_pct"]:
+            out["mfe_pct"] = round(fav, 2)
+            out["mfe_time_min"] = minute
+        if adv < out["mae_pct"]:
+            out["mae_pct"] = round(adv, 2)
+            out["mae_time_min"] = minute
+        for t in thresholds:
+            if not out["hits"][t]["hit"] and fav >= t:
+                out["hits"][t] = {"hit": True, "time_min": minute}
+    return out
+
+
+def _weekly_ema_backtest_symbol(symbol, days=WEEKLY_EMA_BACKTEST_DAYS,
+                                 window_min=WEEKLY_EMA_REACTION_WINDOW_MIN,
+                                 thresholds=WEEKLY_EMA_REACTION_THRESHOLDS,
+                                 max_age_days=WEEKLY_EMA_REACTION_MAX_AGE_DAYS):
+    raw = _fetch_candles(symbol, "1d", days)
+    weekly = _resample_to_weekly(raw)
+    if len(weekly) < max(WEEKLY_EMA_PERIODS) + 5:
+        return []
+    signals, closes = _weekly_ema_detect_signals(weekly)
+    cutoff_ts = time.time() - max_age_days * 86400
+    for s in signals:
+        if s["week_t"] < cutoff_ts:
+            # слишком старый сигнал — 1m-историю у биржи почти наверняка уже
+            # не достать, не тратим запрос впустую
+            s["intraday"] = None
+            continue
+        try:
+            s["intraday"] = _weekly_ema_evaluate_intraday(s, symbol, window_min, thresholds)
+        except Exception as e:
+            olog(f"[weekly_ema_backtest] {symbol}: intraday оценка упала: {e}")
+            s["intraday"] = None
+    return signals
+
+
+def _weekly_ema_aggregate_symbol(signals, thresholds=WEEKLY_EMA_REACTION_THRESHOLDS):
+    """Сворачивает список сигналов одной монеты в статистику по порогам
+    реакции (+ отдельно по direction long/short — у монеты с трендом одна
+    сторона обычно работает заметно лучше другой)."""
+    def _agg(subset):
+        evaluable = [s for s in subset if s.get("intraday") is not None]
+        by_threshold = {}
+        for t in thresholds:
+            hits = [s for s in evaluable if s["intraday"]["hits"][t]["hit"]]
+            times = [s["intraday"]["hits"][t]["time_min"] for s in hits]
+            by_threshold[t] = {
+                "total": len(evaluable), "hits": len(hits),
+                "hit_rate": round(len(hits) / len(evaluable) * 100, 1) if evaluable else None,
+                "avg_time_min": round(sum(times) / len(times), 1) if times else None,
+            }
+        avg_mfe = round(sum(s["intraday"]["mfe_pct"] for s in evaluable) / len(evaluable), 2) if evaluable else None
+        avg_mae = round(sum(s["intraday"]["mae_pct"] for s in evaluable) / len(evaluable), 2) if evaluable else None
+        return {"total_signals": len(subset), "evaluable": len(evaluable),
+                "by_threshold": by_threshold, "avg_mfe_pct": avg_mfe, "avg_mae_pct": avg_mae}
+
+    result = _agg(signals)
+    result["by_bias"] = {bias: _agg([s for s in signals if s["bias"] == bias])
+                          for bias in ("long", "short")}
+    return result
+
+
+def _weekly_ema_backtest_run(symbols, days=WEEKLY_EMA_BACKTEST_DAYS,
+                              window_min=WEEKLY_EMA_REACTION_WINDOW_MIN,
+                              thresholds=WEEKLY_EMA_REACTION_THRESHOLDS,
+                              max_age_days=WEEKLY_EMA_REACTION_MAX_AGE_DAYS,
+                              progress_cb=None):
+    """Прогоняет бэктест по списку монет, возвращает {symbol: агрегат}.
+    progress_cb(done, total), если передан, вызывается после каждой монеты."""
+    results = {}
+    total = len(symbols)
+    for idx, symbol in enumerate(symbols):
+        try:
+            signals = _weekly_ema_backtest_symbol(symbol, days=days, window_min=window_min,
+                                                   thresholds=thresholds, max_age_days=max_age_days)
+            if signals:
+                results[symbol] = _weekly_ema_aggregate_symbol(signals, thresholds)
+        except Exception as e:
+            olog(f"[weekly_ema_backtest] {symbol}: ошибка: {e}")
+        if progress_cb:
+            progress_cb(idx + 1, total)
+    return results
+
+
+_weekly_ema_backtest_jobs_lock = threading.Lock()
+_weekly_ema_backtest_jobs = {}   # job_id -> {"status","done","total","result","created_at"}
+_WEEKLY_EMA_BACKTEST_JOB_TTL_SEC = 3600
+
+
+def _weekly_ema_backtest_new_job():
+    """~100 монет × годы дневных свечей — минуты работы (в основном сетевой
+    фетч), один блокирующий запрос выглядел бы зависшим. Тот же паттерн,
+    что и у /pump_match: POST сразу отдаёт job_id, прогресс — через GET."""
+    job_id = uuid.uuid4().hex[:12]
+    with _weekly_ema_backtest_jobs_lock:
+        _weekly_ema_backtest_jobs[job_id] = {"status": "running", "done": 0, "total": 0,
+                                              "result": None, "created_at": time.time()}
+        stale = [k for k, v in _weekly_ema_backtest_jobs.items()
+                 if time.time() - v.get("created_at", 0) > _WEEKLY_EMA_BACKTEST_JOB_TTL_SEC]
+        for k in stale:
+            del _weekly_ema_backtest_jobs[k]
+    return job_id
+
+
+def _weekly_ema_backtest_run_background(job_id, symbols, days, window_min, thresholds, max_age_days):
+    def progress_cb(done, total):
+        with _weekly_ema_backtest_jobs_lock:
+            if job_id in _weekly_ema_backtest_jobs:
+                _weekly_ema_backtest_jobs[job_id]["done"] = done
+                _weekly_ema_backtest_jobs[job_id]["total"] = total
+    try:
+        results = _weekly_ema_backtest_run(symbols, days=days, window_min=window_min,
+                                            thresholds=thresholds, max_age_days=max_age_days,
+                                            progress_cb=progress_cb)
+        payload = {"ok": True, "thresholds": thresholds, "window_min": window_min,
+                   "max_age_days": max_age_days, "results": results,
+                   "generated_at": int(time.time())}
+        try:
+            with open(WEEKLY_EMA_BACKTEST_FILE, "w") as f:
+                json.dump(payload, f)
+        except Exception as e:
+            olog(f"[weekly_ema_backtest] ⚠ не смог сохранить результат: {e}")
+        with _weekly_ema_backtest_jobs_lock:
+            if job_id in _weekly_ema_backtest_jobs:
+                _weekly_ema_backtest_jobs[job_id]["status"] = "done"
+                _weekly_ema_backtest_jobs[job_id]["result"] = payload
+    except Exception as e:
+        olog(f"[weekly_ema_backtest] задача {job_id} упала: {e}")
+        with _weekly_ema_backtest_jobs_lock:
+            if job_id in _weekly_ema_backtest_jobs:
+                _weekly_ema_backtest_jobs[job_id]["status"] = "error"
+                _weekly_ema_backtest_jobs[job_id]["result"] = {"ok": False, "msg": f"Внутренняя ошибка: {e}"}
+# ─── конец Weekly EMA Backtest ──────────────────────────────────────────────
+
 def _load_alert_cfg():
     """Подхватывает сохранённые TG/ntfy настройки из файла (приоритет над env)."""
     global TG_TOKEN, TG_CHAT, NTFY_URL, WATCHDOG_ENABLED, WATCHDOG_TIMEOUT_MIN, HC_URL
@@ -4304,6 +4560,181 @@ def _pump_match_run_background(job_id, image_bytes, symbol, search_start_ts, sea
                 _pump_match_jobs[job_id]["result"] = {"ok": False, "msg": f"Внутренняя ошибка: {e}"}
 
 
+WEEKLY_EMA_BACKTEST_HTML_PAGE = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Weekly EMA Backtest</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font-family:system-ui,sans-serif;margin:0;padding:16px}
+h1{font-size:20px}
+label{display:block;margin-top:12px;font-size:13px;color:#8b949e}
+input,select{width:100%;background:#161b22;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:8px;margin-top:4px;font-size:14px;box-sizing:border-box}
+button{background:#238636;color:#fff;border:0;padding:10px 16px;border-radius:6px;font-size:14px;margin-top:14px;cursor:pointer}
+.card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:16px;margin-top:14px;max-width:480px}
+#status{color:#8b949e;font-size:13px;margin-top:10px}
+table{width:100%;border-collapse:collapse;margin-top:14px;font-size:13px}
+th,td{padding:6px 8px;text-align:left;border-bottom:1px solid #21262d;white-space:nowrap}
+th{color:#8b949e;position:sticky;top:0;background:#161b22;cursor:pointer}
+tbody tr:hover{background:#1c2128}
+.wr-hi{color:#3fb950;font-weight:bold}
+.wr-lo{color:#f85149;font-weight:bold}
+.table-scroll{overflow-x:auto}
+.section-card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:14px;margin-top:14px}
+</style></head><body>
+<h1>&#128202; Weekly EMA Backtest — рейтинг угадывания</h1>
+<p style="color:#8b949e;font-size:13px;max-width:480px">Сигнал ищется на НЕДЕЛЬНОМ графике (касание EMA7/14/28), но оценивается БЫСТРАЯ реакция — по 1-минутным свечам в первые часы после касания: достигла ли цена цели (3/4/6/10%) в сторону классического bounce-bias, и за сколько минут. Так, как реально торгуется сигнал — сделки на минуты-час, а не удержание неделями.</p>
+<p style="color:#d29922;font-size:12px;max-width:480px">⚠️ У биржи почти наверняка нет 1m-истории на годы назад — реакцию можно проверить только для сравнительно недавних касаний (см. "макс. давность сигнала" ниже). Для более старых сигналов факт касания всё равно посчитается (total_signals), но в винрейт по реакции они не попадут — это видно по числу "evaluable" в скобках у каждой ячейки.</p>
+
+<div class="card">
+  <label>Сколько монет по объёму (топ-N)</label>
+  <input type="number" id="btTopN" value="100" min="1" max="500">
+  <label>Глубина недельной истории для поиска касаний, дней</label>
+  <input type="number" id="btDays" value="1500" min="200" max="5000">
+  <label>Макс. давность сигнала для проверки реакции, дней (старше — 1m почти наверняка недоступны)</label>
+  <input type="number" id="btMaxAgeDays" value="90" min="1" max="1000">
+  <label>Окно проверки реакции после касания, минут</label>
+  <input type="number" id="btWindowMin" value="180" min="5" max="1440">
+  <label>Пороги цели, % (через запятую)</label>
+  <input type="text" id="btThresholds" value="3,4,6,10">
+  <label>Минимум сигналов у монеты, чтобы попасть в таблицу (отсеивает шум от 1-2 случайных касаний)</label>
+  <input type="number" id="btMinSignals" value="5" min="1" max="100">
+  <label>Сортировать по hit-rate на пороге</label>
+  <select id="btSortThreshold"></select>
+  <button onclick="runBacktest()">&#128202; Запустить бэктест</button>
+  <div id="status"></div>
+</div>
+
+<div class="section-card">
+  <div class="table-scroll">
+    <table id="resultsTable">
+      <thead><tr id="theadRow"><th>Монета</th><th>Сигналов</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+let lastResults = null;
+
+function wrClass(wr){
+  if(wr === null || wr === undefined) return '';
+  if(wr >= 60) return 'wr-hi';
+  if(wr <= 25) return 'wr-lo';
+  return '';
+}
+
+function currentThresholds(){
+  return lastResults && lastResults.thresholds ? lastResults.thresholds
+       : document.getElementById('btThresholds').value.split(',').map(s => parseFloat(s.trim())).filter(v => !isNaN(v));
+}
+
+function rebuildHeadAndSortOptions(){
+  const thresholds = currentThresholds();
+  const thead = document.getElementById('theadRow');
+  thead.innerHTML = '<th>Монета</th><th>Сигналов</th>';
+  const sel = document.getElementById('btSortThreshold');
+  sel.innerHTML = '';
+  for(const t of thresholds){
+    thead.innerHTML += `<th>${t}%</th>`;
+    const opt = document.createElement('option');
+    opt.value = t; opt.text = t + '%';
+    sel.appendChild(opt);
+  }
+}
+
+function renderTable(){
+  if(!lastResults) return;
+  rebuildHeadAndSortOptions();
+  const thresholds = currentThresholds();
+  const minSignals = parseInt(document.getElementById('btMinSignals').value) || 1;
+  const sortT = document.getElementById('btSortThreshold').value || thresholds[0];
+  const rows = Object.entries(lastResults.results || {})
+    .filter(([sym, r]) => r.total_signals >= minSignals)
+    .sort((a, b) => {
+      const wa = (a[1].by_threshold[sortT] || {}).hit_rate;
+      const wb = (b[1].by_threshold[sortT] || {}).hit_rate;
+      if(wa === null || wa === undefined) return 1;
+      if(wb === null || wb === undefined) return -1;
+      return wb - wa;
+    });
+  const tbody = document.querySelector('#resultsTable tbody');
+  tbody.innerHTML = '';
+  for(const [sym, r] of rows){
+    const tr = document.createElement('tr');
+    let cells = `<td>${sym}</td><td>${r.total_signals}</td>`;
+    for(const t of thresholds){
+      const stat = r.by_threshold[t] || {};
+      const hr = stat.hit_rate;
+      const timeNote = stat.avg_time_min != null ? `, ~${stat.avg_time_min}м` : '';
+      cells += `<td class="${wrClass(hr)}">${hr!=null ? hr+'%' : '—'}${timeNote} <span style="color:#6e7681;font-size:11px">(n=${stat.total||0})</span></td>`;
+    }
+    tr.innerHTML = cells;
+    tbody.appendChild(tr);
+  }
+  document.getElementById('status').innerHTML = `Монет в таблице: <b>${rows.length}</b> (из ${Object.keys(lastResults.results||{}).length} с сигналами) — обновлено ${new Date(lastResults.generated_at*1000).toLocaleString()}`;
+}
+
+async function runBacktest(){
+  const statusEl = document.getElementById('status');
+  const topN = document.getElementById('btTopN').value;
+  const days = document.getElementById('btDays').value;
+  const maxAgeDays = document.getElementById('btMaxAgeDays').value;
+  const windowMin = document.getElementById('btWindowMin').value;
+  const thresholds = document.getElementById('btThresholds').value.split(',').map(s => parseFloat(s.trim())).filter(v => !isNaN(v));
+  statusEl.innerText = 'Запускаю бэктест...';
+  try{
+    const r = await fetch('/weekly_ema_backtest_run', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({top_n: parseInt(topN), days: parseInt(days), max_age_days: parseInt(maxAgeDays),
+                             window_min: parseInt(windowMin), thresholds: thresholds})});
+    const d = await r.json();
+    if(!d.ok){ statusEl.innerText = '❌ ' + d.msg; return; }
+    statusEl.innerText = `Запущено (${d.symbols_count} монет), жду...`;
+    pollStatus(d.job_id);
+  }catch(e){
+    statusEl.innerText = '❌ ошибка запроса: ' + e;
+  }
+}
+
+async function pollStatus(jobId){
+  const statusEl = document.getElementById('status');
+  try{
+    const r = await fetch('/weekly_ema_backtest_status?job_id=' + jobId, {cache:'no-store'});
+    const d = await r.json();
+    if(!d.ok){ statusEl.innerText = '❌ ' + d.msg; return; }
+    if(d.status === 'running'){
+      statusEl.innerText = `Прогоняю монеты: ${d.done}/${d.total}...`;
+      setTimeout(() => pollStatus(jobId), 2000);
+      return;
+    }
+    if(d.status === 'error'){
+      statusEl.innerText = '❌ ' + (d.result && d.result.msg ? d.result.msg : 'ошибка выполнения');
+      return;
+    }
+    lastResults = d.result;
+    renderTable();
+  }catch(e){
+    statusEl.innerText = '❌ ошибка опроса статуса: ' + e;
+  }
+}
+
+document.getElementById('btMinSignals').addEventListener('change', renderTable);
+document.getElementById('btSortThreshold').addEventListener('change', renderTable);
+
+// подхватываем последний сохранённый результат при загрузке страницы
+(async () => {
+  try{
+    const r = await fetch('/weekly_ema_backtest_last');
+    const d = await r.json();
+    if(d.ok !== false && d.results){
+      lastResults = d;
+      renderTable();
+    } else {
+      rebuildHeadAndSortOptions();
+    }
+  }catch(e){ rebuildHeadAndSortOptions(); }
+})();
+</script></body></html>"""
+
+
 PUMP_MATCH_HTML_PAGE = """<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Pump Match</title>
@@ -4580,6 +5011,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
             else:
                 self._json({"ok": True, "status": job["status"], "done": job["done"],
                             "total": job["total"], "result": job["result"]})
+        elif self.path == "/weekly_ema_backtest" or self.path == "/weekly_ema_backtest.html":
+            body = WEEKLY_EMA_BACKTEST_HTML_PAGE.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", len(body))
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path.startswith("/weekly_ema_backtest_status"):
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            job_id = (params.get("job_id") or [""])[0]
+            with _weekly_ema_backtest_jobs_lock:
+                job = _weekly_ema_backtest_jobs.get(job_id)
+            if not job:
+                self._json({"ok": False, "msg": "Задача не найдена (истекла или неверный job_id)"})
+            else:
+                self._json({"ok": True, "status": job["status"], "done": job["done"],
+                            "total": job["total"], "result": job["result"]})
+        elif self.path == "/weekly_ema_backtest_last":
+            # последний сохранённый результат бэктеста (переживает рестарт процесса)
+            try:
+                if os.path.exists(WEEKLY_EMA_BACKTEST_FILE):
+                    with open(WEEKLY_EMA_BACKTEST_FILE) as f:
+                        self._json(json.load(f))
+                else:
+                    self._json({"ok": False, "msg": "Бэктест ещё не запускался"})
+            except Exception as e:
+                self._json({"ok": False, "msg": str(e)})
         else:
             self.send_response(404); self.end_headers()
       except Exception as e:
@@ -4695,6 +5155,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json({"ok": True})
             except Exception as e:
                 self._json({"ok": False, "msg": str(e)})
+
+        elif self.path == "/weekly_ema_backtest_run":
+            try:
+                top_n = int(body.get("top_n") or WEEKLY_EMA_BACKTEST_TOP_N)
+                days = int(body.get("days") or WEEKLY_EMA_BACKTEST_DAYS)
+                window_min = int(body.get("window_min") or WEEKLY_EMA_REACTION_WINDOW_MIN)
+                max_age_days = int(body.get("max_age_days") or WEEKLY_EMA_REACTION_MAX_AGE_DAYS)
+                thresholds_raw = body.get("thresholds") or WEEKLY_EMA_REACTION_THRESHOLDS
+                thresholds = sorted(float(t) for t in thresholds_raw)
+                custom_symbols = body.get("symbols")  # необязательный явный список вместо топ-N
+            except (TypeError, ValueError) as e:
+                self._json({"ok": False, "msg": f"Некорректные параметры: {e}"}); return
+            if custom_symbols and isinstance(custom_symbols, list):
+                symbols = [s.strip().upper() for s in custom_symbols if s.strip()]
+            else:
+                symbols = _fetch_all_symbols()[:top_n]
+            if not symbols:
+                self._json({"ok": False, "msg": "Не удалось получить список монет"}); return
+            job_id = _weekly_ema_backtest_new_job()
+            threading.Thread(
+                target=_weekly_ema_backtest_run_background,
+                args=(job_id, symbols, days, window_min, thresholds, max_age_days),
+                daemon=True,
+            ).start()
+            self._json({"ok": True, "job_id": job_id, "symbols_count": len(symbols)})
 
         else:
             self.send_response(404); self.end_headers()
