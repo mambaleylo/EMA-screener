@@ -1,7 +1,35 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.4.0 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.6.1 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.6.1: Weekly EMA Touch Watcher теперь определяет СТОРОНУ подхода к
+  уровню (по предыдущей закрытой недельной свече — была она выше или ниже
+  EMA) и классическую bounce-трактовку: подход снизу вверх = тест
+  сопротивления = SHORT-контекст (ждём отскок вниз); сверху вниз = тест
+  поддержки = LONG-контекст (ждём отскок вверх). Это ИНФОРМАЦИЯ о
+  классическом прочтении, не гарантированный сигнал — уровень может и
+  пробиться вместо отскока (та же развилка bounce/breakout, что и во всём
+  остальном движке). Добавлено в текст Telegram-алерта и колонку таблицы.
+- v0.6.0: добавлен Weekly EMA Touch Watcher — отдельный, независимый ни от
+  Pump Detector, ни от (остановленного) EMA-инверт движка сканер. Раз в
+  30 минут проверяет топ-100 монет по объёму на касание ценой EMA7/14/28
+  на НЕДЕЛЬНОМ графике (переиспользует чистые функции _ema/_atr/
+  _resample_to_weekly/_ema_live_value/_ladder_order, уже бывшие в файле —
+  ничего заново не писалось) и шлёт текстовый алерт в Telegram + пишет в
+  историю. Секция "Касания EMA7/14/28" добавлена на главную страницу
+  (таблица последних срабатываний), эндпоинт GET /weekly_ema_status.
+  Чисто информационно — НЕ сигнал на вход, автоторговли не касается.
+- v0.5.0: главная страница ("/", "/ema") упрощена — по запросу "уходим от
+  прошлой реализации, оставляем только поиск пампов". Убраны с UI: скан
+  EMA-досье, живые EMA-сигналы, история сигналов, автоторговля — остались
+  только живые пампы, настройки алертов и ссылка на /pump_match. Старая
+  полная страница никуда не делась, доступна на /ema_full (таблицы будут
+  пустые, т.к. сам EMA-движок теперь не запускается — см. ниже), код всего
+  движка остался в файле нетронутым, просто не в фокусе.
+  _ema_signal_loop() остановлен в main() (закомментирован запуск потока) —
+  раз им не пользуемся, незачем ему фоном дёргать Gate.io API и держать
+  включённой возможность реальной автоторговли без видимого в UI контроля
+  над ней. Возврат — раскомментировать одну строку в main().
 - v0.4.0: /pump_match переведён на асинхронную схему — сетка перебора
   выросла до тысяч комбинаций (несколько минут), один блокирующий HTTP-
   запрос на это время выглядел бы как зависание браузера. Теперь POST
@@ -78,7 +106,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.4.0"
+APP_VERSION  = "0.6.1"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2061,6 +2089,206 @@ def _ema_signal_loop():
                 olog(f"[ema_live] RSS {_rss} МБ (итерация {_iter}, ctx_cache={len(_ema_ctx_cache)})")
             gc.collect()
         time.sleep(EMA_LIVE_POLL_SEC)
+PUMP_MAIN_HTML_PAGE = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pump Radar</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font-family:system-ui,sans-serif;margin:0;padding:16px}
+h1{font-size:20px}
+h3{font-size:15px;margin:0}
+button{background:#238636;color:#fff;border:0;padding:10px 16px;border-radius:6px;font-size:14px;margin:6px 6px 6px 0;cursor:pointer}
+table{width:100%;border-collapse:collapse;margin-top:0;font-size:13px}
+th,td{padding:6px 8px;text-align:left;border-bottom:1px solid #21262d;white-space:nowrap}
+th{color:#8b949e;position:sticky;top:0;background:#161b22}
+tbody tr:hover{background:#1c2128}
+.long{color:#3fb950}
+#status{color:#8b949e;font-size:13px;margin-top:8px}
+#alertModal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:50;align-items:center;justify-content:center}
+#alertModal .card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:20px;width:min(420px,92vw)}
+#alertModal label{display:block;margin-top:12px;font-size:13px;color:#8b949e}
+#alertModal input[type=text]{width:100%;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:8px;margin-top:4px;font-size:14px;box-sizing:border-box}
+#alertModal .row{display:flex;justify-content:space-between;align-items:center;margin-top:12px}
+.section-card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:14px;margin-top:14px}
+.summary-line{font-size:13px;color:#8b949e;margin-top:6px}
+.summary-line b{color:#c9d1d9}
+.table-scroll{overflow-x:auto;margin-top:10px;border-radius:6px}
+details summary{cursor:pointer;font-size:15px;list-style:none}
+details summary::-webkit-details-marker{display:none}
+details summary:before{content:"▸ ";color:#8b949e}
+details[open] summary:before{content:"▾ "}
+.log-box{background:#010409;border:1px solid #21262d;border-radius:4px;height:200px;overflow-y:auto;padding:6px;font-size:11px;font-family:monospace}
+.log-line{padding:1px 0;border-bottom:1px solid #21262d}
+@media (max-width:480px){
+  body{padding:8px;font-size:13px}
+  h1{font-size:17px}
+  h3{font-size:14px}
+  button{padding:8px 12px;font-size:13px;margin:4px 4px 4px 0}
+  th,td{padding:4px 6px;font-size:12px}
+  .section-card{padding:10px;margin-top:10px}
+}
+</style></head><body>
+<h1>&#128225; Pump Radar <span style="font-size:12px;color:#8b949e;font-weight:normal">v__APP_VERSION__</span></h1>
+<p style="color:#8b949e;font-size:13px;max-width:480px">Детектит резкий рост цены (памп) по топ-монетам Gate.io и шлёт алерт в Telegram с картинкой. Старый EMA-инверт движок отключён и не показан — код остался в файле, просто не в фокусе сейчас.</p>
+<button onclick="openAlertSettings()" style="background:#21262d;border:1px solid #30363d">&#128276; Алерты</button>
+<a href="/pump_match" style="text-decoration:none"><button style="background:#8250df">&#127919; Pump Match (подбор параметров отрисовки)</button></a>
+<div id="status"></div>
+
+<div id="alertModal">
+  <div class="card">
+    <h3 style="margin-top:0">&#128276; Алерты (Telegram / ntfy)</h3>
+    <label>Telegram bot token</label>
+    <input type="text" id="alTgToken" placeholder="123456:AAаа...">
+    <label>Telegram chat id</label>
+    <input type="text" id="alTgChat" placeholder="-1001234567890">
+    <label>ntfy.sh URL (необязательно, запасной канал)</label>
+    <input type="text" id="alNtfyUrl" placeholder="https://ntfy.sh/my-topic">
+    <div class="row">
+      <button onclick="closeAlertSettings()" style="background:#21262d;border:1px solid #30363d">Отмена</button>
+      <div>
+        <button onclick="testAlert()" style="background:#1f6feb">Тест</button>
+        <button onclick="saveAlertSettings()">Сохранить</button>
+      </div>
+    </div>
+    <div id="alertMsg" style="margin-top:8px;font-size:12px;color:#f85149"></div>
+  </div>
+</div>
+
+<div class="section-card">
+  <h3>&#128293; Живые пампы</h3>
+  <div id="pumpSummary" class="summary-line">пока не было срабатываний</div>
+  <div class="table-scroll">
+    <table id="pumps"><thead><tr><th>Монета</th><th>%</th><th>База → сейчас</th><th>Когда</th></tr></thead><tbody></tbody></table>
+  </div>
+</div>
+
+<div class="section-card">
+  <h3>&#128204; Касания EMA7/14/28 (недельный график)</h3>
+  <div id="weeklyEmaSummary" class="summary-line">пока не было срабатываний</div>
+  <div class="table-scroll">
+    <table id="weeklyEma"><thead><tr><th>Монета</th><th>EMA</th><th>Цена</th><th>Расст. (ATR)</th><th>Подход</th><th>Тренд</th><th>Когда</th></tr></thead><tbody></tbody></table>
+  </div>
+</div>
+
+<div class="section-card">
+  <details id="logDetails">
+    <summary><h3 style="display:inline">&#128221; Логи</h3></summary>
+    <div class="card log-box" id="logBox" style="margin-top:8px"></div>
+  </details>
+</div>
+
+<script>
+function openAlertSettings(){ document.getElementById('alertModal').style.display='flex'; loadAlertSettings(); }
+function closeAlertSettings(){ document.getElementById('alertModal').style.display='none'; }
+async function loadAlertSettings(){
+  try{
+    const r = await fetch('/alert_cfg'); const d = await r.json();
+    document.getElementById('alTgToken').value = d.tg_token || '';
+    document.getElementById('alTgChat').value  = d.tg_chat  || '';
+    document.getElementById('alNtfyUrl').value = d.ntfy_url || '';
+  }catch(e){}
+}
+async function saveAlertSettings(){
+  const msg = document.getElementById('alertMsg'); msg.innerText = '';
+  const payload = {
+    tg_token: document.getElementById('alTgToken').value.trim(),
+    tg_chat:  document.getElementById('alTgChat').value.trim(),
+    ntfy_url: document.getElementById('alNtfyUrl').value.trim(),
+  };
+  const r = await fetch('/alert_cfg', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+  const d = await r.json();
+  if(!d.ok){ msg.innerText = d.msg || 'Ошибка сохранения'; return; }
+  closeAlertSettings();
+}
+async function saveAlertSettingsSync(){
+  const payload = {
+    tg_token: document.getElementById('alTgToken').value.trim(),
+    tg_chat:  document.getElementById('alTgChat').value.trim(),
+    ntfy_url: document.getElementById('alNtfyUrl').value.trim(),
+  };
+  const r = await fetch('/alert_cfg', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+  return r.json();
+}
+async function testAlert(){
+  const msg = document.getElementById('alertMsg'); msg.style.color = '#8b949e'; msg.innerText = 'Отправляю...';
+  const saved = await saveAlertSettingsSync();
+  if(!saved.ok){ msg.style.color = '#f85149'; msg.innerText = saved.msg || 'Ошибка сохранения'; return; }
+  const r = await fetch('/alert_test', {method:'POST'}); const d = await r.json();
+  msg.style.color = d.ok ? '#3fb950' : '#f85149';
+  msg.innerText = d.ok ? '✅ Тестовое сообщение отправлено' : ('Ошибка: ' + (d.error||''));
+}
+
+function fmtAgo(ts){
+  const s = Math.floor(Date.now()/1000) - ts;
+  if(s < 3600) return Math.floor(s/60)+'м назад';
+  if(s < 86400) return Math.floor(s/3600)+'ч назад';
+  return Math.floor(s/86400)+'д назад';
+}
+
+async function refreshPumps(){
+  try{
+    const r = await fetch('/pump_status'); const d = await r.json();
+    const tbody = document.querySelector('#pumps tbody'); tbody.innerHTML = '';
+    const items = (d.recent || []).slice().reverse();
+    document.getElementById('pumpSummary').innerHTML = items.length
+      ? `отслеживается монет: <b>${d.tracked||0}</b> &nbsp;·&nbsp; сработало пампов: <b>${items.length}</b>`
+      : `отслеживается монет: <b>${d.tracked||0}</b> &nbsp;·&nbsp; пока не было срабатываний`;
+    for(const it of items.slice(0,50)){
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${it.symbol}</td><td class="long">+${it.pct}%</td><td>${it.base_price} -> ${it.last_price}</td><td>${fmtAgo(it.ts)}</td>`;
+      tbody.appendChild(tr);
+    }
+  }catch(e){}
+}
+
+async function refreshWeeklyEma(){
+  try{
+    const r = await fetch('/weekly_ema_status'); const d = await r.json();
+    const tbody = document.querySelector('#weeklyEma tbody'); tbody.innerHTML = '';
+    const items = (d.recent || []).slice().reverse();
+    document.getElementById('weeklyEmaSummary').innerHTML = items.length
+      ? `сработало касаний: <b>${items.length}</b>`
+      : 'пока не было срабатываний';
+    const ladderLabel = {up:'&#8593; вверх', down:'&#8595; вниз'};
+    const biasLabel = {short:'<span style="color:#f85149">снизу вверх → SHORT</span>',
+                        long:'<span style="color:#3fb950">сверху вниз → LONG</span>'};
+    for(const it of items.slice(0,50)){
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${it.symbol}</td><td>EMA${it.period}</td><td>${it.price}</td><td>${it.dist_atr}</td><td>${biasLabel[it.classic_bias]||'—'}</td><td>${ladderLabel[it.ladder]||'—'}</td><td>${fmtAgo(it.ts)}</td>`;
+      tbody.appendChild(tr);
+    }
+  }catch(e){}
+}
+
+let pumpLogsTotal = 0;
+async function pollPumpLogs(){
+  try{
+    const r = await fetch('/ema_logs', {cache:'no-store'});
+    const d = await r.json();
+    const dropped = d.logs_dropped || 0;
+    const totalNow = dropped + (d.logs||[]).length;
+    const newFrom = Math.max(0, pumpLogsTotal - dropped);
+    const newLogs = (d.logs||[]).slice(newFrom);
+    const lb = document.getElementById('logBox');
+    const wasOpen = document.getElementById('logDetails').open;
+    const atBottom = !wasOpen || (lb.scrollTop + lb.clientHeight >= lb.scrollHeight - 4);
+    newLogs.forEach(l => {
+      const div = document.createElement('div');
+      div.className = 'log-line';
+      div.innerHTML = `<span style="color:#555">[${l.ts}]</span> ${l.msg}`;
+      lb.appendChild(div);
+    });
+    while(lb.children.length > 300) lb.removeChild(lb.firstChild);
+    if(newLogs.length && atBottom) lb.scrollTop = lb.scrollHeight;
+    pumpLogsTotal = totalNow;
+  }catch(e){}
+}
+
+pollPumpLogs(); setInterval(pollPumpLogs, 4000);
+refreshPumps(); setInterval(refreshPumps, 8000);
+refreshWeeklyEma(); setInterval(refreshWeeklyEma, 15000);
+</script></body></html>"""
+
+
 EMA_HTML_PAGE = """<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Pump Radar</title>
@@ -3144,6 +3372,141 @@ def _pump_detect_loop():
         time.sleep(PUMP_DETECT_POLL_SEC)
 # ─── конец Live Pump Detector ───────────────────────────────────────────────
 
+# ─── Weekly EMA Touch Watcher ───────────────────────────────────────────────
+# Отдельный, независимый ни от Pump Detector, ни от (остановленного) EMA-
+# инверт движка сканер: раз в WEEKLY_EMA_SCAN_POLL_SEC проверяет топ-N монет
+# по объёму на касание ценой EMA7/14/28 на НЕДЕЛЬНОМ графике (те самые
+# уровни, которые в исходном EMA Bounce Dossier называются "границей
+# локального тренда") и шлёт текстовый алерт в Telegram. Чисто
+# информационно — не сигнал на вход, не завязан на автоторговлю.
+WEEKLY_EMA_PERIODS = [7, 14, 28]
+WEEKLY_EMA_TOUCH_ATR = 0.25       # тот же допуск касания, что и в исходном движке
+WEEKLY_EMA_SCAN_POLL_SEC = 1800   # раз в 30 минут — недельный график быстро не меняется
+WEEKLY_EMA_SCAN_TOP_N = 100
+WEEKLY_EMA_FETCH_DAYS = 400       # с запасом под EMA28 на неделях (~28 недель=196 дней) + история ATR
+WEEKLY_EMA_TOUCH_COOLDOWN_SEC = 24 * 3600  # не спамить чаще раза в сутки по той же связке символ+уровень
+
+_weekly_ema_touch_lock = threading.Lock()
+_weekly_ema_touch_state = {}   # "symbol|period" -> last_alert_ts
+_weekly_ema_recent = []        # последние сработавшие касания — для /weekly_ema_status
+WEEKLY_EMA_HISTORY_FILE = os.path.expanduser("~/pumpradar_weekly_ema_history.json")
+
+
+def _weekly_ema_check_symbol(symbol):
+    """Тянет дневные свечи, ресемплит в недельные (_resample_to_weekly),
+    считает EMA7/14/28 и ATR(14) на недельном ТФ, проверяет касание живой
+    ценой любого из трёх уровней (цена экстраполирует EMA на текущий
+    момент через _ema_live_value — та же логика, что в исходном движке,
+    просто переиспользована здесь как чистая функция). Для каждого касания
+    также определяет СТОРОНУ подхода (по предыдущей закрытой недельной
+    свече — была она выше или ниже уровня) и классическую bounce-трактовку
+    (снизу вверх = тест сопротивления = short-ожидание отскока; сверху вниз
+    = тест поддержки = long-ожидание отскока) — это ИНФОРМАЦИЯ о контексте,
+    не готовый сигнал (сам пробой вместо отскока — ровно то, что проверял
+    invert-форк этого же движка, здесь такого фильтра нет). Возвращает
+    список touch-записей (может быть больше одной, если цена одновременно
+    у нескольких уровней) или пустой список."""
+    raw = _fetch_candles(symbol, "1d", WEEKLY_EMA_FETCH_DAYS)
+    weekly = _resample_to_weekly(raw)
+    if len(weekly) < max(WEEKLY_EMA_PERIODS) + 5:
+        return []
+    closes = [c["close"] for c in weekly]
+    atr_arr = _atr(weekly, 14)
+    i = len(weekly) - 1
+    atr_v = atr_arr[i]
+    if not atr_v:
+        return []
+    live_price = _gate_get_price(symbol)
+    price = live_price if live_price else closes[i]
+    ema_arrays = {p: _ema(closes, p) for p in WEEKLY_EMA_PERIODS}
+    if any(arr[i] is None for arr in ema_arrays.values()):
+        return []
+    ladder = _ladder_order([price] + [ema_arrays[p][i] for p in WEEKLY_EMA_PERIODS])
+    touches = []
+    for period in WEEKLY_EMA_PERIODS:
+        ema_arr = ema_arrays[period]
+        ema_closed = ema_arr[i]
+        ema_now = _ema_live_value(ema_closed, price, period) if live_price else ema_closed
+        dist = abs(price - ema_now)
+        tol = WEEKLY_EMA_TOUCH_ATR * atr_v
+        if dist <= tol:
+            prev_close = closes[i - 1] if i > 0 else closes[i]
+            prev_ema = ema_arr[i - 1] if (i > 0 and ema_arr[i - 1] is not None) else ema_closed
+            side = "from_below" if prev_close < prev_ema else "from_above"
+            classic_bias = "short" if side == "from_below" else "long"
+            touches.append({
+                "symbol": symbol, "period": period, "price": price,
+                "ema_value": ema_now, "dist_atr": round(dist / atr_v, 3),
+                "ladder": ladder, "side": side, "classic_bias": classic_bias,
+                "week_t": weekly[i]["t"],
+            })
+    return touches
+
+
+def _weekly_ema_fire_alert(touch):
+    ladder_note = {"up": "лесенка вверх (здоровый up-тренд)",
+                   "down": "лесенка вниз (здоровый down-тренд)",
+                   None: "лесенка не выстроена (боковик/переход)"}[touch["ladder"]]
+    side_note = ("снизу вверх, тест сопротивления" if touch["side"] == "from_below"
+                 else "сверху вниз, тест поддержки")
+    bias_note = "классический bounce-контекст: SHORT" if touch["classic_bias"] == "short" \
+                else "классический bounce-контекст: LONG"
+    msg = (f"📐 <b>{touch['symbol']}</b> — касание EMA{touch['period']} на НЕДЕЛЬНОМ графике\n"
+           f"Цена: {_fmt_px(touch['price'])} | EMA{touch['period']}: {_fmt_px(touch['ema_value'])}\n"
+           f"Расстояние: {touch['dist_atr']} ATR | подход {side_note}\n"
+           f"{bias_note} (если сыграет отскок, а не пробой) | {ladder_note}")
+    _send_alert(msg)
+    olog(f"[weekly_ema] {touch['symbol']}: касание EMA{touch['period']} "
+         f"(dist={touch['dist_atr']} ATR, side={touch['side']}) — алерт отправлен")
+    rec = {"ts": int(time.time()), "symbol": touch["symbol"], "period": touch["period"],
+           "price": touch["price"], "ema_value": touch["ema_value"],
+           "dist_atr": touch["dist_atr"], "ladder": touch["ladder"],
+           "side": touch["side"], "classic_bias": touch["classic_bias"]}
+    global _weekly_ema_recent
+    _weekly_ema_recent.append(rec)
+    _weekly_ema_recent = _weekly_ema_recent[-200:]
+    try:
+        with open(WEEKLY_EMA_HISTORY_FILE, "w") as f:
+            json.dump(_weekly_ema_recent, f)
+    except Exception as e:
+        olog(f"[weekly_ema] ⚠ не смог сохранить историю: {e}")
+
+
+def _weekly_ema_touch_loop():
+    time.sleep(25)
+    # подхватываем историю с прошлого запуска, чтобы /weekly_ema_status не
+    # был пустым сразу после рестарта процесса
+    global _weekly_ema_recent
+    try:
+        if os.path.exists(WEEKLY_EMA_HISTORY_FILE):
+            with open(WEEKLY_EMA_HISTORY_FILE) as f:
+                _weekly_ema_recent = json.load(f)
+    except Exception:
+        pass
+    while True:
+        try:
+            symbols = _fetch_all_symbols()[:WEEKLY_EMA_SCAN_TOP_N]
+            now = time.time()
+            for symbol in symbols:
+                try:
+                    touches = _weekly_ema_check_symbol(symbol)
+                except Exception as e:
+                    olog(f"[weekly_ema] {symbol}: ошибка проверки: {e}")
+                    continue
+                for touch in touches:
+                    key = f"{symbol}|{touch['period']}"
+                    with _weekly_ema_touch_lock:
+                        last = _weekly_ema_touch_state.get(key, 0)
+                    if now - last < WEEKLY_EMA_TOUCH_COOLDOWN_SEC:
+                        continue
+                    _weekly_ema_fire_alert(touch)
+                    with _weekly_ema_touch_lock:
+                        _weekly_ema_touch_state[key] = now
+        except Exception as e:
+            olog(f"[weekly_ema] ошибка цикла: {e}")
+        time.sleep(WEEKLY_EMA_SCAN_POLL_SEC)
+# ─── конец Weekly EMA Touch Watcher ─────────────────────────────────────────
+
 def _load_alert_cfg():
     """Подхватывает сохранённые TG/ntfy настройки из файла (приоритет над env)."""
     global TG_TOKEN, TG_CHAT, NTFY_URL, WATCHDOG_ENABLED, WATCHDOG_TIMEOUT_MIN, HC_URL
@@ -4113,6 +4476,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Location", "/ema")
             self.end_headers()
         elif self.path == "/ema" or self.path == "/ema.html":
+            body = PUMP_MAIN_HTML_PAGE.replace("__APP_VERSION__", APP_VERSION).encode()
+            self.send_response(200)
+            self.send_header("Content-Type","text/html; charset=utf-8")
+            self.send_header("Content-Length",len(body))
+            self.send_header("Cache-Control","no-store, no-cache, must-revalidate, max-age=0")
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/ema_full":
+            # старая полная страница EMA-инверт движка (досье/сигналы/авто-
+            # трейд) — сам движок сейчас не запущен (см. main()), поэтому
+            # таблицы тут будут пустые; оставлено на случай, если понадобится
+            # вернуться к этой фиче — правкой одной строки в main().
             body = EMA_HTML_PAGE.replace("__APP_VERSION__", APP_VERSION).encode()
             self.send_response(200)
             self.send_header("Content-Type","text/html; charset=utf-8")
@@ -4177,6 +4552,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except Exception:
                 recent = []
             self._json({"tracked": tracked, "recent": recent[-100:]})
+        elif self.path == "/weekly_ema_status":
+            with _weekly_ema_touch_lock:
+                recent = list(_weekly_ema_recent[-100:])
+            self._json({"recent": recent})
         elif self.path == "/alert_cfg":
             self._json({"tg_token": TG_TOKEN, "tg_chat": TG_CHAT, "ntfy_url": NTFY_URL,
                         "hc_url": HC_URL,
@@ -4399,8 +4778,14 @@ def main():
     _load_pump_render_params()
     threading.Thread(target=_watchdog_loop, daemon=True).start()
     threading.Thread(target=_heartbeat_loop, daemon=True).start()
-    threading.Thread(target=_ema_signal_loop, daemon=True).start()
+    # v0.5.0: остановлен по запросу — уходим от EMA-инверт как основной
+    # фичи, главная страница теперь только про пампы. Код движка остался в
+    # файле нетронутым (можно вернуть одной строкой), просто больше не
+    # крутится в фоне — не дёргает Gate.io и не может случайно открыть
+    # реальную сделку через _ema_maybe_open_live_trade без видимого UI.
+    # threading.Thread(target=_ema_signal_loop, daemon=True).start()
     threading.Thread(target=_pump_detect_loop, daemon=True).start()
+    threading.Thread(target=_weekly_ema_touch_loop, daemon=True).start()
 
     server = http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"{_C_GRN}Pump Radar v{APP_VERSION} — http://0.0.0.0:{PORT}{_C_RST}", flush=True)
