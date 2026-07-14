@@ -2943,6 +2943,14 @@ def _render_pump_chart_variant(candles, base_price, volume_mode="directional",
             xx += 10
         d.text((4, yy - 6), f"{v:.6g}", fill=text_color, font=font)
 
+    # правая ось — шкала объёма (только подписи, без своей сетки поверх
+    # левой — референс показывает именно такую пару осей: цена слева,
+    # объём справа, обе цифрами, но сетка одна общая)
+    for k in range(5):
+        vv = axis_min + (vmax - axis_min) * k / 4.0
+        yy = y_vol(vv)
+        d.text((W - pad_r + 4, yy - 6), f"{vv:,.0f}".replace(",", " "), fill=text_color, font=font)
+
     overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     od = ImageDraw.Draw(overlay)
     for series, color in ((red_s, red), (green_s, green)):
@@ -3236,6 +3244,10 @@ PUMP_MATCH_GRID_FLOOR_FRACS  = [0.0, 0.10, 0.15, 0.25]
 PUMP_MATCH_WINDOW_COARSE_STEP_MIN = 5
 PUMP_MATCH_WINDOW_REFINE_RADIUS_MIN = 10
 PUMP_MATCH_WINDOW_TOP_CANDIDATES = 3
+# указанная пользователем длительность — ориентир "на глаз", а не точная
+# цифра (жалоба с реального теста: конец графика обрезан короче референса)
+# — пробуем и её, и несколько соседних вариантов длины окна.
+PUMP_MATCH_DURATION_MULTIPLIERS = [0.7, 1.0, 1.3, 1.6, 2.0]
 # сетка стиля отрисовки перебирается полностью только для топ-N окон по
 # времени (иначе N_windows × полная_сетка растёт слишком быстро) — сам
 # поиск окна (дешёвый) всё равно смотрит на WINDOW_TOP_CANDIDATES позиций.
@@ -3553,33 +3565,51 @@ def _pil_to_png_bytes(img):
     return buf.getvalue()
 
 
+def _pm_color_balance_ratio(g_profile, r_profile):
+    """Доля красного в общей 'массе' цвета (сумма по всем столбцам) —
+    0 = совсем нет красного, 1 = совсем нет зелёного, 0.5 = поровну.
+    Используется отдельно от позиционной корреляции: Пирсон по столбцам
+    может дать приличный score, даже если один цвет в кандидате на самом
+    деле в разы тоньше/слабее эталона — он ловит СОВПАДЕНИЕ ПОЗИЦИЙ, а не
+    относительную СИЛУ цвета. Проверено на живом случае: dual_period давал
+    красный как тонкую подложку под зелёным (мат. так и должно быть — обе
+    линии из одного объёма, медленная EMA/RMA физически не может быть
+    выше быстрой на самом пике) и получал неоправданно высокий score."""
+    tg = sum(g_profile)
+    tr = sum(r_profile)
+    if tg + tr <= 0:
+        return 0.5
+    return tr / (tg + tr)
+
+
 def _pm_style_grid_search(candles, base_price, ref_g, ref_r):
     """Перебирает сетку параметров ОТРИСОВКИ (не времени) на уже
     зафиксированном наборе свечей и оценивает каждый вариант по цветовому
     профилю. Возвращает список результатов, отсортированный по score."""
+    ref_balance = _pm_color_balance_ratio(ref_g, ref_r)
     results = []
     for ff in PUMP_MATCH_GRID_FLOOR_FRACS:
         # directional: "none" один раз (период не важен), остальные методы — по сетке периодов
-        results.extend(_pm_try_variant(candles, base_price, ref_g, ref_r,
+        results.extend(_pm_try_variant(candles, base_price, ref_g, ref_r, ref_balance,
                                         "directional", "none", 1, None, ff))
         for method in PUMP_MATCH_GRID_SMOOTHING_METHODS:
             if method == "none":
                 continue
             for ep in PUMP_MATCH_GRID_EMA_PERIODS:
-                results.extend(_pm_try_variant(candles, base_price, ref_g, ref_r,
+                results.extend(_pm_try_variant(candles, base_price, ref_g, ref_r, ref_balance,
                                                 "directional", method, ep, None, ff))
         # dual_period: "none" бессмысленен (обе линии снова совпали бы) — только реальные методы сглаживания
         for method in PUMP_MATCH_GRID_SMOOTHING_METHODS:
             if method == "none":
                 continue
             for fast, slow in PUMP_MATCH_GRID_DUAL_PAIRS:
-                results.extend(_pm_try_variant(candles, base_price, ref_g, ref_r,
+                results.extend(_pm_try_variant(candles, base_price, ref_g, ref_r, ref_balance,
                                                 "dual_period", method, fast, slow, ff))
     results.sort(key=lambda r: r["score"], reverse=True)
     return results
 
 
-def _pm_try_variant(candles, base_price, ref_g, ref_r, vm, method, ep, ep_slow, ff):
+def _pm_try_variant(candles, base_price, ref_g, ref_r, ref_balance, vm, method, ep, ep_slow, ff):
     from PIL import Image
     try:
         png = _render_pump_chart_variant(candles, base_price, volume_mode=vm,
@@ -3591,10 +3621,21 @@ def _pm_try_variant(candles, base_price, ref_g, ref_r, vm, method, ep, ep_slow, 
         cg, cr = _pm_color_profile(cand_img)
         sg = _pm_pearson(ref_g, cg)
         sr = _pm_pearson(ref_r, cr)
+        cand_balance = _pm_color_balance_ratio(cg, cr)
+        # штраф за дисбаланс: 1.0 если доля красного у кандидата совпадает
+        # с эталоном, тем ниже, чем сильнее расходится (мат. разница до 1.0)
+        balance_score = 1.0 - abs(ref_balance - cand_balance)
     except Exception as e:
         olog(f"[pump_match] вариант vm={vm} method={method} ep={ep}/{ep_slow} ff={ff} упал: {e}")
         return []
-    return [{"score": (sg + sr) / 2, "score_g": sg, "score_r": sr,
+    position_score = (sg + sr) / 2
+    # 65% позиционное совпадение, 35% совпадение баланса цветов — баланс
+    # хуже определяет ТОЧНОЕ время, но грубо отсеивает структурно неверные
+    # гипотезы вроде dual_period на не-подходящих данных
+    final_score = position_score * 0.65 + balance_score * 0.35
+    return [{"score": final_score, "score_g": sg, "score_r": sr,
+              "balance_score": balance_score, "ref_balance": round(ref_balance, 3),
+              "cand_balance": round(cand_balance, 3),
               "volume_mode": vm, "smoothing_method": method, "ema_period": ep,
               "ema_period_slow": ep_slow, "floor_frac": ff, "png": png}]
 
@@ -3606,11 +3647,14 @@ def _pump_match_run(image_bytes, symbol, search_start_ts, search_end_ts,
          и профиль формы ценовой линии (для поиска времени);
       2) стянуть РЕАЛЬНЫЕ свечи одним широким запросом на весь диапазон
          поиска (а не заранее известное окно — пользователь его не знает);
-      3) найти несколько кандидатов на позицию окна нужной длины, сравнивая
-         форму цены (см. _pm_find_best_window);
+      3) найти несколько кандидатов на позицию И длину окна, сравнивая
+         форму цены (см. _pm_find_best_window) — сама duration_min от
+         пользователя лишь ОРИЕНТИР (на глаз по подписям оси), поэтому
+         пробуем и её саму, и несколько соседних вариантов длины;
       4) для лучших позиций окна перебрать сетку параметров ОТРИСОВКИ и
-         оценить по цветовому профилю;
-      5) сохранить и вернуть общий лучший результат (время + стиль)."""
+         оценить по цветовому профилю (включая штраф за дисбаланс
+         красный/зелёный — см. _pm_try_variant);
+      5) сохранить и вернуть общий лучший результат (время + длина + стиль)."""
     from PIL import Image
     try:
         ref_img = Image.open(io.BytesIO(image_bytes))
@@ -3621,30 +3665,45 @@ def _pump_match_run(image_bytes, symbol, search_start_ts, search_end_ts,
     ref_g, ref_r = _pm_color_profile(cropped)
     ref_price_profile = _pm_price_line_profile(cropped)
 
+    duration_base = max(3, int(duration_min))
     day_candles = _pm_fetch_candles_window(symbol, search_start_ts, search_end_ts)
-    duration_bars = max(3, int(duration_min))
-    if not day_candles or len(day_candles) < duration_bars + 1:
+    if not day_candles or len(day_candles) < duration_base + 1:
         return {"ok": False,
                 "msg": f"Не удалось получить достаточно свечей для '{symbol}' в диапазоне "
                        f"поиска (получено {len(day_candles) if day_candles else 0}, нужно "
-                       f"минимум {duration_bars+1}). Контракт может называться иначе на "
+                       f"минимум {duration_base+1}). Контракт может называться иначе на "
                        f"Gate.io (для монет с крошечной ценой часто есть множитель в имени, "
                        f"напр. 1000{symbol}), либо диапазон поиска слишком узкий."}
 
-    window_candidates = None
+    window_candidates = []  # список (score, start_idx, duration_bars)
     if ref_price_profile is not None:
-        window_candidates = _pm_find_best_window(day_candles, ref_price_profile, duration_bars)
+        for mult in PUMP_MATCH_DURATION_MULTIPLIERS:
+            dur = max(3, int(duration_base * mult))
+            if dur + 1 > len(day_candles):
+                continue
+            for score, start_idx in _pm_find_best_window(day_candles, ref_price_profile, dur):
+                window_candidates.append((score, start_idx, dur))
+        window_candidates.sort(key=lambda t: t[0], reverse=True)
+        # дедуп: одинаковая позиция+длина (в пределах половины шага уточнения) не повторяем
+        deduped = []
+        for score, start_idx, dur in window_candidates:
+            if any(abs(start_idx - s) < PUMP_MATCH_WINDOW_REFINE_RADIUS_MIN and dur == d
+                   for _, s, d in deduped):
+                continue
+            deduped.append((score, start_idx, dur))
+            if len(deduped) >= PUMP_MATCH_WINDOW_TOP_CANDIDATES:
+                break
+        window_candidates = deduped
     if not window_candidates:
         # не смогли распознать ценовую линию на скрине (или совпадений нет) —
-        # fail-open: просто берём последнее окно нужной длины в диапазоне
+        # fail-open: просто берём последнее окно базовой длины в диапазоне
         olog(f"[pump_match] {symbol}: не смог распознать/сопоставить ценовую линию — "
              f"беру последнее окно диапазона поиска как есть")
-        window_candidates = [(0.0, len(day_candles) - duration_bars)]
+        window_candidates = [(0.0, len(day_candles) - duration_base, duration_base)]
 
     all_style_results = []
-    window_info_by_start = {}
-    for win_score, start_idx in window_candidates[:PUMP_MATCH_STYLE_SEARCH_WINDOWS]:
-        window = day_candles[start_idx:start_idx + duration_bars]
+    for win_score, start_idx, dur in window_candidates[:PUMP_MATCH_STYLE_SEARCH_WINDOWS]:
+        window = day_candles[start_idx:start_idx + dur]
         base_price = base_price_override if base_price_override else min(c["close"] for c in window)
         style_results = _pm_style_grid_search(window, base_price, ref_g, ref_r)
         for r in style_results:
@@ -3654,7 +3713,6 @@ def _pump_match_run(image_bytes, symbol, search_start_ts, search_end_ts,
             r["base_price"] = base_price
             r["window"] = window
         all_style_results.extend(style_results)
-        window_info_by_start[start_idx] = window
 
     if not all_style_results:
         return {"ok": False, "msg": "Ни один вариант рендера не удалось построить (нет Pillow?)"}
@@ -3697,6 +3755,8 @@ def _pump_match_run(image_bytes, symbol, search_start_ts, search_end_ts,
             "volume_mode": r["volume_mode"], "smoothing_method": r["smoothing_method"],
             "ema_period": r["ema_period"],
             "ema_period_slow": r["ema_period_slow"], "floor_frac": r["floor_frac"],
+            "balance_score": round(r["balance_score"], 3), "ref_balance": r["ref_balance"],
+            "cand_balance": r["cand_balance"],
             "window_start": time.strftime("%H:%M", time.localtime(r["window"][0]["t"])),
             "window_end": time.strftime("%H:%M", time.localtime(r["window"][-1]["t"])),
             "png_b64": _pm_png_to_b64(r["png"]),
@@ -3802,8 +3862,8 @@ async function runMatch(){
       const paramsLine = c.volume_mode === 'dual_period'
         ? `dual_period, ${mLabel}: период ${c.ema_period}/${c.ema_period_slow} | floor_frac=${c.floor_frac}`
         : `directional, ${mLabel}${c.smoothing_method!=='none' ? ' период '+c.ema_period : ''} | floor_frac=${c.floor_frac}`;
-      div.innerHTML = `<div class="score">${i===0?'★ ЛУЧШИЙ — ':''}итог ${c.combined_score} (стиль ${c.score})</div>`
-        + `<div class="params">${paramsLine} | окно ${c.window_start}-${c.window_end} | (g=${c.score_g} r=${c.score_r})</div>`
+      div.innerHTML = `<div class="score">${i===0?'★ ЛУЧШИЙ — ':''}итог ${c.combined_score} (стиль ${c.score}, баланс ${c.balance_score})</div>`
+        + `<div class="params">${paramsLine} | окно ${c.window_start}-${c.window_end} | (g=${c.score_g} r=${c.score_r}) | доля красного: эталон ${c.ref_balance} / кандидат ${c.cand_balance}</div>`
         + `<img src="${c.png_b64}">`;
       resDiv.appendChild(div);
     });
