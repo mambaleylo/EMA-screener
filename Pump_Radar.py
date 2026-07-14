@@ -1,7 +1,28 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.8.0 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.10.0 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.10.0: по скринам стороннего "AI EMA SIGNALS" — добавлены Вход/Стоп/
+  Тейк (ATR-based, RR=1.5 по умолчанию — подсмотрено на их примере APE, где
+  риск/прибыль ≈ 1:1.5) в touch-записи _ema_touch_check_symbol, и картинка
+  к алерту вместо голого текста: _render_ema_touch_chart_png рисует свечи +
+  EMA7/14/28 линиями (синий/фиолетовый/золотой, как у референса) + пункти-
+  рные уровни Вход/Стоп/Тейк + белая точка на текущей цене, тёмная тема.
+  Алерт теперь уходит через _send_alert_photo вместо текстового _send_alert
+  (с тем же текстом в подписи). Таблица на главной странице получила
+  колонки Вход/Стоп/Тейк.
+- v0.9.0: по запросу (сообщение пришло со съехавшей раскладкой, расшифровано
+  как "касания надо отслеживать как на недельке, так и на дневке? работаем
+  только в шорт") — Weekly EMA Touch Watcher переименован в Weekly/Daily,
+  сканирует ОБА таймфрейма (EMA_TOUCH_TIMEFRAMES = ["1w","1d"]), и в LIVE-
+  алертах фильтрует только SHORT-касания (EMA_TOUCH_LIVE_ONLY_SHORT=True —
+  подход снизу вверх, тест сопротивления); long-касания больше не алертят.
+  _weekly_ema_check_symbol обобщена в _ema_touch_check_symbol(symbol, tf) —
+  общая логика на оба ТФ, отдельный кулдаун для дневного (короче недельного,
+  раз дневной график быстрее меняется). Weekly EMA Backtest тоже получил
+  параметр tf ("1w"/"1d", выбирается на странице) — там long НЕ фильтруется
+  (обе стороны видны в by_bias для сравнения), результаты по разным ТФ
+  сохраняются в отдельные файлы, не перезаписывают друг друга.
 - v0.8.0: ВАЖНАЯ поправка методики Weekly EMA Backtest по прямому запросу —
   сигнал ищется на недельном графике, но сделка НЕ держится неделями:
   реальная торговля — мгновенная реакция на 3-4%, иногда 6-10%, сделки на
@@ -136,7 +157,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.8.0"
+APP_VERSION  = "0.10.0"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2193,10 +2214,10 @@ details[open] summary:before{content:"▾ "}
 </div>
 
 <div class="section-card">
-  <h3>&#128204; Касания EMA7/14/28 (недельный график)</h3>
+  <h3>&#128204; Касания EMA7/14/28 (неделя + день, только SHORT)</h3>
   <div id="weeklyEmaSummary" class="summary-line">пока не было срабатываний</div>
   <div class="table-scroll">
-    <table id="weeklyEma"><thead><tr><th>Монета</th><th>EMA</th><th>Цена</th><th>Расст. (ATR)</th><th>Подход</th><th>Тренд</th><th>Когда</th></tr></thead><tbody></tbody></table>
+    <table id="weeklyEma"><thead><tr><th>Монета</th><th>ТФ</th><th>EMA</th><th>Цена</th><th>Вход</th><th>Стоп</th><th>Тейк</th><th>Расст. (ATR)</th><th>Подход</th><th>Тренд</th><th>Когда</th></tr></thead><tbody></tbody></table>
   </div>
 </div>
 
@@ -2282,9 +2303,10 @@ async function refreshWeeklyEma(){
     const ladderLabel = {up:'&#8593; вверх', down:'&#8595; вниз'};
     const biasLabel = {short:'<span style="color:#f85149">снизу вверх → SHORT</span>',
                         long:'<span style="color:#3fb950">сверху вниз → LONG</span>'};
+    const tfLabel = {'1w':'Неделя', '1d':'День'};
     for(const it of items.slice(0,50)){
       const tr = document.createElement('tr');
-      tr.innerHTML = `<td>${it.symbol}</td><td>EMA${it.period}</td><td>${it.price}</td><td>${it.dist_atr}</td><td>${biasLabel[it.classic_bias]||'—'}</td><td>${ladderLabel[it.ladder]||'—'}</td><td>${fmtAgo(it.ts)}</td>`;
+      tr.innerHTML = `<td>${it.symbol}</td><td>${tfLabel[it.tf]||it.tf||'—'}</td><td>EMA${it.period}</td><td>${it.price}</td><td>${it.entry??'—'}</td><td style="color:#f85149">${it.stop??'—'}</td><td style="color:#3fb950">${it.take??'—'}</td><td>${it.dist_atr}</td><td>${biasLabel[it.classic_bias]||'—'}</td><td>${ladderLabel[it.ladder]||'—'}</td><td>${fmtAgo(it.ts)}</td>`;
       tbody.appendChild(tr);
     }
   }catch(e){}
@@ -3403,47 +3425,64 @@ def _pump_detect_loop():
         time.sleep(PUMP_DETECT_POLL_SEC)
 # ─── конец Live Pump Detector ───────────────────────────────────────────────
 
-# ─── Weekly EMA Touch Watcher ───────────────────────────────────────────────
+# ─── Weekly/Daily EMA Touch Watcher ─────────────────────────────────────────
 # Отдельный, независимый ни от Pump Detector, ни от (остановленного) EMA-
 # инверт движка сканер: раз в WEEKLY_EMA_SCAN_POLL_SEC проверяет топ-N монет
-# по объёму на касание ценой EMA7/14/28 на НЕДЕЛЬНОМ графике (те самые
-# уровни, которые в исходном EMA Bounce Dossier называются "границей
-# локального тренда") и шлёт текстовый алерт в Telegram. Чисто
-# информационно — не сигнал на вход, не завязан на автоторговлю.
+# по объёму на касание ценой EMA7/14/28 — теперь на ДВУХ таймфреймах разом
+# (недельный и дневной, по прямому запросу), не только на недельном — и
+# шлёт текстовый алерт в Telegram. Чисто информационно — не сигнал на вход,
+# не завязан на автоторговлю.
 WEEKLY_EMA_PERIODS = [7, 14, 28]
-WEEKLY_EMA_TOUCH_ATR = 0.25       # тот же допуск касания, что и в исходном движке
-WEEKLY_EMA_SCAN_POLL_SEC = 1800   # раз в 30 минут — недельный график быстро не меняется
+WEEKLY_EMA_TOUCH_ATR = 0.25       # тот же допуск касания на обоих ТФ (это доля ATR ЭТОГО же ТФ, масштаб уже учтён)
+# Вход/Стоп/Тейк по ATR — подсмотрено у стороннего "AI EMA SIGNALS" (реальный
+# пример APE: риск 0.0077/прибыль 0.0115 ≈ RR 1.5). Свои множители, не их
+# точные цифры — мы не знаем их формулу, ATR-based даёт масштаб под
+# конкретную волатильность монеты вместо фиксированного % для всех.
+EMA_TOUCH_STOP_ATR_MULT = 1.5     # стоп = цена входа ± 1.5×ATR(14) этого ТФ
+EMA_TOUCH_RR = 1.5                # тейк = стоп-дистанция × RR в прибыльную сторону
+WEEKLY_EMA_SCAN_POLL_SEC = 1800   # раз в 30 минут
 WEEKLY_EMA_SCAN_TOP_N = 100
 WEEKLY_EMA_FETCH_DAYS = 400       # с запасом под EMA28 на неделях (~28 недель=196 дней) + история ATR
-WEEKLY_EMA_TOUCH_COOLDOWN_SEC = 24 * 3600  # не спамить чаще раза в сутки по той же связке символ+уровень
+DAILY_EMA_FETCH_DAYS = 120        # с запасом под EMA28 на днях (28 дней) + история ATR — намного короче
+WEEKLY_EMA_TOUCH_COOLDOWN_SEC = 24 * 3600   # недельный ТФ: не спамить чаще раза в сутки по той же связке
+DAILY_EMA_TOUCH_COOLDOWN_SEC = 8 * 3600     # дневной ТФ движется быстрее — кулдаун короче
+EMA_TOUCH_TIMEFRAMES = ["1w", "1d"]         # какие ТФ сканирует live-вотчер
+# "работаем только в шорт" — в LIVE-алертах фильтруем на только те касания,
+# где классический bias == short (подход снизу вверх, тест сопротивления).
+# В бэктесте long НЕ фильтруется (см. by_bias) — там обе стороны видны для
+# сравнения, полезно проверить эмпирически, действительно ли short лучше.
+EMA_TOUCH_LIVE_ONLY_SHORT = True
 
 _weekly_ema_touch_lock = threading.Lock()
-_weekly_ema_touch_state = {}   # "symbol|period" -> last_alert_ts
+_weekly_ema_touch_state = {}   # "symbol|tf|period" -> last_alert_ts
 _weekly_ema_recent = []        # последние сработавшие касания — для /weekly_ema_status
 WEEKLY_EMA_HISTORY_FILE = os.path.expanduser("~/pumpradar_weekly_ema_history.json")
 
 
-def _weekly_ema_check_symbol(symbol):
-    """Тянет дневные свечи, ресемплит в недельные (_resample_to_weekly),
-    считает EMA7/14/28 и ATR(14) на недельном ТФ, проверяет касание живой
-    ценой любого из трёх уровней (цена экстраполирует EMA на текущий
-    момент через _ema_live_value — та же логика, что в исходном движке,
-    просто переиспользована здесь как чистая функция). Для каждого касания
-    также определяет СТОРОНУ подхода (по предыдущей закрытой недельной
-    свече — была она выше или ниже уровня) и классическую bounce-трактовку
-    (снизу вверх = тест сопротивления = short-ожидание отскока; сверху вниз
-    = тест поддержки = long-ожидание отскока) — это ИНФОРМАЦИЯ о контексте,
-    не готовый сигнал (сам пробой вместо отскока — ровно то, что проверял
-    invert-форк этого же движка, здесь такого фильтра нет). Возвращает
-    список touch-записей (может быть больше одной, если цена одновременно
-    у нескольких уровней) или пустой список."""
-    raw = _fetch_candles(symbol, "1d", WEEKLY_EMA_FETCH_DAYS)
-    weekly = _resample_to_weekly(raw)
-    if len(weekly) < max(WEEKLY_EMA_PERIODS) + 5:
+def _ema_touch_check_symbol(symbol, tf="1w"):
+    """Тянет дневные свечи (ресемплит в недельные, если tf="1w" — иначе
+    использует как есть), считает EMA7/14/28 и ATR(14) на нужном ТФ,
+    проверяет касание живой ценой любого из трёх уровней (цена
+    экстраполирует EMA на текущий момент через _ema_live_value — та же
+    логика, что в исходном движке, просто переиспользована здесь как
+    чистая функция). Для каждого касания также определяет СТОРОНУ подхода
+    (по предыдущей закрытой свече — была она выше или ниже уровня) и
+    классическую bounce-трактовку (снизу вверх = тест сопротивления =
+    short-ожидание отскока; сверху вниз = тест поддержки = long-ожидание
+    отскока), плюс конкретные Вход/Стоп/Тейк по ATR (RR по умолчанию ~1.5,
+    подсмотрено у стороннего "AI EMA SIGNALS" — на их примере APE
+    вход/стоп/тейк дали риск 0.0077/прибыль 0.0115 ≈ RR 1.5) — это
+    ИНФОРМАЦИЯ о контексте, не готовый сигнал на автоторговлю (её тут нет).
+    Возвращает список touch-записей (может быть больше одной, если цена
+    одновременно у нескольких уровней) или пустой список."""
+    fetch_days = WEEKLY_EMA_FETCH_DAYS if tf == "1w" else DAILY_EMA_FETCH_DAYS
+    raw = _fetch_candles(symbol, "1d", fetch_days)
+    candles = _resample_to_weekly(raw) if tf == "1w" else raw
+    if len(candles) < max(WEEKLY_EMA_PERIODS) + 5:
         return []
-    closes = [c["close"] for c in weekly]
-    atr_arr = _atr(weekly, 14)
-    i = len(weekly) - 1
+    closes = [c["close"] for c in candles]
+    atr_arr = _atr(candles, 14)
+    i = len(candles) - 1
     atr_v = atr_arr[i]
     if not atr_v:
         return []
@@ -3465,13 +3504,149 @@ def _weekly_ema_check_symbol(symbol):
             prev_ema = ema_arr[i - 1] if (i > 0 and ema_arr[i - 1] is not None) else ema_closed
             side = "from_below" if prev_close < prev_ema else "from_above"
             classic_bias = "short" if side == "from_below" else "long"
+            stop_dist = EMA_TOUCH_STOP_ATR_MULT * atr_v
+            if classic_bias == "short":
+                entry, stop, take = price, price + stop_dist, price - stop_dist * EMA_TOUCH_RR
+            else:
+                entry, stop, take = price, price - stop_dist, price + stop_dist * EMA_TOUCH_RR
             touches.append({
-                "symbol": symbol, "period": period, "price": price,
+                "symbol": symbol, "tf": tf, "period": period, "price": price,
                 "ema_value": ema_now, "dist_atr": round(dist / atr_v, 3),
                 "ladder": ladder, "side": side, "classic_bias": classic_bias,
-                "week_t": weekly[i]["t"],
+                "entry": _round_price(entry), "stop": _round_price(stop),
+                "take": _round_price(take), "rr": EMA_TOUCH_RR,
+                "week_t": candles[i]["t"],
+                "candles": candles, "ema_arrays": ema_arrays, "bar_i": i,
             })
     return touches
+
+
+def _render_ema_touch_chart_png(touch, lookback=50):
+    """Свечи + 3 линии EMA (7/14/28) поверх + пунктирные уровни Вход/Стоп/
+    Тейк + белая точка на текущей цене — в стиле стороннего "AI EMA
+    SIGNALS" (тёмная тема, не белый фон как у Pump-чартов). Требует
+    Pillow — если недоступен, возвращает None (тогда _send_alert_photo
+    сама откатится на текстовый алерт)."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return None
+    candles = touch.get("candles")
+    ema_arrays = touch.get("ema_arrays")
+    bar_i = touch.get("bar_i")
+    if not candles or not ema_arrays or bar_i is None:
+        return None
+
+    W, H = 960, 620
+    pad_l, pad_r, pad_t, pad_b = 60, 60, 50, 130
+    bg = (13, 13, 18)
+    grid_color = (40, 40, 48)
+    text_color = (200, 200, 205)
+    green = (46, 189, 133)
+    red = (240, 90, 90)
+    ema_colors = {7: (66, 133, 244), 14: (156, 120, 230), 28: (230, 168, 60)}
+    entry_col = (80, 210, 120)
+    stop_col = (230, 90, 90)
+    take_col = (100, 220, 140)
+
+    entry, stop, take = touch["entry"], touch["stop"], touch["take"]
+    lo = max(0, bar_i - lookback + 1)
+    window = candles[lo:bar_i + 1]
+    n = len(window)
+    if n < 2:
+        return None
+    ema_window = {p: arr[lo:bar_i + 1] for p, arr in ema_arrays.items()}
+
+    highs = [c["high"] for c in window]
+    lows = [c["low"] for c in window]
+    all_vals = highs + lows + [entry, stop, take]
+    for arr in ema_window.values():
+        all_vals += [v for v in arr if v is not None]
+    pmin, pmax = min(all_vals), max(all_vals)
+    if pmax <= pmin:
+        pmax = pmin + max(abs(pmin) * 0.001, 1e-9)
+    pad_range = (pmax - pmin) * 0.08
+    pmin -= pad_range
+    pmax += pad_range
+
+    img = Image.new("RGB", (W, H), bg)
+    d = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+
+    plot_w = W - pad_l - pad_r
+    plot_h = H - pad_t - pad_b
+
+    def x_of(i):
+        return pad_l + (i / (n - 1) * plot_w if n > 1 else plot_w / 2)
+
+    def y_of(v):
+        return pad_t + (pmax - v) / (pmax - pmin) * plot_h
+
+    for k in range(5):
+        v = pmin + (pmax - pmin) * k / 4.0
+        yy = y_of(v)
+        d.line([(pad_l, yy), (W - pad_r, yy)], fill=grid_color, width=1)
+        d.text((4, yy - 5), f"{v:.6g}", fill=text_color, font=font)
+
+    body_w = max(2, plot_w / n * 0.55)
+    for i, c in enumerate(window):
+        xc = x_of(i)
+        bullish = c["close"] >= c["open"]
+        color = green if bullish else red
+        d.line([(xc, y_of(c["high"])), (xc, y_of(c["low"]))], fill=color, width=1)
+        y_o, y_c = y_of(c["open"]), y_of(c["close"])
+        ytop, ybot = min(y_o, y_c), max(y_o, y_c)
+        if ybot - ytop < 1.5:
+            ybot = ytop + 1.5
+        d.rectangle([xc - body_w / 2, ytop, xc + body_w / 2, ybot], fill=color)
+
+    for p in (7, 14, 28):
+        pts = [(x_of(i), y_of(v)) for i, v in enumerate(ema_window.get(p, [])) if v is not None]
+        if len(pts) >= 2:
+            d.line(pts, fill=ema_colors[p], width=2)
+
+    def dashed_hline(v, color, label):
+        yy = y_of(v)
+        xx = pad_l
+        while xx < W - pad_r:
+            d.line([(xx, yy), (min(xx + 7, W - pad_r), yy)], fill=color, width=2)
+            xx += 12
+        d.text((W - pad_r + 4, yy - 5), label, fill=color, font=font)
+    dashed_hline(entry, entry_col, "ВХОД")
+    dashed_hline(stop, stop_col, "СТОП")
+    dashed_hline(take, take_col, "ТЕЙК")
+
+    last_x, last_y = x_of(n - 1), y_of(window[-1]["close"])
+    d.ellipse([last_x - 4, last_y - 4, last_x + 4, last_y + 4], fill=(255, 255, 255))
+
+    tf_label = "W" if touch["tf"] == "1w" else "D"
+    title = f"{touch['symbol']} | EMA{touch['period']}({tf_label}) | {touch['classic_bias'].upper()}"
+    d.text((pad_l, 10), title, fill=(255, 255, 255), font=font)
+
+    lx = pad_l
+    for p in (7, 14, 28):
+        d.line([(lx, 30), (lx + 16, 30)], fill=ema_colors[p], width=2)
+        d.text((lx + 20, 25), f"EMA{p}", fill=text_color, font=font)
+        lx += 70
+
+    step = max(1, n // 8)
+    for i in range(0, n, step):
+        xx = x_of(i)
+        lbl = time.strftime("%m-%d", time.localtime(window[i]["t"]))
+        d.text((xx - 16, H - pad_b + 8), lbl, fill=text_color, font=font)
+
+    ty = H - pad_b + 30
+    d.text((pad_l, ty), f"Цена: {touch['price']:.6g}", fill=text_color, font=font)
+    d.text((pad_l, ty + 14), f"Вход: {entry:.6g}", fill=entry_col, font=font)
+    d.text((pad_l, ty + 28), f"Стоп: {stop:.6g}  (RR {touch.get('rr', EMA_TOUCH_RR)})", fill=stop_col, font=font)
+    d.text((pad_l, ty + 42), f"Тейк: {take:.6g}", fill=take_col, font=font)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 def _weekly_ema_fire_alert(touch):
@@ -3482,17 +3657,28 @@ def _weekly_ema_fire_alert(touch):
                  else "сверху вниз, тест поддержки")
     bias_note = "классический bounce-контекст: SHORT" if touch["classic_bias"] == "short" \
                 else "классический bounce-контекст: LONG"
-    msg = (f"📐 <b>{touch['symbol']}</b> — касание EMA{touch['period']} на НЕДЕЛЬНОМ графике\n"
+    tf_label = "НЕДЕЛЬНОМ" if touch["tf"] == "1w" else "ДНЕВНОМ"
+    msg = (f"📐 <b>{touch['symbol']}</b> — касание EMA{touch['period']} на {tf_label} графике\n"
            f"Цена: {_fmt_px(touch['price'])} | EMA{touch['period']}: {_fmt_px(touch['ema_value'])}\n"
+           f"Вход: {_fmt_px(touch['entry'])} | Стоп: {_fmt_px(touch['stop'])} | "
+           f"Тейк: {_fmt_px(touch['take'])} (RR {touch['rr']})\n"
            f"Расстояние: {touch['dist_atr']} ATR | подход {side_note}\n"
            f"{bias_note} (если сыграет отскок, а не пробой) | {ladder_note}")
-    _send_alert(msg)
-    olog(f"[weekly_ema] {touch['symbol']}: касание EMA{touch['period']} "
+    png = None
+    try:
+        png = _render_ema_touch_chart_png(touch)
+    except Exception as e:
+        olog(f"[weekly_ema] {touch['symbol']}: ошибка рендера графика: {e}")
+    _send_alert_photo(png, msg)
+    olog(f"[weekly_ema] {touch['symbol']}: касание EMA{touch['period']} на {touch['tf']} "
          f"(dist={touch['dist_atr']} ATR, side={touch['side']}) — алерт отправлен")
-    rec = {"ts": int(time.time()), "symbol": touch["symbol"], "period": touch["period"],
+    rec = {"ts": int(time.time()), "symbol": touch["symbol"], "tf": touch["tf"],
+           "period": touch["period"],
            "price": touch["price"], "ema_value": touch["ema_value"],
            "dist_atr": touch["dist_atr"], "ladder": touch["ladder"],
-           "side": touch["side"], "classic_bias": touch["classic_bias"]}
+           "side": touch["side"], "classic_bias": touch["classic_bias"],
+           "entry": touch["entry"], "stop": touch["stop"], "take": touch["take"],
+           "rr": touch["rr"]}
     global _weekly_ema_recent
     _weekly_ema_recent.append(rec)
     _weekly_ema_recent = _weekly_ema_recent[-200:]
@@ -3519,24 +3705,28 @@ def _weekly_ema_touch_loop():
             symbols = _fetch_all_symbols()[:WEEKLY_EMA_SCAN_TOP_N]
             now = time.time()
             for symbol in symbols:
-                try:
-                    touches = _weekly_ema_check_symbol(symbol)
-                except Exception as e:
-                    olog(f"[weekly_ema] {symbol}: ошибка проверки: {e}")
-                    continue
-                for touch in touches:
-                    key = f"{symbol}|{touch['period']}"
-                    with _weekly_ema_touch_lock:
-                        last = _weekly_ema_touch_state.get(key, 0)
-                    if now - last < WEEKLY_EMA_TOUCH_COOLDOWN_SEC:
+                for tf in EMA_TOUCH_TIMEFRAMES:
+                    try:
+                        touches = _ema_touch_check_symbol(symbol, tf)
+                    except Exception as e:
+                        olog(f"[weekly_ema] {symbol} {tf}: ошибка проверки: {e}")
                         continue
-                    _weekly_ema_fire_alert(touch)
-                    with _weekly_ema_touch_lock:
-                        _weekly_ema_touch_state[key] = now
+                    cooldown = WEEKLY_EMA_TOUCH_COOLDOWN_SEC if tf == "1w" else DAILY_EMA_TOUCH_COOLDOWN_SEC
+                    for touch in touches:
+                        if EMA_TOUCH_LIVE_ONLY_SHORT and touch["classic_bias"] != "short":
+                            continue   # "работаем только в шорт" — long-касания не алертим
+                        key = f"{symbol}|{tf}|{touch['period']}"
+                        with _weekly_ema_touch_lock:
+                            last = _weekly_ema_touch_state.get(key, 0)
+                        if now - last < cooldown:
+                            continue
+                        _weekly_ema_fire_alert(touch)
+                        with _weekly_ema_touch_lock:
+                            _weekly_ema_touch_state[key] = now
         except Exception as e:
             olog(f"[weekly_ema] ошибка цикла: {e}")
         time.sleep(WEEKLY_EMA_SCAN_POLL_SEC)
-# ─── конец Weekly EMA Touch Watcher ─────────────────────────────────────────
+# ─── конец Weekly/Daily EMA Touch Watcher ───────────────────────────────────
 
 # ─── Weekly EMA Backtest ─────────────────────────────────────────────────────
 # По запросу: "исторически прогнать все возможные сигналы и посмотреть куда
@@ -3564,17 +3754,21 @@ WEEKLY_EMA_BACKTEST_TOP_N = 100
 WEEKLY_EMA_REACTION_WINDOW_MIN = 180       # сколько минут после касания проверяем реакцию (3ч, с запасом над "час максимум")
 WEEKLY_EMA_REACTION_THRESHOLDS = [3, 4, 6, 10]   # % цели, запрошенные явно
 WEEKLY_EMA_REACTION_MAX_AGE_DAYS = 90      # старше — не пытаемся тянуть 1m (почти наверняка их уже нет у биржи)
-WEEKLY_EMA_BACKTEST_FILE = os.path.expanduser("~/pumpradar_weekly_ema_backtest.json")
+WEEKLY_EMA_BACKTEST_FILE_TEMPLATE = os.path.expanduser("~/pumpradar_ema_backtest_{tf}.json")
+
+def _weekly_ema_backtest_file(tf):
+    return WEEKLY_EMA_BACKTEST_FILE_TEMPLATE.format(tf=tf.replace("/", "_"))
 
 
-def _weekly_ema_detect_signals(weekly):
-    """Проходит недельные свечи ОДИН РАЗ (без заглядывания вперёд) и находит
-    все touch-события. Возвращает (signals, closes)."""
-    closes = [c["close"] for c in weekly]
-    atr_arr = _atr(weekly, 14)
+def _weekly_ema_detect_signals(candles):
+    """Проходит свечи (недельные ИЛИ дневные — общая логика для обоих ТФ)
+    ОДИН РАЗ (без заглядывания вперёд) и находит все touch-события.
+    Возвращает (signals, closes)."""
+    closes = [c["close"] for c in candles]
+    atr_arr = _atr(candles, 14)
     ema_arrays = {p: _ema(closes, p) for p in WEEKLY_EMA_PERIODS}
     signals = []
-    n = len(weekly)
+    n = len(candles)
     start = max(WEEKLY_EMA_PERIODS) + 1
     i = start
     while i < n:
@@ -3595,7 +3789,7 @@ def _weekly_ema_detect_signals(weekly):
                 side = "from_below" if closes[i - 1] < prev_ema else "from_above"
                 bias = "short" if side == "from_below" else "long"
                 signals.append({"i": i, "period": period, "side": side, "bias": bias,
-                                 "entry": closes[i], "week_t": weekly[i]["t"]})
+                                 "entry": closes[i], "week_t": candles[i]["t"]})
                 fired_here = True
         i += WEEKLY_EMA_BACKTEST_DEDUP_WEEKS if fired_here else 1
     return signals, closes
@@ -3641,15 +3835,16 @@ def _weekly_ema_evaluate_intraday(signal, symbol, window_min=WEEKLY_EMA_REACTION
     return out
 
 
-def _weekly_ema_backtest_symbol(symbol, days=WEEKLY_EMA_BACKTEST_DAYS,
+def _weekly_ema_backtest_symbol(symbol, tf="1w", days=WEEKLY_EMA_BACKTEST_DAYS,
                                  window_min=WEEKLY_EMA_REACTION_WINDOW_MIN,
                                  thresholds=WEEKLY_EMA_REACTION_THRESHOLDS,
                                  max_age_days=WEEKLY_EMA_REACTION_MAX_AGE_DAYS):
-    raw = _fetch_candles(symbol, "1d", days)
-    weekly = _resample_to_weekly(raw)
-    if len(weekly) < max(WEEKLY_EMA_PERIODS) + 5:
+    fetch_days = days if tf == "1w" else min(days, DAILY_EMA_FETCH_DAYS * 3)
+    raw = _fetch_candles(symbol, "1d", fetch_days)
+    candles = _resample_to_weekly(raw) if tf == "1w" else raw
+    if len(candles) < max(WEEKLY_EMA_PERIODS) + 5:
         return []
-    signals, closes = _weekly_ema_detect_signals(weekly)
+    signals, closes = _weekly_ema_detect_signals(candles)
     cutoff_ts = time.time() - max_age_days * 86400
     for s in signals:
         if s["week_t"] < cutoff_ts:
@@ -3691,18 +3886,19 @@ def _weekly_ema_aggregate_symbol(signals, thresholds=WEEKLY_EMA_REACTION_THRESHO
     return result
 
 
-def _weekly_ema_backtest_run(symbols, days=WEEKLY_EMA_BACKTEST_DAYS,
+def _weekly_ema_backtest_run(symbols, tf="1w", days=WEEKLY_EMA_BACKTEST_DAYS,
                               window_min=WEEKLY_EMA_REACTION_WINDOW_MIN,
                               thresholds=WEEKLY_EMA_REACTION_THRESHOLDS,
                               max_age_days=WEEKLY_EMA_REACTION_MAX_AGE_DAYS,
                               progress_cb=None):
-    """Прогоняет бэктест по списку монет, возвращает {symbol: агрегат}.
-    progress_cb(done, total), если передан, вызывается после каждой монеты."""
+    """Прогоняет бэктест по списку монет на указанном ТФ ("1w" или "1d"),
+    возвращает {symbol: агрегат}. progress_cb(done, total), если передан,
+    вызывается после каждой монеты."""
     results = {}
     total = len(symbols)
     for idx, symbol in enumerate(symbols):
         try:
-            signals = _weekly_ema_backtest_symbol(symbol, days=days, window_min=window_min,
+            signals = _weekly_ema_backtest_symbol(symbol, tf=tf, days=days, window_min=window_min,
                                                    thresholds=thresholds, max_age_days=max_age_days)
             if signals:
                 results[symbol] = _weekly_ema_aggregate_symbol(signals, thresholds)
@@ -3733,21 +3929,21 @@ def _weekly_ema_backtest_new_job():
     return job_id
 
 
-def _weekly_ema_backtest_run_background(job_id, symbols, days, window_min, thresholds, max_age_days):
+def _weekly_ema_backtest_run_background(job_id, symbols, tf, days, window_min, thresholds, max_age_days):
     def progress_cb(done, total):
         with _weekly_ema_backtest_jobs_lock:
             if job_id in _weekly_ema_backtest_jobs:
                 _weekly_ema_backtest_jobs[job_id]["done"] = done
                 _weekly_ema_backtest_jobs[job_id]["total"] = total
     try:
-        results = _weekly_ema_backtest_run(symbols, days=days, window_min=window_min,
+        results = _weekly_ema_backtest_run(symbols, tf=tf, days=days, window_min=window_min,
                                             thresholds=thresholds, max_age_days=max_age_days,
                                             progress_cb=progress_cb)
-        payload = {"ok": True, "thresholds": thresholds, "window_min": window_min,
+        payload = {"ok": True, "tf": tf, "thresholds": thresholds, "window_min": window_min,
                    "max_age_days": max_age_days, "results": results,
                    "generated_at": int(time.time())}
         try:
-            with open(WEEKLY_EMA_BACKTEST_FILE, "w") as f:
+            with open(_weekly_ema_backtest_file(tf), "w") as f:
                 json.dump(payload, f)
         except Exception as e:
             olog(f"[weekly_ema_backtest] ⚠ не смог сохранить результат: {e}")
@@ -4585,9 +4781,14 @@ tbody tr:hover{background:#1c2128}
 <p style="color:#d29922;font-size:12px;max-width:480px">⚠️ У биржи почти наверняка нет 1m-истории на годы назад — реакцию можно проверить только для сравнительно недавних касаний (см. "макс. давность сигнала" ниже). Для более старых сигналов факт касания всё равно посчитается (total_signals), но в винрейт по реакции они не попадут — это видно по числу "evaluable" в скобках у каждой ячейки.</p>
 
 <div class="card">
+  <label>Таймфрейм для поиска касаний</label>
+  <select id="btTf">
+    <option value="1w" selected>Недельный</option>
+    <option value="1d">Дневной</option>
+  </select>
   <label>Сколько монет по объёму (топ-N)</label>
   <input type="number" id="btTopN" value="100" min="1" max="500">
-  <label>Глубина недельной истории для поиска касаний, дней</label>
+  <label>Глубина истории для поиска касаний, дней</label>
   <input type="number" id="btDays" value="1500" min="200" max="5000">
   <label>Макс. давность сигнала для проверки реакции, дней (старше — 1m почти наверняка недоступны)</label>
   <input type="number" id="btMaxAgeDays" value="90" min="1" max="1000">
@@ -4675,6 +4876,7 @@ function renderTable(){
 
 async function runBacktest(){
   const statusEl = document.getElementById('status');
+  const tf = document.getElementById('btTf').value;
   const topN = document.getElementById('btTopN').value;
   const days = document.getElementById('btDays').value;
   const maxAgeDays = document.getElementById('btMaxAgeDays').value;
@@ -4683,7 +4885,7 @@ async function runBacktest(){
   statusEl.innerText = 'Запускаю бэктест...';
   try{
     const r = await fetch('/weekly_ema_backtest_run', {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({top_n: parseInt(topN), days: parseInt(days), max_age_days: parseInt(maxAgeDays),
+      body: JSON.stringify({tf: tf, top_n: parseInt(topN), days: parseInt(days), max_age_days: parseInt(maxAgeDays),
                              window_min: parseInt(windowMin), thresholds: thresholds})});
     const d = await r.json();
     if(!d.ok){ statusEl.innerText = '❌ ' + d.msg; return; }
@@ -4719,19 +4921,25 @@ async function pollStatus(jobId){
 document.getElementById('btMinSignals').addEventListener('change', renderTable);
 document.getElementById('btSortThreshold').addEventListener('change', renderTable);
 
-// подхватываем последний сохранённый результат при загрузке страницы
-(async () => {
+// подхватываем последний сохранённый результат ДЛЯ ВЫБРАННОГО ТФ
+async function loadLastForCurrentTf(){
+  const tf = document.getElementById('btTf').value;
   try{
-    const r = await fetch('/weekly_ema_backtest_last');
+    const r = await fetch('/weekly_ema_backtest_last?tf=' + tf);
     const d = await r.json();
     if(d.ok !== false && d.results){
       lastResults = d;
       renderTable();
     } else {
+      lastResults = null;
+      document.querySelector('#resultsTable tbody').innerHTML = '';
+      document.getElementById('status').innerText = d.msg || 'Бэктест для этого ТФ ещё не запускался';
       rebuildHeadAndSortOptions();
     }
   }catch(e){ rebuildHeadAndSortOptions(); }
-})();
+}
+document.getElementById('btTf').addEventListener('change', loadLastForCurrentTf);
+loadLastForCurrentTf();
 </script></body></html>"""
 
 
@@ -5030,14 +5238,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             else:
                 self._json({"ok": True, "status": job["status"], "done": job["done"],
                             "total": job["total"], "result": job["result"]})
-        elif self.path == "/weekly_ema_backtest_last":
+        elif self.path.startswith("/weekly_ema_backtest_last"):
             # последний сохранённый результат бэктеста (переживает рестарт процесса)
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            tf = (params.get("tf") or ["1w"])[0]
             try:
-                if os.path.exists(WEEKLY_EMA_BACKTEST_FILE):
-                    with open(WEEKLY_EMA_BACKTEST_FILE) as f:
+                fpath = _weekly_ema_backtest_file(tf)
+                if os.path.exists(fpath):
+                    with open(fpath) as f:
                         self._json(json.load(f))
                 else:
-                    self._json({"ok": False, "msg": "Бэктест ещё не запускался"})
+                    self._json({"ok": False, "msg": f"Бэктест для {tf} ещё не запускался"})
             except Exception as e:
                 self._json({"ok": False, "msg": str(e)})
         else:
@@ -5158,6 +5370,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         elif self.path == "/weekly_ema_backtest_run":
             try:
+                tf = (body.get("tf") or "1w").strip()
+                if tf not in ("1w", "1d"):
+                    self._json({"ok": False, "msg": "tf должен быть '1w' или '1d'"}); return
                 top_n = int(body.get("top_n") or WEEKLY_EMA_BACKTEST_TOP_N)
                 days = int(body.get("days") or WEEKLY_EMA_BACKTEST_DAYS)
                 window_min = int(body.get("window_min") or WEEKLY_EMA_REACTION_WINDOW_MIN)
@@ -5176,7 +5391,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             job_id = _weekly_ema_backtest_new_job()
             threading.Thread(
                 target=_weekly_ema_backtest_run_background,
-                args=(job_id, symbols, days, window_min, thresholds, max_age_days),
+                args=(job_id, symbols, tf, days, window_min, thresholds, max_age_days),
                 daemon=True,
             ).start()
             self._json({"ok": True, "job_id": job_id, "symbols_count": len(symbols)})
