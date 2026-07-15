@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.16.2 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.17.0 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.17.0: по запросу — кнопки очистки истории с подтверждением на все три
+  таблицы главной страницы (Живые пампы / Живые дампы / Касания EMA7/14/28),
+  не только одна. Каждая — свой confirm() и свой POST-эндпоинт
+  (/pump_history_clear, /dump_history_clear, /weekly_ema_history_clear),
+  зеркалит уже существовавший паттерн (/ema_signal_history_clear в старой
+  версии страницы). Проверено сквозным HTTP-тестом на все три.
 - v0.16.2: реальный баг — для очень волатильных дешёвых монет ATR может
   быть настолько большим относительно самой цены (видели >45%), что
   stop_dist*RR (2.25×ATR) превышает саму цену — тейк (для SHORT) или стоп
@@ -262,7 +268,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.16.2"
+APP_VERSION  = "0.17.0"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2265,6 +2271,8 @@ tbody tr:hover{background:#1c2128}
 #alertModal input[type=text]{width:100%;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:8px;margin-top:4px;font-size:14px;box-sizing:border-box}
 #alertModal .row{display:flex;justify-content:space-between;align-items:center;margin-top:12px}
 .section-card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:14px;margin-top:14px}
+.section-head{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px}
+.btn-danger-sm{background:#3a1414;border:1px solid #f85149;color:#f85149;padding:4px 10px;font-size:12px;border-radius:6px;margin:0;cursor:pointer}
 .summary-line{font-size:13px;color:#8b949e;margin-top:6px}
 .summary-line b{color:#c9d1d9}
 .table-scroll{overflow-x:auto;margin-top:10px;border-radius:6px}
@@ -2311,7 +2319,10 @@ details[open] summary:before{content:"▾ "}
 </div>
 
 <div class="section-card">
-  <h3>&#128293; Живые пампы</h3>
+  <div class="section-head">
+    <h3>&#128293; Живые пампы</h3>
+    <button onclick="clearHistory('pump')" class="btn-danger-sm">Очистить</button>
+  </div>
   <div id="pumpSummary" class="summary-line">пока не было срабатываний</div>
   <div class="table-scroll">
     <table id="pumps"><thead><tr><th>Монета</th><th>%</th><th>База → сейчас</th><th>После сигнала</th><th>Когда</th></tr></thead><tbody></tbody></table>
@@ -2319,7 +2330,10 @@ details[open] summary:before{content:"▾ "}
 </div>
 
 <div class="section-card">
-  <h3>&#128167; Живые дампы</h3>
+  <div class="section-head">
+    <h3>&#128167; Живые дампы</h3>
+    <button onclick="clearHistory('dump')" class="btn-danger-sm">Очистить</button>
+  </div>
   <div id="dumpSummary" class="summary-line">пока не было срабатываний</div>
   <div class="table-scroll">
     <table id="dumps"><thead><tr><th>Монета</th><th>%</th><th>База → сейчас</th><th>После сигнала</th><th>Когда</th></tr></thead><tbody></tbody></table>
@@ -2327,7 +2341,10 @@ details[open] summary:before{content:"▾ "}
 </div>
 
 <div class="section-card">
-  <h3>&#128204; Касания EMA7/14/28 (триггер — памп/дамп)</h3>
+  <div class="section-head">
+    <h3>&#128204; Касания EMA7/14/28 (триггер — памп/дамп)</h3>
+    <button onclick="clearHistory('weekly_ema')" class="btn-danger-sm">Очистить</button>
+  </div>
   <div id="weeklyEmaSummary" class="summary-line">пока не было срабатываний</div>
   <div class="table-scroll">
     <table id="weeklyEma"><thead><tr><th>Монета</th><th>ТФ</th><th>EMA</th><th>Цена</th><th>Вход</th><th>Стоп</th><th>Тейк</th><th>Исход</th><th>Расст. (ATR)</th><th>Подход</th><th>Тренд</th><th>Когда</th></tr></thead><tbody></tbody></table>
@@ -2396,6 +2413,21 @@ function fmtTrack(it){
   const reverse = `<span style="color:#f85149">-${it.max_reverse_pct}%</span>`;
   const status = it.track_done ? '' : ' <span style="color:#6e7681;font-size:11px">(ещё следим)</span>';
   return `дальше ${follow} / откат ${reverse}${status}`;
+}
+
+const CLEAR_ENDPOINTS = {
+  pump: {url:'/pump_history_clear', label:'пампов', refresh:() => refreshPumps()},
+  dump: {url:'/dump_history_clear', label:'дампов', refresh:() => refreshDumps()},
+  weekly_ema: {url:'/weekly_ema_history_clear', label:'EMA-сигналов (включая открытые)', refresh:() => refreshWeeklyEma()},
+};
+async function clearHistory(kind){
+  const cfg = CLEAR_ENDPOINTS[kind];
+  if(!cfg) return;
+  if(!confirm(`Точно очистить всю историю ${cfg.label}? Отменить нельзя.`)) return;
+  try{
+    await fetch(cfg.url, {method:'POST'});
+    cfg.refresh();
+  }catch(e){}
 }
 
 async function refreshPumps(){
@@ -5862,6 +5894,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
             with _ema_history_lock:
                 _save_ema_history({"items": {}})
             olog("[ema_history] история сигналов очищена вручную")
+            self._json({"ok": True})
+
+        elif self.path == "/weekly_ema_history_clear":
+            global _weekly_ema_recent
+            with _weekly_ema_touch_lock:
+                _weekly_ema_recent = []
+                _save_weekly_ema_history()
+            olog("[weekly_ema] история EMA-сигналов очищена вручную")
+            self._json({"ok": True})
+
+        elif self.path == "/pump_history_clear":
+            with _pump_detect_lock:
+                _pump_dump_history_save_all(PUMP_DETECT_HISTORY_FILE, [])
+            olog("[pump_detect] история пампов очищена вручную")
+            self._json({"ok": True})
+
+        elif self.path == "/dump_history_clear":
+            with _pump_detect_lock:
+                _pump_dump_history_save_all(DUMP_DETECT_HISTORY_FILE, [])
+            olog("[dump_detect] история дампов очищена вручную")
             self._json({"ok": True})
 
         elif self.path == "/ema_dossier_start":
