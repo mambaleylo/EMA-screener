@@ -1,7 +1,20 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.15.0 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.16.0 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.16.0: по запросу — памп/дамп алерты тоже теперь отслеживают, куда
+  пошла цена ПОСЛЕ сигнала и насколько далеко (в отличие от EMA-сигналов у
+  памп/дампа нет явных стоп/тейк уровней — здесь просто трекинг движения
+  цены, не гонка take-vs-stop). Новый фоновый _pump_dump_track_loop: раз в
+  5 минут, в течение 2 часов после срабатывания, обновляет max_follow_pct
+  (максимальное движение цены В ТУ ЖЕ сторону, что и сигнал — "разогналось
+  дальше") и max_reverse_pct (максимальное движение В ОБРАТНУЮ — "откатило
+  назад"). Таблицы "Живые пампы"/"Живые дампы" получили колонку "После
+  сигнала". Заодно вынес дублировавшийся код записи истории (был отдельно
+  в _pump_fire_alert и _dump_fire_alert) в общие _pump_dump_history_append/
+  _pump_dump_history_save_all — с той же атомарной записью (tmp+os.replace),
+  что и остальные файлы состояния. Проверено тестом на обе стороны для
+  памп и для дамп: и продолжение движения, и откат корректно фиксируются.
 - v0.15.0: защита от потери отслеживания тейка/стопа при сбоях (интернет,
   падение Termux и т.п.) — по прямому запросу. НАШЛИ И ПОЧИНИЛИ реальный
   баг по пути: история EMA-сигналов подхватывалась с диска ТОЛЬКО внутри
@@ -237,7 +250,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.15.0"
+APP_VERSION  = "0.16.0"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2289,7 +2302,7 @@ details[open] summary:before{content:"▾ "}
   <h3>&#128293; Живые пампы</h3>
   <div id="pumpSummary" class="summary-line">пока не было срабатываний</div>
   <div class="table-scroll">
-    <table id="pumps"><thead><tr><th>Монета</th><th>%</th><th>База → сейчас</th><th>Когда</th></tr></thead><tbody></tbody></table>
+    <table id="pumps"><thead><tr><th>Монета</th><th>%</th><th>База → сейчас</th><th>После сигнала</th><th>Когда</th></tr></thead><tbody></tbody></table>
   </div>
 </div>
 
@@ -2297,7 +2310,7 @@ details[open] summary:before{content:"▾ "}
   <h3>&#128167; Живые дампы</h3>
   <div id="dumpSummary" class="summary-line">пока не было срабатываний</div>
   <div class="table-scroll">
-    <table id="dumps"><thead><tr><th>Монета</th><th>%</th><th>База → сейчас</th><th>Когда</th></tr></thead><tbody></tbody></table>
+    <table id="dumps"><thead><tr><th>Монета</th><th>%</th><th>База → сейчас</th><th>После сигнала</th><th>Когда</th></tr></thead><tbody></tbody></table>
   </div>
 </div>
 
@@ -2364,6 +2377,15 @@ function fmtAgo(ts){
   return Math.floor(s/86400)+'д назад';
 }
 
+function fmtTrack(it){
+  const hasData = it.max_follow_pct !== undefined;
+  if(!hasData) return '—';
+  const follow = `<span style="color:#3fb950">+${it.max_follow_pct}%</span>`;
+  const reverse = `<span style="color:#f85149">-${it.max_reverse_pct}%</span>`;
+  const status = it.track_done ? '' : ' <span style="color:#6e7681;font-size:11px">(ещё следим)</span>';
+  return `дальше ${follow} / откат ${reverse}${status}`;
+}
+
 async function refreshPumps(){
   try{
     const r = await fetch('/pump_status'); const d = await r.json();
@@ -2374,7 +2396,7 @@ async function refreshPumps(){
       : `отслеживается монет: <b>${d.tracked||0}</b> &nbsp;·&nbsp; пока не было срабатываний`;
     for(const it of items.slice(0,50)){
       const tr = document.createElement('tr');
-      tr.innerHTML = `<td>${it.symbol}</td><td class="long">+${it.pct}%</td><td>${it.base_price} -> ${it.last_price}</td><td>${fmtAgo(it.ts)}</td>`;
+      tr.innerHTML = `<td>${it.symbol}</td><td class="long">+${it.pct}%</td><td>${it.base_price} -> ${it.last_price}</td><td>${fmtTrack(it)}</td><td>${fmtAgo(it.ts)}</td>`;
       tbody.appendChild(tr);
     }
   }catch(e){}
@@ -2390,7 +2412,7 @@ async function refreshDumps(){
       : `отслеживается монет: <b>${d.tracked||0}</b> &nbsp;·&nbsp; пока не было срабатываний`;
     for(const it of items.slice(0,50)){
       const tr = document.createElement('tr');
-      tr.innerHTML = `<td>${it.symbol}</td><td style="color:#f85149">-${it.pct}%</td><td>${it.base_price} -> ${it.last_price}</td><td>${fmtAgo(it.ts)}</td>`;
+      tr.innerHTML = `<td>${it.symbol}</td><td style="color:#f85149">-${it.pct}%</td><td>${it.base_price} -> ${it.last_price}</td><td>${fmtTrack(it)}</td><td>${fmtAgo(it.ts)}</td>`;
       tbody.appendChild(tr);
     }
   }catch(e){}
@@ -3528,6 +3550,99 @@ def _render_pump_chart_png(candles, base_price):
                                        floor_frac=p.get("floor_frac", 0.15))
 
 
+PUMP_TRACK_WINDOW_SEC = 2 * 3600   # сколько времени после сигнала следим за ценой
+PUMP_TRACK_POLL_SEC   = 300        # раз в 5 минут проверяем ещё не закрытые записи
+
+
+def _pump_dump_history_append(file_path, rec):
+    """Общая запись в историю пампов/дампов — атомарно (tmp + os.replace),
+    не растим файл бесконечно (последние 200 записей)."""
+    try:
+        hist = []
+        if os.path.exists(file_path):
+            with open(file_path) as f:
+                hist = json.load(f)
+        hist.append(rec)
+        hist = hist[-200:]
+        tmp_path = file_path + f".tmp{os.getpid()}"
+        with open(tmp_path, "w") as f:
+            json.dump(hist, f)
+        os.replace(tmp_path, file_path)
+    except Exception as e:
+        olog(f"[pump_dump_track] ⚠ не смог записать {file_path}: {e}")
+
+
+def _pump_dump_history_save_all(file_path, hist):
+    try:
+        tmp_path = file_path + f".tmp{os.getpid()}"
+        with open(tmp_path, "w") as f:
+            json.dump(hist, f)
+        os.replace(tmp_path, file_path)
+    except Exception as e:
+        olog(f"[pump_dump_track] ⚠ не смог сохранить {file_path}: {e}")
+
+
+def _pump_dump_track_loop():
+    """Фоновый цикл: раз в PUMP_TRACK_POLL_SEC смотрит все ещё не
+    "закрытые" (track_done=False) записи в истории пампов/дампов и
+    обновляет максимальное движение цены В ТУ ЖЕ сторону, что и сигнал
+    (max_follow_pct — "разогналось дальше") и В ОБРАТНУЮ (max_reverse_pct —
+    "откатило назад") за PUMP_TRACK_WINDOW_SEC после срабатывания. У
+    памп/дамп алертов нет явных стоп/тейк уровней (в отличие от EMA-
+    сигналов) — тут просто трекинг движения цены, не гонка take-vs-stop."""
+    time.sleep(40)
+    while True:
+        try:
+            for file_path, kind in ((PUMP_DETECT_HISTORY_FILE, "pump"),
+                                     (DUMP_DETECT_HISTORY_FILE, "dump")):
+                try:
+                    if not os.path.exists(file_path):
+                        continue
+                    with open(file_path) as f:
+                        hist = json.load(f)
+                except Exception as e:
+                    olog(f"[pump_dump_track] {file_path}: не смог прочитать: {e}")
+                    continue
+                now = time.time()
+                price_cache = {}
+                changed = False
+                for rec in hist:
+                    if rec.get("track_done", True):   # старые записи без поля тоже не трогаем
+                        continue
+                    try:
+                        sym = rec["symbol"]
+                        if sym not in price_cache:
+                            try:
+                                price_cache[sym] = _gate_get_price(sym)
+                            except Exception as e:
+                                olog(f"[pump_dump_track] {sym}: ошибка получения цены: {e}")
+                                price_cache[sym] = None
+                        price = price_cache[sym]
+                        if price and rec.get("last_price"):
+                            pct = (price - rec["last_price"]) / rec["last_price"] * 100.0
+                            if kind == "pump":
+                                follow, reverse = pct, -pct
+                            else:
+                                follow, reverse = -pct, pct
+                            rec["max_follow_pct"] = round(max(rec.get("max_follow_pct", 0.0), follow), 2)
+                            rec["max_reverse_pct"] = round(max(rec.get("max_reverse_pct", 0.0), reverse), 2)
+                            rec["last_tracked_price"] = price
+                            rec["last_tracked_ts"] = int(now)
+                            changed = True
+                        if now >= rec.get("track_until", 0):
+                            rec["track_done"] = True
+                            changed = True
+                    except Exception as e:
+                        olog(f"[pump_dump_track] ⚠ пропущена битая запись "
+                             f"({rec.get('symbol','?')}): {e}")
+                        continue
+                if changed:
+                    _pump_dump_history_save_all(file_path, hist)
+        except Exception as e:
+            olog(f"[pump_dump_track] ошибка цикла: {e}")
+        time.sleep(PUMP_TRACK_POLL_SEC)
+
+
 def _pump_fire_alert(symbol, res):
     """Тянет 1m-свечи за последнее PUMP_CHART_WINDOW_MIN окно, рисует
     картинку и шлёт в Telegram/ntfy (через уже существующий
@@ -3535,7 +3650,8 @@ def _pump_fire_alert(symbol, res):
     откатится на обычный текстовый _send_alert, ничего не потеряется).
     После обычного алерта — проверяет, не долетел ли этот памп до уровня
     EMA (см. _pump_or_dump_maybe_trigger_ema_signal); если да, следом
-    уходит ещё и полноценный сигнал со входом/стопом/тейком."""
+    уходит ещё и полноценный сигнал со входом/стопом/тейком. Плюс ставит
+    запись на трекинг движения цены после сигнала (см. _pump_dump_track_loop)."""
     candles = []
     try:
         days = max(1, math.ceil(PUMP_CHART_WINDOW_MIN * 60 / 86400) + 1)
@@ -3558,19 +3674,13 @@ def _pump_fire_alert(symbol, res):
     olog(f"[pump_detect] 🔥 {symbol}: памп {res['pct']}% "
          f"({res['base_price']:.6g} → {res['last_price']:.6g}) — алерт отправлен")
 
-    try:
-        rec = {"ts": int(time.time()), "symbol": symbol, "pct": res["pct"],
-               "base_price": res["base_price"], "last_price": res["last_price"]}
-        hist = []
-        if os.path.exists(PUMP_DETECT_HISTORY_FILE):
-            with open(PUMP_DETECT_HISTORY_FILE) as f:
-                hist = json.load(f)
-        hist.append(rec)
-        hist = hist[-200:]   # не растим файл бесконечно
-        with open(PUMP_DETECT_HISTORY_FILE, "w") as f:
-            json.dump(hist, f)
-    except Exception as e:
-        olog(f"[pump_detect] ⚠ не смог записать {PUMP_DETECT_HISTORY_FILE}: {e}")
+    now = time.time()
+    rec = {"ts": int(now), "symbol": symbol, "pct": res["pct"],
+           "base_price": res["base_price"], "last_price": res["last_price"],
+           "kind": "pump", "track_until": now + PUMP_TRACK_WINDOW_SEC,
+           "track_done": False, "max_follow_pct": 0.0, "max_reverse_pct": 0.0,
+           "last_tracked_price": res["last_price"], "last_tracked_ts": int(now)}
+    _pump_dump_history_append(PUMP_DETECT_HISTORY_FILE, rec)
 
     try:
         _pump_or_dump_maybe_trigger_ema_signal(symbol, expected_bias="short")
@@ -3582,8 +3692,9 @@ def _dump_fire_alert(symbol, res):
     """Зеркало _pump_fire_alert для падений — тот же рендер графика
     (цвета/направление там уже определяются по самим свечам, не по тому,
     памп это или дамп, так что переиспользуем как есть), тот же принцип
-    записи истории, и та же проверка EMA-триггера, но с ожиданием
-    LONG-стороны (дамп в поддержку, а не памп в сопротивление)."""
+    записи истории (с трекингом движения цены после сигнала), и та же
+    проверка EMA-триггера, но с ожиданием LONG-стороны (дамп в поддержку,
+    а не памп в сопротивление)."""
     candles = []
     try:
         days = max(1, math.ceil(PUMP_CHART_WINDOW_MIN * 60 / 86400) + 1)
@@ -3606,19 +3717,13 @@ def _dump_fire_alert(symbol, res):
     olog(f"[dump_detect] 💧 {symbol}: дамп -{res['pct']}% "
          f"({res['base_price']:.6g} → {res['last_price']:.6g}) — алерт отправлен")
 
-    try:
-        rec = {"ts": int(time.time()), "symbol": symbol, "pct": res["pct"],
-               "base_price": res["base_price"], "last_price": res["last_price"]}
-        hist = []
-        if os.path.exists(DUMP_DETECT_HISTORY_FILE):
-            with open(DUMP_DETECT_HISTORY_FILE) as f:
-                hist = json.load(f)
-        hist.append(rec)
-        hist = hist[-200:]
-        with open(DUMP_DETECT_HISTORY_FILE, "w") as f:
-            json.dump(hist, f)
-    except Exception as e:
-        olog(f"[dump_detect] ⚠ не смог записать {DUMP_DETECT_HISTORY_FILE}: {e}")
+    now = time.time()
+    rec = {"ts": int(now), "symbol": symbol, "pct": res["pct"],
+           "base_price": res["base_price"], "last_price": res["last_price"],
+           "kind": "dump", "track_until": now + PUMP_TRACK_WINDOW_SEC,
+           "track_done": False, "max_follow_pct": 0.0, "max_reverse_pct": 0.0,
+           "last_tracked_price": res["last_price"], "last_tracked_ts": int(now)}
+    _pump_dump_history_append(DUMP_DETECT_HISTORY_FILE, rec)
 
     try:
         _pump_or_dump_maybe_trigger_ema_signal(symbol, expected_bias="long")
@@ -5935,6 +6040,7 @@ def main():
     # threading.Thread(target=_ema_signal_loop, daemon=True).start()
     threading.Thread(target=_pump_detect_loop, daemon=True).start()
     threading.Thread(target=_weekly_ema_resolve_loop, daemon=True).start()
+    threading.Thread(target=_pump_dump_track_loop, daemon=True).start()
     # v0.13.0: полностью заменено на триггер от пампа/дампа (см.
     # _pump_or_dump_maybe_trigger_ema_signal, вызывается изнутри
     # _pump_fire_alert/_dump_fire_alert) — постоянный опрос топ-100 монет
