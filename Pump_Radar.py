@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.16.0 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.16.2 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.16.2: реальный баг — для очень волатильных дешёвых монет ATR может
+  быть настолько большим относительно самой цены (видели >45%), что
+  stop_dist*RR (2.25×ATR) превышает саму цену — тейк (для SHORT) или стоп
+  (для LONG) уходил в ОТРИЦАТЕЛЬНУЮ цену, что и было видно в сигналах.
+  Добавлен guard в _ema_touch_check_symbol: если расчётный entry/stop/take
+  <= 0, касание тихо пропускается (лог с причиной), сигнал не шлётся.
+  Проверено юнит-тестом на обе уязвимые ветки формулы (SHORT→тейк,
+  LONG→стоп) — обе корректно отсекаются при экстремальной волатильности,
+  нормальные случаи проходят как раньше.
+- v0.16.1: по запросу — трекинг цены после пампа/дампа теперь раз в минуту
+  (было раз в 5 минут) в течение часа (было 2 часа) — PUMP_TRACK_POLL_SEC
+  60, PUMP_TRACK_WINDOW_SEC 3600.
 - v0.16.0: по запросу — памп/дамп алерты тоже теперь отслеживают, куда
   пошла цена ПОСЛЕ сигнала и насколько далеко (в отличие от EMA-сигналов у
   памп/дампа нет явных стоп/тейк уровней — здесь просто трекинг движения
@@ -250,7 +262,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.16.0"
+APP_VERSION  = "0.16.2"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3550,8 +3562,8 @@ def _render_pump_chart_png(candles, base_price):
                                        floor_frac=p.get("floor_frac", 0.15))
 
 
-PUMP_TRACK_WINDOW_SEC = 2 * 3600   # сколько времени после сигнала следим за ценой
-PUMP_TRACK_POLL_SEC   = 300        # раз в 5 минут проверяем ещё не закрытые записи
+PUMP_TRACK_WINDOW_SEC = 1 * 3600   # сколько времени после сигнала следим за ценой
+PUMP_TRACK_POLL_SEC   = 60         # раз в минуту проверяем ещё не закрытые записи
 
 
 def _pump_dump_history_append(file_path, rec):
@@ -3949,6 +3961,17 @@ def _ema_touch_check_symbol(symbol, tf="1w"):
                 entry, stop, take = level, level + stop_dist, level - stop_dist * EMA_TOUCH_RR
             else:
                 entry, stop, take = level, level - stop_dist, level + stop_dist * EMA_TOUCH_RR
+            # v0.16.2: для очень волатильных дешёвых монет ATR может быть
+            # настолько большим относительно самой цены (реально видели
+            # >45% от цены), что stop_dist*RR превышает саму цену — тейк
+            # (или, реже, стоп) уходит в ОТРИЦАТЕЛЬНУЮ цену, что бессмысленно
+            # физически. Лучше молча пропустить такое касание, чем прислать
+            # сигнал с ценой ниже нуля.
+            if stop <= 0 or take <= 0 or entry <= 0:
+                olog(f"[weekly_ema] {symbol} {tf} EMA{period}: пропуск — ATR слишком "
+                     f"большой относительно цены (entry={entry:.6g} stop={stop:.6g} "
+                     f"take={take:.6g}), стоп/тейк ушли бы в отрицательную цену")
+                continue
             levels = []
             for lvl_period in WEEKLY_EMA_PERIODS:
                 lvl_val = live_ema_values[lvl_period]
