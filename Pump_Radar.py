@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.19.0 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.19.1 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.19.1: по запросу — кнопка "Скачать JSON" на /ema_diag (GET
+  /ema_diag_export, с Content-Disposition: attachment — телефон сохранит
+  файл, а не просто покажет JSON текстом в браузере). Экспорт включает и
+  сырые записи, и уже готовую сводку (_diag_summary) в одном файле.
 - v0.19.0: по запросу — целая система сбора диагностических данных для
   анализа/улучшения алгоритма, новая страница /ema_diag. В отличие от
   live-вотчера (узкий порог 0.25 ATR, только под алерты) — здесь широкий
@@ -301,7 +305,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.19.0"
+APP_VERSION  = "0.19.1"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -5869,6 +5873,7 @@ select,input{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-ra
         <option value="14">EMA14</option>
         <option value="28">EMA28</option>
       </select>
+      <a href="/ema_diag_export" style="text-decoration:none"><button>&#128190; Скачать JSON</button></a>
       <button onclick="clearDiag()" class="btn-danger-sm">Очистить всё</button>
     </div>
   </div>
@@ -6488,6 +6493,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json({"total": len(items), "recent": items[:limit]})
         elif self.path == "/ema_diag_summary":
             self._json({"summary": _diag_summary()})
+        elif self.path == "/ema_diag_export":
+            # скачивание ВСЕГО сырого набора (не через _json — та не
+            # проставляет Content-Disposition, браузер показал бы JSON
+            # текстом вместо предложения сохранить файл)
+            with _diag_lock:
+                items = list(_diag_records)
+            payload = {"exported_at": int(time.time()), "count": len(items),
+                       "summary": _diag_summary(), "records": items}
+            body = json.dumps(payload, ensure_ascii=False, indent=2).encode()
+            fname = f"ema_diagnostics_{time.strftime('%Y%m%d_%H%M')}.json"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
+            self.send_header("Content-Length", len(body))
+            self.end_headers()
+            self.wfile.write(body)
         elif self.path == "/ema_diag" or self.path == "/ema_diag.html":
             body = EMA_DIAG_HTML_PAGE.encode()
             self.send_response(200)
