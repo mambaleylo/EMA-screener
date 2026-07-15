@@ -1,7 +1,28 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.18.0 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.19.0 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.19.0: по запросу — целая система сбора диагностических данных для
+  анализа/улучшения алгоритма, новая страница /ema_diag. В отличие от
+  live-вотчера (узкий порог 0.25 ATR, только под алерты) — здесь широкий
+  DIAG_TOUCH_ATR=1.0, собирает ВСЕ приближения к EMA7/14/28, не только
+  сигнальные. Таймфреймов теперь 4 (1h/4h добавлены к 1d/1w). Для каждого
+  касания: MFE/MAE (макс. движение за/против), срезы через 15/30/60/120/240
+  минут, флаг просадки ПОСЛЕ уже начавшегося движения по тренду (не просто
+  любой MAE — это нормальный шум входа), Volume Profile (POC + доля объёма
+  в пиковой зоне), funding rate. Честно про "карту ликвидации" — настоящей
+  нет и не будет без платного источника типа Coinglass, funding rate это
+  единственный реально доступный (и куда более грубый) прокси. Сводная
+  таблица /ema_diag_summary: по каждой связке период×таймфрейм — bounce
+  rate, средний MFE/MAE, отдельно по long/short — отвечает на "откуда
+  отскакивало чаще всего". Два новых фоновых цикла (_diag_scan_loop раз в
+  15 минут, _diag_track_loop раз в 2 минуты), та же архитектура защиты от
+  сбоев, что и у остального (атомарная запись, восстановление истории при
+  старте — не наступаем на грабли v0.13/v0.15). Пойман и починен реальный
+  дедлок при разработке (POST /ema_diag_clear держал _diag_lock и внутри
+  вызывал _diag_save(), которая тоже берёт этот лок — Lock не реентерабельный).
+  Проверено полным HTTP-тестом: скан находит касания, статус/сводка/очистка
+  работают, очистка не виснет.
 - v0.18.0: по запросу — (1) количество монет, участвующих в поиске сигналов
   (было жёстко зашитое PUMP_DETECT_TOP_N=100), вынесено в настройку
   /scan_settings — меняется прямо на странице (поле + кнопка "Сохранить"
@@ -280,7 +301,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.18.0"
+APP_VERSION  = "0.19.0"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2308,6 +2329,7 @@ details[open] summary:before{content:"▾ "}
 <button onclick="openAlertSettings()" style="background:#21262d;border:1px solid #30363d">&#128276; Алерты</button>
 <a href="/pump_match" style="text-decoration:none"><button style="background:#8250df">&#127919; Pump Match (подбор параметров отрисовки)</button></a>
 <a href="/weekly_ema_backtest" style="text-decoration:none"><button style="background:#8250df">&#128202; Weekly EMA Backtest</button></a>
+<a href="/ema_diag" style="text-decoration:none"><button style="background:#8250df">&#128300; EMA Diagnostics</button></a>
 <div class="section-card" style="max-width:420px">
   <label style="display:block;font-size:13px;color:#8b949e">Сколько монет по объёму участвует в поиске (топ-N)</label>
   <div style="display:flex;gap:8px;margin-top:6px;align-items:center">
@@ -4644,6 +4666,356 @@ def _weekly_ema_backtest_run_background(job_id, symbols, tf, days, window_min, t
                 _weekly_ema_backtest_jobs[job_id]["result"] = {"ok": False, "msg": f"Внутренняя ошибка: {e}"}
 # ─── конец Weekly EMA Backtest ──────────────────────────────────────────────
 
+# ─── EMA Diagnostics: система сбора данных для анализа алгоритма ───────────
+# По прямому запросу — "собирать все, все возможные ема сигналы, куда пошла
+# цена сразу, на какое расстояние, был ли откат, где через час-два,
+# профили объёма, упор на ема — откуда отскакивали чаще всего, на разных
+# фреймах". В отличие от живого вотчера (WEEKLY_EMA_TOUCH_ATR=0.25, узкий
+# порог именно под алерты) — тут порог НАМНОГО шире (DIAG_TOUCH_ATR=1.0) и
+# таймфреймов больше (1h/4h добавлены к 1d/1w) — это отдельный, более
+# широкий сбор данных ДЛЯ АНАЛИЗА, не для принятия решения о сигнале.
+# Карта ликвидации: честно — настоящей нет и не будет без платного
+# источника (Coinglass и т.п.), Gate.io публично такое не отдаёт. Вместо
+# неё — funding rate (реально доступный, хоть и более грубый прокси
+# перекошенности позиций лонг/шорт).
+DIAG_TIMEFRAMES     = ["1h", "4h", "1d", "1w"]
+DIAG_TOUCH_ATR      = 1.0        # значительно шире алертового порога — собираем данные, а не только то, что алертим
+DIAG_FETCH_DAYS     = {"1h": 30, "4h": 60, "1d": 120, "1w": 400}
+DIAG_SCAN_POLL_SEC  = 900        # раз в 15 минут — новый скан по всем ТФ/монетам
+DIAG_CHECKPOINTS_MIN = [15, 30, 60, 120, 240]   # через сколько минут после касания фиксируем срез
+DIAG_TRACK_WINDOW_SEC = max(DIAG_CHECKPOINTS_MIN) * 60 + 600   # с запасом сверх последнего чекпоинта
+DIAG_TRACK_POLL_SEC = 120        # раз в 2 минуты проверяем ещё не закрытые записи
+DIAG_FILE           = os.path.expanduser("~/pumpradar_ema_diagnostics.json")
+DIAG_MAX_RECORDS    = 5000       # не растим файл бесконечно
+
+_diag_lock = threading.Lock()
+_diag_records = []   # общий список всех диагностических записей (открытых и закрытых)
+_diag_ctx_cache = {}       # "symbol|tf" -> closed-context (тот же приём, что _ema_touch_ctx_cache, но своя копия — разные пороги/ТФ)
+_diag_ctx_cache_lock = threading.Lock()
+
+
+def _diag_get_closed_ctx(symbol, tf):
+    """Аналог _ema_touch_get_closed_ctx, но с собственным кэшем (разные
+    таймфреймы/глубина фетча) и собственным негативным кэшем недостаточной
+    истории — не мешаем друг другу с live-вотчером."""
+    key = f"{symbol}|{tf}"
+    now = time.time()
+    with _diag_ctx_cache_lock:
+        cached = _diag_ctx_cache.get(key)
+    if cached and now < cached["next_close_t"]:
+        return None if cached.get("insufficient") else cached
+    fetch_days = DIAG_FETCH_DAYS.get(tf, 60)
+    if tf == "1w":
+        raw = _fetch_candles(symbol, "1d", fetch_days)
+        candles = _resample_to_weekly(raw)
+    else:
+        candles = _fetch_candles(symbol, tf, fetch_days)
+    min_bars = max(WEEKLY_EMA_PERIODS) + 5
+    if len(candles) < min_bars:
+        with _diag_ctx_cache_lock:
+            _diag_ctx_cache[key] = {"insufficient": True,
+                                     "next_close_t": now + EMA_TOUCH_INSUFFICIENT_HISTORY_RECHECK_SEC}
+        return None
+    closes = [c["close"] for c in candles]
+    atr_arr = _atr(candles, 14)
+    i = len(candles) - 1
+    atr_v = atr_arr[i]
+    if not atr_v:
+        return None
+    ema_arrays = {p: _ema(closes, p) for p in WEEKLY_EMA_PERIODS}
+    if any(arr[i] is None for arr in ema_arrays.values()):
+        return None
+    interval_sec = 86400 * 7 if tf == "1w" else TF_SECONDS.get(tf, 86400)
+    ctx = {"candles": candles, "closes": closes, "atr_v": atr_v, "i": i,
+           "ema_arrays": ema_arrays, "next_close_t": candles[i]["t"] + interval_sec + 5}
+    with _diag_ctx_cache_lock:
+        _diag_ctx_cache[key] = ctx
+    return ctx
+
+
+def _diag_volume_profile(candles, lookback=50, bins=10):
+    """Простой Volume Profile по последним lookback барам: делит ценовой
+    диапазон на bins корзин, суммирует объём каждой свечи в корзину её
+    средней цены, возвращает POC (цена корзины с максимальным объёмом) и
+    какую долю общего объёма она забирает (poc_vol_share — насколько
+    выражен пик, а не размазан объём равномерно)."""
+    window = candles[-lookback:]
+    if not window:
+        return None
+    lo = min(c["low"] for c in window)
+    hi = max(c["high"] for c in window)
+    if hi <= lo:
+        return None
+    bin_size = (hi - lo) / bins
+    vol_by_bin = [0.0] * bins
+    for c in window:
+        mid = (c["high"] + c["low"]) / 2
+        idx = min(bins - 1, max(0, int((mid - lo) / bin_size)))
+        vol_by_bin[idx] += c.get("vol", 0) or 0
+    total_vol = sum(vol_by_bin)
+    if total_vol <= 0:
+        return None
+    poc_idx = max(range(bins), key=lambda k: vol_by_bin[k])
+    poc_price = lo + (poc_idx + 0.5) * bin_size
+    return {
+        "poc_price": _round_price(poc_price),
+        "range_low": _round_price(lo), "range_high": _round_price(hi),
+        "poc_vol_share": round(vol_by_bin[poc_idx] / total_vol, 3),
+    }
+
+
+def _diag_get_funding_rate(symbol):
+    """НЕ карта ликвидации — честный, но куда более грубый прокси:
+    funding rate показывает, платят ли лонги шортам или наоборот (сильный
+    перекос = много позиций в одну сторону = потенциальная зона
+    ликвидаций при движении против них, но БЕЗ конкретных уровней цены,
+    в отличие от настоящей карты ликвидаций типа Coinglass). Отдельный
+    прямой запрос, НЕ через _gate_get_contract_info — тот кэш бессрочный и
+    используется для торговой логики (плечо/размер ордера), а funding
+    rate меняется каждые несколько часов, кэшировать вместе с ним нельзя."""
+    try:
+        contract = symbol.replace("/", "_").upper()
+        r = requests.get(f"{GATE_API}/futures/usdt/contracts/{contract}", timeout=5)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        fr = data.get("funding_rate")
+        return float(fr) if fr is not None else None
+    except Exception:
+        return None
+
+
+def _diag_check_symbol(symbol, tf):
+    """Широкий (DIAG_TOUCH_ATR=1.0, не алертовый 0.25) детект приближения
+    к EMA7/14/28 на заданном ТФ — для сбора ДАННЫХ, не для решения слать
+    ли сигнал. Возвращает список диагностических записей (без исхода —
+    его дозаполняет _diag_track_loop)."""
+    ctx = _diag_get_closed_ctx(symbol, tf)
+    if ctx is None:
+        return []
+    candles, closes, atr_v, i, ema_arrays = (ctx["candles"], ctx["closes"], ctx["atr_v"],
+                                              ctx["i"], ctx["ema_arrays"])
+    live_price = _gate_get_price(symbol)
+    price = live_price if live_price else closes[i]
+    vol_ratio = _vol_ratio(candles, i)
+    vol_profile = _diag_volume_profile(candles)
+    funding_rate = _diag_get_funding_rate(symbol)
+    ladder = _ladder_order([price] + [
+        (_ema_live_value(ema_arrays[p][i], price, p) if live_price else ema_arrays[p][i])
+        for p in WEEKLY_EMA_PERIODS
+    ])
+    records = []
+    now = time.time()
+    for period in WEEKLY_EMA_PERIODS:
+        ema_arr = ema_arrays[period]
+        ema_closed = ema_arr[i]
+        if ema_closed is None:
+            continue
+        ema_now = _ema_live_value(ema_closed, price, period) if live_price else ema_closed
+        dist = abs(price - ema_now)
+        dist_atr = dist / atr_v
+        if dist_atr > DIAG_TOUCH_ATR:
+            continue
+        prev_close = closes[i - 1] if i > 0 else closes[i]
+        prev_ema = ema_arr[i - 1] if (i > 0 and ema_arr[i - 1] is not None) else ema_closed
+        side = "from_below" if prev_close < prev_ema else "from_above"
+        classic_bias = "short" if side == "from_below" else "long"
+        records.append({
+            "id": f"{symbol}|{tf}|{period}|{int(now)}",
+            "ts": int(now), "symbol": symbol, "tf": tf, "period": period,
+            "price": price, "ema_value": _round_price(ema_now),
+            "dist_atr": round(dist_atr, 3), "side": side, "classic_bias": classic_bias,
+            "ladder": ladder, "vol_ratio": vol_ratio, "vol_profile": vol_profile,
+            "funding_rate": funding_rate,
+            "checkpoints": {str(m): None for m in DIAG_CHECKPOINTS_MIN},
+            "mfe_pct": 0.0, "mae_pct": 0.0,
+            "retrace_before_favorable": False,   # был ли момент MAE>0 ПОСЛЕ уже начавшегося MFE>0 (просадка после начала движения по тренду)
+            "track_until": now + DIAG_TRACK_WINDOW_SEC, "track_done": False,
+        })
+    return records
+
+
+def _diag_save():
+    """Атомарная запись (tmp + os.replace), капается на DIAG_MAX_RECORDS."""
+    try:
+        with _diag_lock:
+            trimmed = _diag_records[-DIAG_MAX_RECORDS:]
+        tmp_path = DIAG_FILE + f".tmp{os.getpid()}"
+        with open(tmp_path, "w") as f:
+            json.dump(trimmed, f)
+        os.replace(tmp_path, DIAG_FILE)
+    except Exception as e:
+        olog(f"[ema_diag] ⚠ не смог сохранить {DIAG_FILE}: {e}")
+
+
+def _diag_load():
+    """Подхватывает диагностику с прошлого запуска (тот же принцип, что
+    _load_weekly_ema_history — вызывается прямо в main(), не зависит от
+    того, какие циклы включены)."""
+    global _diag_records
+    try:
+        if os.path.exists(DIAG_FILE):
+            with open(DIAG_FILE) as f:
+                loaded = json.load(f)
+            if isinstance(loaded, list):
+                with _diag_lock:
+                    _diag_records = loaded
+                still_open = sum(1 for r in loaded if not r.get("track_done", True))
+                olog(f"[ema_diag] история подхвачена с диска: {len(loaded)} записей, "
+                     f"из них ещё отслеживается {still_open}")
+    except Exception as e:
+        olog(f"[ema_diag] ⚠ не смог подхватить историю с диска: {e}")
+
+
+def _diag_scan_loop():
+    """Раз в DIAG_SCAN_POLL_SEC проходит топ-N монет (та же настраиваемая
+    _get_scan_top_n(), что и у пампа/дампа) по всем DIAG_TIMEFRAMES и
+    добавляет в _diag_records новые широкие касания. Дедуп: не добавляем
+    новую запись на ту же связку символ+ТФ+период, если уже есть открытая
+    (ещё отслеживаемая) — иначе одно и то же затяжное касание плодило бы
+    записи каждые 15 минут."""
+    time.sleep(60)
+    while True:
+        try:
+            symbols = _fetch_all_symbols()[:_get_scan_top_n()]
+            added = 0
+            for symbol in symbols:
+                for tf in DIAG_TIMEFRAMES:
+                    try:
+                        new_records = _diag_check_symbol(symbol, tf)
+                    except Exception as e:
+                        olog(f"[ema_diag] {symbol} {tf}: ошибка проверки: {e}")
+                        continue
+                    if not new_records:
+                        continue
+                    with _diag_lock:
+                        open_keys = {f"{r['symbol']}|{r['tf']}|{r['period']}"
+                                     for r in _diag_records if not r.get("track_done", True)}
+                        for rec in new_records:
+                            rkey = f"{rec['symbol']}|{rec['tf']}|{rec['period']}"
+                            if rkey in open_keys:
+                                continue
+                            _diag_records.append(rec)
+                            open_keys.add(rkey)
+                            added += 1
+            if added:
+                _diag_save()
+                olog(f"[ema_diag] скан завершён: +{added} новых записей "
+                     f"(всего в истории {len(_diag_records)})")
+        except Exception as e:
+            olog(f"[ema_diag] ошибка цикла сканирования: {e}")
+        time.sleep(DIAG_SCAN_POLL_SEC)
+
+
+def _diag_track_loop():
+    """Раз в DIAG_TRACK_POLL_SEC проверяет живую цену всех ещё
+    отслеживаемых записей: обновляет MFE/MAE (максимум за и против
+    сигнала), заполняет ближайший ПРОШЕДШИЙ чекпоинт (15/30/60/120/240
+    минут — на первом опросе ПОСЛЕ того, как порог времени пройден, не
+    ровно в момент — точность ограничена частотой опроса), и отмечает
+    retrace_before_favorable, если после уже начавшегося благоприятного
+    движения (MFE>0) была просадка (MAE стал больше нуля уже ПОСЛЕ этого) —
+    отдельно от простого MAE, который может быть и ДО того, как пошло по
+    тренду (это нормальный шум входа, не "просадка после начала движения")."""
+    time.sleep(90)
+    while True:
+        try:
+            with _diag_lock:
+                open_recs = [r for r in _diag_records if not r.get("track_done", True)]
+            if open_recs:
+                price_cache = {}
+                changed = False
+                now = time.time()
+                for rec in open_recs:
+                    try:
+                        sym = rec["symbol"]
+                        if sym not in price_cache:
+                            try:
+                                price_cache[sym] = _gate_get_price(sym)
+                            except Exception as e:
+                                olog(f"[ema_diag_track] {sym}: ошибка получения цены: {e}")
+                                price_cache[sym] = None
+                        price = price_cache[sym]
+                        if not price or not rec.get("price"):
+                            continue
+                        pct = (price - rec["price"]) / rec["price"] * 100.0
+                        if rec["classic_bias"] == "long":
+                            fav, adv = pct, -pct
+                        else:
+                            fav, adv = -pct, pct
+                        had_started_moving = rec["mfe_pct"] > 0.1   # уже пошло по тренду хоть немного
+                        if fav > rec["mfe_pct"]:
+                            rec["mfe_pct"] = round(fav, 2)
+                        if adv > rec["mae_pct"]:
+                            rec["mae_pct"] = round(adv, 2)
+                            if had_started_moving:
+                                rec["retrace_before_favorable"] = True
+                        elapsed_min = (now - rec["ts"]) / 60.0
+                        for cp in DIAG_CHECKPOINTS_MIN:
+                            key = str(cp)
+                            if rec["checkpoints"].get(key) is None and elapsed_min >= cp:
+                                rec["checkpoints"][key] = {"price": price, "pct": round(pct, 2)}
+                        changed = True
+                        if now >= rec.get("track_until", 0):
+                            rec["track_done"] = True
+                    except Exception as e:
+                        olog(f"[ema_diag_track] ⚠ пропущена битая запись "
+                             f"({rec.get('symbol','?')}): {e}")
+                        continue
+                if changed:
+                    _diag_save()
+        except Exception as e:
+            olog(f"[ema_diag_track] ошибка цикла: {e}")
+        time.sleep(DIAG_TRACK_POLL_SEC)
+DIAG_BOUNCE_THRESHOLD_PCT = 1.0   # от какого MFE считаем, что реально "отскочило", а не шум
+
+
+def _diag_summary(min_touches=3):
+    """Сводка по каждой связке (период EMA × таймфрейм): сколько касаний,
+    доля реально отскочивших (MFE >= порога) против пробитых (MAE >= порога
+    без соответствующего MFE), средний MFE/MAE, доля с просадкой перед
+    движением по тренду. Отдельно то же самое разбито по классической
+    стороне (short/long) — они часто ведут себя по-разному."""
+    with _diag_lock:
+        records = list(_diag_records)
+    groups = {}
+    for r in records:
+        key = (r["tf"], r["period"])
+        groups.setdefault(key, []).append(r)
+
+    def _agg(items):
+        total = len(items)
+        evaluated = [r for r in items if r.get("track_done") or r.get("mfe_pct", 0) > 0 or r.get("mae_pct", 0) > 0]
+        bounced = sum(1 for r in evaluated if r["mfe_pct"] >= DIAG_BOUNCE_THRESHOLD_PCT)
+        broke = sum(1 for r in evaluated if r["mae_pct"] >= DIAG_BOUNCE_THRESHOLD_PCT and r["mfe_pct"] < DIAG_BOUNCE_THRESHOLD_PCT)
+        retraced = sum(1 for r in evaluated if r.get("retrace_before_favorable"))
+        avg_mfe = round(sum(r["mfe_pct"] for r in evaluated) / len(evaluated), 2) if evaluated else None
+        avg_mae = round(sum(r["mae_pct"] for r in evaluated) / len(evaluated), 2) if evaluated else None
+        return {
+            "total": total, "evaluated": len(evaluated), "bounced": bounced, "broke": broke,
+            "bounce_rate": round(bounced / len(evaluated) * 100, 1) if evaluated else None,
+            "avg_mfe_pct": avg_mfe, "avg_mae_pct": avg_mae,
+            "retrace_rate": round(retraced / len(evaluated) * 100, 1) if evaluated else None,
+        }
+
+    result = []
+    for (tf, period), items in groups.items():
+        if len(items) < min_touches:
+            continue
+        entry = {"tf": tf, "period": period, "overall": _agg(items)}
+        for bias in ("long", "short"):
+            subset = [r for r in items if r["classic_bias"] == bias]
+            if subset:
+                entry[bias] = _agg(subset)
+        result.append(entry)
+    result.sort(key=lambda e: (e["overall"]["bounce_rate"] or 0), reverse=True)
+    return result
+
+
+# ─── конец EMA Diagnostics ───────────────────────────────────────────────────
+
+
+
 def _load_alert_cfg():
     """Подхватывает сохранённые TG/ntfy настройки из файла (приоритет над env)."""
     global TG_TOKEN, TG_CHAT, NTFY_URL, WATCHDOG_ENABLED, WATCHDOG_TIMEOUT_MIN, HC_URL
@@ -5441,6 +5813,154 @@ def _pump_match_run_background(job_id, image_bytes, symbol, search_start_ts, sea
                 _pump_match_jobs[job_id]["result"] = {"ok": False, "msg": f"Внутренняя ошибка: {e}"}
 
 
+EMA_DIAG_HTML_PAGE = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>EMA Diagnostics</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font-family:system-ui,sans-serif;margin:0;padding:16px}
+h1{font-size:20px}
+h3{font-size:15px;margin:0}
+button{background:#238636;color:#fff;border:0;padding:8px 14px;border-radius:6px;font-size:13px;margin:4px 6px 4px 0;cursor:pointer}
+.btn-danger-sm{background:#3a1414;border:1px solid #f85149;color:#f85149;padding:4px 10px;font-size:12px;border-radius:6px;margin:0}
+table{width:100%;border-collapse:collapse;margin-top:10px;font-size:12px}
+th,td{padding:5px 7px;text-align:left;border-bottom:1px solid #21262d;white-space:nowrap}
+th{color:#8b949e;position:sticky;top:0;background:#161b22}
+tbody tr:hover{background:#1c2128}
+.section-card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:14px;margin-top:14px}
+.section-head{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px}
+.table-scroll{overflow-x:auto}
+.wr-hi{color:#3fb950;font-weight:bold}
+.wr-lo{color:#f85149;font-weight:bold}
+select,input{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px;font-size:13px}
+.summary-line{font-size:13px;color:#8b949e;margin-top:6px}
+</style></head><body>
+<h1>&#128300; EMA Diagnostics — сбор данных для анализа</h1>
+<p style="color:#8b949e;font-size:13px;max-width:520px">Широкий (не алертовый) скан касаний EMA7/14/28 на 1h/4h/1d/1w — собирает ВСЕ приближения в пределах 1.0 ATR (не только те, что проходят узкий порог для реального сигнала), отслеживает MFE/MAE и срезы через 15/30/60/120/240 минут после касания. Цель — понять, откуда цена реально отскакивает чаще всего, а не только то, что мы уже алертим.</p>
+<p style="color:#d29922;font-size:12px;max-width:520px">⚠️ "Карта ликвидации" в исходном запросе — честно, у нас её нет (нужен платный источник типа Coinglass). Funding rate — единственный реально доступный прокси перекошенности позиций, это не то же самое, показан отдельным полем в сырых записях.</p>
+
+<div class="section-card">
+  <div class="section-head">
+    <h3>&#128202; Сводка: откуда отскакивает чаще всего</h3>
+    <button onclick="loadSummary()">&#128260; Обновить</button>
+  </div>
+  <div id="summaryStatus" class="summary-line">загрузка...</div>
+  <div class="table-scroll">
+    <table id="summaryTable">
+      <thead><tr><th>ТФ</th><th>EMA</th><th>Касаний</th><th>Оценено</th><th>Bounce rate</th><th>Avg MFE</th><th>Avg MAE</th><th>С просадкой</th><th>LONG bounce%</th><th>SHORT bounce%</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="section-card">
+  <div class="section-head">
+    <h3>&#128203; Последние записи (сырые)</h3>
+    <div>
+      <select id="filterTf" onchange="loadRaw()">
+        <option value="">Все ТФ</option>
+        <option value="1h">1h</option>
+        <option value="4h">4h</option>
+        <option value="1d">1d</option>
+        <option value="1w">1w</option>
+      </select>
+      <select id="filterPeriod" onchange="loadRaw()">
+        <option value="">Все EMA</option>
+        <option value="7">EMA7</option>
+        <option value="14">EMA14</option>
+        <option value="28">EMA28</option>
+      </select>
+      <button onclick="clearDiag()" class="btn-danger-sm">Очистить всё</button>
+    </div>
+  </div>
+  <div id="rawStatus" class="summary-line"></div>
+  <div class="table-scroll">
+    <table id="rawTable">
+      <thead><tr><th>Монета</th><th>ТФ</th><th>EMA</th><th>Подход</th><th>Dist(ATR)</th><th>Vol ratio</th><th>Funding</th><th>MFE</th><th>MAE</th><th>Откат</th><th>15м</th><th>30м</th><th>60м</th><th>120м</th><th>240м</th><th>Статус</th><th>Когда</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+function wrClass(v, hi, lo){
+  if(v === null || v === undefined) return '';
+  if(v >= hi) return 'wr-hi';
+  if(v <= lo) return 'wr-lo';
+  return '';
+}
+function fmtAgo(ts){
+  const s = Math.floor(Date.now()/1000) - ts;
+  if(s < 3600) return Math.floor(s/60)+'м назад';
+  if(s < 86400) return Math.floor(s/3600)+'ч назад';
+  return Math.floor(s/86400)+'д назад';
+}
+function fmtCp(cp){
+  if(!cp) return '—';
+  return `${cp.pct>=0?'+':''}${cp.pct}%`;
+}
+
+async function loadSummary(){
+  const statusEl = document.getElementById('summaryStatus');
+  statusEl.innerText = 'Загрузка...';
+  try{
+    const r = await fetch('/ema_diag_summary'); const d = await r.json();
+    const tbody = document.querySelector('#summaryTable tbody'); tbody.innerHTML = '';
+    for(const e of d.summary){
+      const o = e.overall;
+      const tr = document.createElement('tr');
+      const longBr = e.long ? e.long.bounce_rate : null;
+      const shortBr = e.short ? e.short.bounce_rate : null;
+      tr.innerHTML = `<td>${e.tf}</td><td>EMA${e.period}</td><td>${o.total}</td><td>${o.evaluated}</td>`
+        + `<td class="${wrClass(o.bounce_rate,60,35)}">${o.bounce_rate ?? '—'}%</td>`
+        + `<td>${o.avg_mfe_pct ?? '—'}%</td><td>${o.avg_mae_pct ?? '—'}%</td>`
+        + `<td>${o.retrace_rate ?? '—'}%</td>`
+        + `<td class="${wrClass(longBr,60,35)}">${longBr ?? '—'}${longBr!=null?'%':''}</td>`
+        + `<td class="${wrClass(shortBr,60,35)}">${shortBr ?? '—'}${shortBr!=null?'%':''}</td>`;
+      tbody.appendChild(tr);
+    }
+    statusEl.innerText = d.summary.length ? `Связок с достаточным числом касаний: ${d.summary.length}` : 'Пока недостаточно данных (нужно хотя бы 3 касания на связку)';
+  }catch(e){ statusEl.innerText = '❌ ошибка загрузки'; }
+}
+
+async function loadRaw(){
+  const statusEl = document.getElementById('rawStatus');
+  const tf = document.getElementById('filterTf').value;
+  const period = document.getElementById('filterPeriod').value;
+  let url = '/ema_diag_status?limit=100';
+  if(tf) url += '&tf=' + tf;
+  if(period) url += '&period=' + period;
+  try{
+    const r = await fetch(url); const d = await r.json();
+    const tbody = document.querySelector('#rawTable tbody'); tbody.innerHTML = '';
+    for(const it of d.recent){
+      const tr = document.createElement('tr');
+      const biasCol = it.classic_bias === 'short' ? '#f85149' : '#3fb950';
+      const cps = it.checkpoints || {};
+      tr.innerHTML = `<td>${it.symbol}</td><td>${it.tf}</td><td>EMA${it.period}</td>`
+        + `<td style="color:${biasCol}">${it.side==='from_below'?'снизу→SHORT':'сверху→LONG'}</td>`
+        + `<td>${it.dist_atr}</td><td>${it.vol_ratio ?? '—'}</td><td>${it.funding_rate ?? '—'}</td>`
+        + `<td style="color:#3fb950">+${it.mfe_pct}%</td><td style="color:#f85149">-${it.mae_pct}%</td>`
+        + `<td>${it.retrace_before_favorable ? 'да' : 'нет'}</td>`
+        + `<td>${fmtCp(cps['15'])}</td><td>${fmtCp(cps['30'])}</td><td>${fmtCp(cps['60'])}</td><td>${fmtCp(cps['120'])}</td><td>${fmtCp(cps['240'])}</td>`
+        + `<td>${it.track_done ? 'закрыт' : 'отслеживаем'}</td><td>${fmtAgo(it.ts)}</td>`;
+      tbody.appendChild(tr);
+    }
+    statusEl.innerText = `Показано ${d.recent.length} из ${d.total}`;
+  }catch(e){ statusEl.innerText = '❌ ошибка загрузки'; }
+}
+
+async function clearDiag(){
+  if(!confirm('Точно очистить ВСЮ диагностическую историю? Отменить нельзя.')) return;
+  await fetch('/ema_diag_clear', {method:'POST'});
+  loadSummary(); loadRaw();
+}
+
+loadSummary();
+loadRaw();
+setInterval(loadRaw, 30000);
+</script></body></html>"""
+
+
 WEEKLY_EMA_BACKTEST_HTML_PAGE = """<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Weekly EMA Backtest</title>
@@ -5952,6 +6472,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self._json({"ok": False, "msg": f"Бэктест для {tf} ещё не запускался"})
             except Exception as e:
                 self._json({"ok": False, "msg": str(e)})
+        elif self.path.startswith("/ema_diag_status"):
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            tf_filter = (params.get("tf") or [None])[0]
+            period_filter = (params.get("period") or [None])[0]
+            limit = int((params.get("limit") or [200])[0])
+            with _diag_lock:
+                items = list(_diag_records)
+            if tf_filter:
+                items = [r for r in items if r["tf"] == tf_filter]
+            if period_filter:
+                items = [r for r in items if str(r["period"]) == str(period_filter)]
+            items.sort(key=lambda r: r["ts"], reverse=True)
+            self._json({"total": len(items), "recent": items[:limit]})
+        elif self.path == "/ema_diag_summary":
+            self._json({"summary": _diag_summary()})
+        elif self.path == "/ema_diag" or self.path == "/ema_diag.html":
+            body = EMA_DIAG_HTML_PAGE.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", len(body))
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+            self.end_headers()
+            self.wfile.write(body)
         else:
             self.send_response(404); self.end_headers()
       except Exception as e:
@@ -6024,6 +6568,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             with _pump_detect_lock:
                 _pump_dump_history_save_all(DUMP_DETECT_HISTORY_FILE, [])
             olog("[dump_detect] история дампов очищена вручную")
+            self._json({"ok": True})
+
+        elif self.path == "/ema_diag_clear":
+            global _diag_records
+            with _diag_lock:
+                _diag_records = []
+            _diag_save()
+            olog("[ema_diag] диагностическая история очищена вручную")
             self._json({"ok": True})
 
         elif self.path == "/ema_dossier_start":
@@ -6216,6 +6768,7 @@ def main():
     # не зависит от того, какие циклы включены.
     _load_weekly_ema_history()
     _load_scan_settings()
+    _diag_load()
     threading.Thread(target=_watchdog_loop, daemon=True).start()
     threading.Thread(target=_heartbeat_loop, daemon=True).start()
     # v0.5.0: остановлен по запросу — уходим от EMA-инверт как основной
@@ -6227,6 +6780,8 @@ def main():
     threading.Thread(target=_pump_detect_loop, daemon=True).start()
     threading.Thread(target=_weekly_ema_resolve_loop, daemon=True).start()
     threading.Thread(target=_pump_dump_track_loop, daemon=True).start()
+    threading.Thread(target=_diag_scan_loop, daemon=True).start()
+    threading.Thread(target=_diag_track_loop, daemon=True).start()
     # v0.13.0: полностью заменено на триггер от пампа/дампа (см.
     # _pump_or_dump_maybe_trigger_ema_signal, вызывается изнутри
     # _pump_fire_alert/_dump_fire_alert) — постоянный опрос топ-100 монет
