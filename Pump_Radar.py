@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.17.0 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.18.0 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.18.0: по запросу — (1) количество монет, участвующих в поиске сигналов
+  (было жёстко зашитое PUMP_DETECT_TOP_N=100), вынесено в настройку
+  /scan_settings — меняется прямо на странице (поле + кнопка "Сохранить"
+  сверху), сохраняется на диск, применяется со следующего цикла сканирования
+  без рестарта процесса. (2) Недостаточность истории на новых листингах
+  теперь кэшируется — раньше монета без достаточной недельной/дневной
+  истории заново дёргала полный фетч (до 400 дней) на КАЖДОЙ проверке после
+  каждого пампа/дампа и каждый раз получала один и тот же отрицательный
+  результат впустую. Теперь _ema_touch_get_closed_ctx запоминает "у этой
+  монеты недостаточно истории" на 3 дня и не тратит сеть повторно. Проверено
+  тестом: настройка сохраняется/применяется через реальный HTTP, повторный
+  fetch для новой монеты не дублируется.
 - v0.17.0: по запросу — кнопки очистки истории с подтверждением на все три
   таблицы главной страницы (Живые пампы / Живые дампы / Касания EMA7/14/28),
   не только одна. Каждая — свой confirm() и свой POST-эндпоинт
@@ -268,7 +280,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.17.0"
+APP_VERSION  = "0.18.0"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2296,6 +2308,15 @@ details[open] summary:before{content:"▾ "}
 <button onclick="openAlertSettings()" style="background:#21262d;border:1px solid #30363d">&#128276; Алерты</button>
 <a href="/pump_match" style="text-decoration:none"><button style="background:#8250df">&#127919; Pump Match (подбор параметров отрисовки)</button></a>
 <a href="/weekly_ema_backtest" style="text-decoration:none"><button style="background:#8250df">&#128202; Weekly EMA Backtest</button></a>
+<div class="section-card" style="max-width:420px">
+  <label style="display:block;font-size:13px;color:#8b949e">Сколько монет по объёму участвует в поиске (топ-N)</label>
+  <div style="display:flex;gap:8px;margin-top:6px;align-items:center">
+    <input type="number" id="topNInput" min="1" max="500" style="width:100px;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:8px;font-size:14px">
+    <button onclick="saveTopN()" style="margin:0">Сохранить</button>
+    <span id="topNMsg" style="font-size:12px;color:#8b949e"></span>
+  </div>
+  <p style="font-size:11px;color:#6e7681;margin:6px 0 0">Монеты без достаточной недельной/дневной истории (новые листинги) автоматически пропускаются при поиске EMA-сигналов, даже если попали в топ-N.</p>
+</div>
 <div id="status"></div>
 
 <div id="alertModal">
@@ -2398,6 +2419,25 @@ async function testAlert(){
   msg.style.color = d.ok ? '#3fb950' : '#f85149';
   msg.innerText = d.ok ? '✅ Тестовое сообщение отправлено' : ('Ошибка: ' + (d.error||''));
 }
+
+async function loadTopN(){
+  try{
+    const r = await fetch('/scan_settings'); const d = await r.json();
+    document.getElementById('topNInput').value = d.top_n;
+  }catch(e){}
+}
+async function saveTopN(){
+  const msg = document.getElementById('topNMsg');
+  const val = parseInt(document.getElementById('topNInput').value);
+  if(!val || val < 1 || val > 500){ msg.style.color = '#f85149'; msg.innerText = 'Введи число от 1 до 500'; return; }
+  try{
+    const r = await fetch('/scan_settings', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({top_n: val})});
+    const d = await r.json();
+    msg.style.color = d.ok ? '#3fb950' : '#f85149';
+    msg.innerText = d.ok ? `Сохранено (${d.top_n}) — применится со следующего цикла сканирования` : (d.msg || 'Ошибка');
+  }catch(e){ msg.style.color = '#f85149'; msg.innerText = 'Ошибка запроса'; }
+}
+loadTopN();
 
 function fmtAgo(ts){
   const s = Math.floor(Date.now()/1000) - ts;
@@ -3157,8 +3197,49 @@ PUMP_MOVE_WINDOW_MIN      = 20    # окно, по которому считае
 PUMP_THRESHOLD_PCT        = 5.0   # порог срабатывания
 PUMP_DETECT_POLL_SEC      = 60    # как часто обновляем цены (один общий /tickers запрос)
 PUMP_DETECT_COOLDOWN_SEC  = 30 * 60   # не повторять алерт по той же монете чаще, пока памп длится
-PUMP_DETECT_TOP_N         = 100   # сколько монет по объёму отслеживаем (см. _fetch_all_symbols)
+PUMP_DETECT_TOP_N_DEFAULT = 100   # дефолт для _scan_settings["top_n"] — сколько монет по объёму отслеживаем
 PUMP_DETECT_HISTORY_FILE  = os.path.expanduser("~/pumpradar_pump_history.json")  # необязательный лог сработавших пампов
+SCAN_SETTINGS_FILE = os.path.expanduser("~/pumpradar_scan_settings.json")
+# v0.18.0: по запросу — "количество пар, которые участвуют в поиске
+# сигналов" вынесено в настройку, меняемую через UI (было жёстко зашитым
+# PUMP_DETECT_TOP_N=100). Влияет и на пампы/дампы (_pump_detect_loop), и
+# транзитивно на EMA-касания (они триггерятся только по монетам, которые
+# вообще попали в этот скан).
+_scan_settings = {"top_n": PUMP_DETECT_TOP_N_DEFAULT}
+_scan_settings_lock = threading.Lock()
+
+
+def _load_scan_settings():
+    global _scan_settings
+    try:
+        if os.path.exists(SCAN_SETTINGS_FILE):
+            with open(SCAN_SETTINGS_FILE) as f:
+                saved = json.load(f)
+            if "top_n" in saved:
+                with _scan_settings_lock:
+                    _scan_settings["top_n"] = max(1, min(500, int(saved["top_n"])))
+            olog(f"[scan_settings] загружено: {_scan_settings}")
+    except Exception as e:
+        olog(f"[scan_settings] ⚠ не смог загрузить: {e}")
+
+
+def _save_scan_settings(top_n):
+    global _scan_settings
+    with _scan_settings_lock:
+        _scan_settings["top_n"] = max(1, min(500, int(top_n)))
+        snapshot = dict(_scan_settings)
+    try:
+        with open(SCAN_SETTINGS_FILE, "w") as f:
+            json.dump(snapshot, f)
+        olog(f"[scan_settings] сохранено и применено: {snapshot}")
+    except Exception as e:
+        olog(f"[scan_settings] ⚠ не смог сохранить: {e}")
+
+
+def _get_scan_top_n():
+    with _scan_settings_lock:
+        return _scan_settings["top_n"]
+
 
 _pump_detect_lock   = threading.Lock()
 _pump_price_history = {}   # symbol -> [(ts, price), ...] по возрастанию времени
@@ -3795,7 +3876,7 @@ def _pump_detect_loop():
             if snapshot:
                 top_symbols = sorted(snapshot.keys(),
                                       key=lambda s: snapshot[s]["vol24"],
-                                      reverse=True)[:PUMP_DETECT_TOP_N]
+                                      reverse=True)[:_get_scan_top_n()]
                 _pump_update_history(snapshot, top_symbols)
                 now = time.time()
                 for sym in top_symbols:
@@ -3901,25 +3982,42 @@ def _load_weekly_ema_history():
              f"(файл мог повредиться при аварийном завершении — начинаем с пустой истории)")
 
 
-_ema_touch_ctx_cache = {}   # "symbol|tf" -> {candles, closes, atr_v, i, ema_arrays, next_close_t}
+_ema_touch_ctx_cache = {}   # "symbol|tf" -> {candles, closes, atr_v, i, ema_arrays, next_close_t} ИЛИ {"insufficient": True, next_close_t}
 _ema_touch_ctx_lock = threading.Lock()
+# монета без достаточной истории не "дорастает" до неё за минуты — не
+# смысла дёргать полный фетч (до 400 дней для недельного ТФ) на каждую
+# проверку после каждого пампа/дампа. Перепроверяем раз в несколько дней.
+EMA_TOUCH_INSUFFICIENT_HISTORY_RECHECK_SEC = 3 * 86400
 
 
 def _ema_touch_get_closed_ctx(symbol, tf):
     """Дорогая часть (фетч дневной истории + EMA/ATR по ЗАКРЫТЫМ барам) —
     кэшируется и пересчитывается только когда по времени должен был
     закрыться новый бар этого ТФ (без похода в API, чистая арифметика от
-    времени последнего известного закрытия), а не на каждый опрос."""
+    времени последнего известного закрытия), а не на каждый опрос.
+    Отдельно кэширует НЕДОСТАТОЧНОСТЬ истории (новые листинги) — иначе
+    каждый памп/дамп на свежей монете зря дёргал бы полный фетч и получал
+    один и тот же отрицательный результат снова и снова."""
     key = f"{symbol}|{tf}"
     now = time.time()
     with _ema_touch_ctx_lock:
         cached = _ema_touch_ctx_cache.get(key)
     if cached and now < cached["next_close_t"]:
-        return cached
+        return None if cached.get("insufficient") else cached
     fetch_days = WEEKLY_EMA_FETCH_DAYS if tf == "1w" else DAILY_EMA_FETCH_DAYS
     raw = _fetch_candles(symbol, "1d", fetch_days)
     candles = _resample_to_weekly(raw) if tf == "1w" else raw
-    if len(candles) < max(WEEKLY_EMA_PERIODS) + 5:
+    min_bars = max(WEEKLY_EMA_PERIODS) + 5
+    if len(candles) < min_bars:
+        with _ema_touch_ctx_lock:
+            _ema_touch_ctx_cache[key] = {
+                "insufficient": True,
+                "next_close_t": now + EMA_TOUCH_INSUFFICIENT_HISTORY_RECHECK_SEC,
+            }
+        olog(f"[weekly_ema] {symbol} {tf}: недостаточно истории для EMA28 "
+             f"({len(candles)} баров из {min_bars} нужных, похоже на новый листинг) — "
+             f"пропускаем, перепроверим через "
+             f"{EMA_TOUCH_INSUFFICIENT_HISTORY_RECHECK_SEC // 86400} дн.")
         return None
     closes = [c["close"] for c in candles]
     atr_arr = _atr(candles, 14)
@@ -4289,7 +4387,7 @@ def _weekly_ema_touch_loop():
     _load_weekly_ema_history()
     while True:
         try:
-            symbols = _fetch_all_symbols()[:WEEKLY_EMA_SCAN_TOP_N]
+            symbols = _fetch_all_symbols()[:_get_scan_top_n()]
             now = time.time()
             for symbol in symbols:
                 for tf in EMA_TOUCH_TIMEFRAMES:
@@ -5800,6 +5898,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "hc_url": HC_URL,
                         "watchdog_enabled": WATCHDOG_ENABLED,
                         "watchdog_timeout_min": WATCHDOG_TIMEOUT_MIN})
+        elif self.path == "/scan_settings":
+            self._json({"top_n": _get_scan_top_n()})
         elif self.path == "/pump_match" or self.path == "/pump_match.html":
             body = PUMP_MATCH_HTML_PAGE.encode()
             self.send_response(200)
@@ -5885,6 +5985,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     pass
             _save_alert_cfg()
             self._json({"ok": True})
+
+        elif self.path == "/scan_settings":
+            try:
+                top_n = int(body.get("top_n"))
+                if not (1 <= top_n <= 500):
+                    raise ValueError("вне диапазона 1-500")
+            except (TypeError, ValueError) as e:
+                self._json({"ok": False, "msg": f"Некорректное значение top_n: {e}"}); return
+            _save_scan_settings(top_n)
+            self._json({"ok": True, "top_n": _get_scan_top_n()})
 
         elif self.path == "/alert_test":
             ok, err = _test_alert()
@@ -6105,6 +6215,7 @@ def main():
     # _weekly_ema_resolve_loop их больше не видел. Теперь вызывается здесь,
     # не зависит от того, какие циклы включены.
     _load_weekly_ema_history()
+    _load_scan_settings()
     threading.Thread(target=_watchdog_loop, daemon=True).start()
     threading.Thread(target=_heartbeat_loop, daemon=True).start()
     # v0.5.0: остановлен по запросу — уходим от EMA-инверт как основной
