@@ -1,7 +1,38 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.22.1 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.24.0 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.24.0: по запросу — Sell-Volume Anomaly Watcher теперь тоже шлёт
+  картинку, но ДРУГОГО стиля, чем памп/дамп (визуально отличать в списке
+  Telegram-уведомлений). Новый _render_vol_anomaly_chart_png: та же общая
+  структура (белый фон, чёрная линия цены, синие пунктирные уровни,
+  красная базовая линия), но заливка — ФИОЛЕТОВАЯ и это РЕАЛЬНЫЙ ряд
+  объёма именно на red-свечах (то, что детектор реально считает для
+  z-score), не directional split зелёное/красное, как у пампа/дампа —
+  тот прежний режим остался нетронутым. Сама аномальная свеча подсвечена
+  отдельным оранжевым маркером сверху — тот же дух, что стрелка на
+  референс-скрине RARE. Проверено попиксельно (фиолетовая заливка,
+  оранжевый маркер, чёрная линия — все на месте) и сквозным тестом
+  через реальный _vol_anomaly_fire_alert.
+- v0.23.0: два фикса по прямому запросу и разбору реального сигнала.
+  (1) БАГ, пойманный на реальном скрине (ASTEROID_USDT) — side/classic_bias
+  считается по ПРЕДЫДУЩЕМУ закрытому бару, а entry=level сравнивается с
+  ЖИВОЙ ценой; если цена внутри текущего (ещё не закрытого) бара уже
+  прошла уровень насквозь, они рассогласуются — получался SHORT с входом
+  НИЖЕ текущей цены (бессмысленно: для шорта лимитка должна быть выше
+  цены, продаём дороже — сверено на всех реальных примерах стороннего
+  бота, там эта связь строго соблюдается). Добавлен guard: для SHORT вход
+  обязан быть >= живой цены, для LONG <= — иначе тихо пропускаем касание,
+  сторона и уровень уже рассогласованы внутри дня. Проверено тестом на
+  точной реконструкции сценария со скрина (0 вместо ложного сигнала) и на
+  нормальных случаях (не сломался, проходят как раньше, для обоих
+  направлений). (2) По данным реальной статистики (см. предыдущий анализ)
+  — пампы, пойманные 120-минутным окном, дают исход в пользу шорта только
+  в 44% случаев против ~85% у 20/60-минутных. Не отключаем (выборка
+  13-16 на группу, не железобетонно), но помечаем такие сигналы в тексте
+  алерта ("⚠️ памп пойман медленным окном — ниже уверенность") и сохраняем
+  пометку в историю для дальнейшего анализа. Дамп пока не трогаем — там
+  аналогичная выборка (n=8) искажена одним тикером, недостаточно надёжно.
 - v0.22.1: по запросу — кнопки "Скачать" (💾) на всех четырёх таблицах
   главной страницы (Живые пампы / Живые дампы / Аномальный объём продаж /
   Касания EMA), не только на /ema_diag как раньше. Новые эндпоинты
@@ -407,7 +438,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.22.1"
+APP_VERSION  = "0.24.0"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3597,7 +3628,7 @@ def _dump_detect_check(symbol):
     return None
 
 
-def _pump_or_dump_maybe_trigger_ema_signal(symbol, expected_bias):
+def _pump_or_dump_maybe_trigger_ema_signal(symbol, expected_bias, confidence_note=None):
     """После срабатывания пампа/дампа проверяет ОБА ТФ (неделя/день) на
     касание EMA7/14/28 — если памп/дамп долетел до уровня, это и есть
     полноценный сигнал (не просто уведомление о движении). expected_bias
@@ -3606,7 +3637,10 @@ def _pump_or_dump_maybe_trigger_ema_signal(symbol, expected_bias):
     движения (only fire, если реально совпало — иначе это редкий
     пограничный случай рассинхрона между внутридневным движением и
     закрытой историей, лучше промолчать, чем прислать нелогичное
-    сочетание направлений)."""
+    сочетание направлений). confidence_note — необязательная пометка,
+    добавляется в текст алерта как есть (см. вызов из _pump_fire_alert —
+    v0.23.0: 120-минутное окно эмпирически даёт заметно худшие исходы для
+    шорта, чем 20/60-минутное — см. changelog)."""
     for tf in EMA_TOUCH_TIMEFRAMES:
         try:
             touches = _ema_touch_check_symbol(symbol, tf)
@@ -3623,7 +3657,7 @@ def _pump_or_dump_maybe_trigger_ema_signal(symbol, expected_bias):
                 last = _weekly_ema_touch_state.get(key, 0)
             if now - last < cooldown:
                 continue
-            _weekly_ema_fire_alert(touch)
+            _weekly_ema_fire_alert(touch, confidence_note=confidence_note)
             with _weekly_ema_touch_lock:
                 _weekly_ema_touch_state[key] = now
 
@@ -3916,6 +3950,124 @@ def _render_pump_chart_variant(candles, base_price, volume_mode="directional",
     return buf.getvalue()
 
 
+def _render_vol_anomaly_chart_png(candles, base_price, anomaly_t=None):
+    """Параллельный _render_pump_chart_variant специально под алерты
+    Sell-Volume Anomaly Watcher — по прямому запросу "визуально отличать"
+    от обычных памп/дамп картинок. Та же структура (белый фон, чёрная
+    линия цены, синие пунктирные уровни, красная базовая линия), но:
+      - заливка — это РЕАЛЬНЫЙ ряд объёма именно на red-свечах (то, что
+        детектор реально меряет для z-score), не directional split
+        зелёное/красное, как у пампа/дампа;
+      - заливка ФИОЛЕТОВАЯ, не зелёно-красная — сразу видно другой тип
+        алерта в списке уведомлений Telegram;
+      - сама аномальная свеча (anomaly_t) подсвечена отдельным маркером
+        (оранжевая звезда сверху) — видно, что именно её увидел детектор,
+        как стрелка на референс-скрине RARE.
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return None
+    if not candles or len(candles) < 3:
+        return None
+
+    W, H = 960, 540
+    pad_l, pad_r, pad_t, pad_b = 60, 60, 24, 40
+    bg           = (255, 255, 255)
+    grid_color   = (70, 70, 150)
+    line_color   = (15, 15, 15)
+    fill_color   = (142, 68, 201)     # фиолетовый — не зелёный/красный памп-детектора
+    baseline_col = (206, 28, 28)
+    text_color   = (50, 50, 50)
+    marker_color = (235, 140, 20)     # оранжевая подсветка аномальной свечи
+
+    closes = [c["close"] for c in candles]
+    opens  = [c["open"] for c in candles]
+    times  = [c["t"] for c in candles]
+    n = len(candles)
+
+    pmin = min(closes + [base_price])
+    pmax = max(closes + [base_price])
+    if pmax <= pmin:
+        pmax = pmin + max(abs(pmin) * 0.001, 1e-9)
+
+    # ряд объёма именно на red-свечах (close < open), 0 на зелёных — ровно
+    # то, что _detect_sell_volume_anomaly реально считает
+    red_vol_raw = [(c.get("vol", 0) or 0) if closes[i] < opens[i] else 0.0
+                   for i, c in enumerate(candles)]
+    vmax = max(red_vol_raw, default=1.0) or 1.0
+
+    img = Image.new("RGB", (W, H), bg)
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+
+    plot_w = W - pad_l - pad_r
+    plot_h = H - pad_t - pad_b
+
+    def x_of(i):
+        return pad_l + (i / (n - 1) * plot_w if n > 1 else 0)
+
+    def y_price(v):
+        return pad_t + (pmax - v) / (pmax - pmin) * plot_h
+
+    def y_vol(v):
+        return pad_t + (1 - v / vmax) * plot_h
+
+    floor_y = pad_t + plot_h
+
+    d = ImageDraw.Draw(img)
+    for k in range(5):
+        v = pmin + (pmax - pmin) * k / 4.0
+        yy = y_price(v)
+        xx = pad_l
+        while xx < W - pad_r:
+            d.line([(xx, yy), (min(xx + 6, W - pad_r), yy)], fill=grid_color, width=1)
+            xx += 10
+        d.text((4, yy - 6), f"{v:.6g}", fill=text_color, font=font)
+
+    for k in range(5):
+        vv = vmax * k / 4.0
+        yy = y_vol(vv)
+        d.text((W - pad_r + 4, yy - 6), f"{vv:,.0f}".replace(",", " "), fill=text_color, font=font)
+
+    overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    od = ImageDraw.Draw(overlay)
+    pts = [(x_of(i), y_vol(red_vol_raw[i])) for i in range(n)]
+    poly = [(x_of(0), floor_y)] + pts + [(x_of(n - 1), floor_y)]
+    od.polygon(poly, fill=fill_color + (110,))
+    od.line(pts, fill=fill_color + (230,), width=2)
+    img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+    d = ImageDraw.Draw(img)
+
+    by = y_price(base_price)
+    d.line([(pad_l, by), (W - pad_r, by)], fill=baseline_col, width=2)
+    d.text((W - pad_r + 4, by - 6), f"{base_price:.6g}", fill=baseline_col, font=font)
+
+    pts_price = [(x_of(i), y_price(closes[i])) for i in range(n)]
+    d.line(pts_price, fill=line_color, width=2)
+    for (xx, yy) in pts_price:
+        d.ellipse([xx - 2, yy - 2, xx + 2, yy + 2], fill=line_color)
+
+    # подсветка аномальной свечи -- маленький оранжевый треугольник сверху,
+    # тем же духом, что стрелка на референс-скрине RARE
+    if anomaly_t is not None:
+        idx = min(range(n), key=lambda i: abs(times[i] - anomaly_t))
+        ax, ay = x_of(idx), y_price(closes[idx])
+        d.polygon([(ax - 6, ay - 14), (ax + 6, ay - 14), (ax, ay - 4)], fill=marker_color)
+
+    step = max(1, n // 10)
+    for i in range(0, n, step):
+        xx = x_of(i)
+        lbl = time.strftime("%H:%M", time.localtime(times[i]))
+        d.text((xx - 14, H - pad_b + 6), lbl, fill=text_color, font=font)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def _render_pump_chart_png(candles, base_price):
     """Обёртка для живых алертов — рисует текущими сохранёнными параметрами
     (см. _pump_render_params / /pump_match). Сигнатура не меняется, чтобы
@@ -4065,7 +4217,18 @@ def _pump_fire_alert(symbol, res):
     _pump_dump_history_append(PUMP_DETECT_HISTORY_FILE, rec)
 
     try:
-        _pump_or_dump_maybe_trigger_ema_signal(symbol, expected_bias="short")
+        # v0.23.0: по данным реальной статистики — пампы, пойманные
+        # 120-минутным окном, откатывают вниз (выигрышно для SHORT) только
+        # в 44% случаев против 85% у 20/60-минутных (n=13-16 на группу,
+        # проверено на реальных пампах). Помечаем такие сигналы прямо в
+        # алерте, не отключаем — данных пока не железобетонно много, но
+        # предупредить лучше, чем молчать.
+        confidence_note = None
+        if res.get("window_min") == 120:
+            confidence_note = ("памп пойман медленным (120-мин) окном — по накопленной статистике "
+                                "такие чаще продолжают расти, чем откатывают (только ~44% случаев в "
+                                "пользу шорта против ~85% у резких пампов) — ниже уверенность")
+        _pump_or_dump_maybe_trigger_ema_signal(symbol, expected_bias="short", confidence_note=confidence_note)
     except Exception as e:
         olog(f"[pump_detect] {symbol}: ошибка проверки EMA-триггера: {e}")
 
@@ -4223,12 +4386,32 @@ def _vol_anomaly_fire_alert(symbol, res):
     шлёт алерт И запускает проверку EMA-уровня (expected_bias="short" —
     в его же примере RARE аномальный red-объём предшествовал росту цены
     в сопротивление, та же логика, что у нашего Pump Detector). Плюс
-    трекинг MFE/MAE для дальнейшего анализа."""
-    _send_alert(
+    трекинг MFE/MAE для дальнейшего анализа.
+    v0.24.0: по запросу — картинка вместо голого текста, но ДРУГОГО стиля,
+    чем у пампа/дампа (_render_vol_anomaly_chart_png — фиолетовая заливка
+    реального red-объёма + подсветка самой аномальной свечи), чтобы в
+    списке уведомлений Telegram сразу было видно, какой это тип алерта."""
+    candles = []
+    try:
+        days = max(1, math.ceil(VOL_ANOMALY_LOOKBACK_MIN * 60 / 86400) + 1)
+        raw = _fetch_candles(symbol, "1m", days)
+        cutoff = time.time() - VOL_ANOMALY_LOOKBACK_MIN * 60
+        candles = [c for c in raw if c["t"] >= cutoff]
+    except Exception as e:
+        olog(f"[vol_anomaly] {symbol}: не смог получить свечи для графика: {e}")
+
+    png = None
+    try:
+        png = _render_vol_anomaly_chart_png(candles, res["price"], anomaly_t=res.get("candle_t"))
+    except Exception as e:
+        olog(f"[vol_anomaly] {symbol}: ошибка рендера графика: {e}")
+
+    caption = (
         f"📐 <b>{symbol}</b> — аномальный объём на продажу\n"
         f"z-score: {res['z']} (объём {res['vol']:.0f} против среднего {res['mean']:.0f} ± {res['std']:.0f})\n"
         f"Цена: {_fmt_px(res['price'])}"
     )
+    _send_alert_photo(png, caption)
     olog(f"[vol_anomaly] {symbol}: z-score={res['z']} vol={res['vol']:.0f} — алерт отправлен")
     now = time.time()
     rec = {"ts": int(now), "symbol": symbol, "z": res["z"], "vol": res["vol"],
@@ -4532,6 +4715,23 @@ def _ema_touch_check_symbol(symbol, tf="1w"):
                      f"большой относительно цены (entry={entry:.6g} stop={stop:.6g} "
                      f"take={take:.6g}), стоп/тейк ушли бы в отрицательную цену")
                 continue
+            # v0.23.0: side/classic_bias считается по ПРЕДЫДУЩЕМУ закрытому
+            # бару (вчера), а entry=level сравнивается с ЖИВОЙ ценой
+            # (сейчас) — если цена внутри текущего (ещё не закрытого) бара
+            # уже прошла уровень НАСКВОЗЬ, эти два получаются рассогласованы:
+            # для SHORT вход обязан быть ВЫШЕ текущей цены (продаём дороже,
+            # ждём отскока ВНИЗ от уровня) — если уровень уже НИЖЕ цены,
+            # значит цена его уже пробила, а не тестирует свежо снизу, как
+            # предполагает bias. Зеркально для LONG (вход обязан быть
+            # НИЖЕ цены). Сверено на реальных примерах — у всех рабочих
+            # его сигналов эта связь строго соблюдается (SHORT: вход выше
+            # цены, LONG: вход ниже). Если не соблюдается — сторона и
+            # уровень уже рассогласованы внутри дня, тихо пропускаем.
+            if (classic_bias == "short" and entry < price) or (classic_bias == "long" and entry > price):
+                olog(f"[weekly_ema] {symbol} {tf} EMA{period}: пропуск — вход ({entry:.6g}) "
+                     f"с неверной стороны от живой цены ({price:.6g}) для {classic_bias} "
+                     f"— уровень уже пробит внутри дня, side/bias устарели")
+                continue
             levels = []
             for lvl_period in WEEKLY_EMA_PERIODS:
                 lvl_val = live_ema_values[lvl_period]
@@ -4699,7 +4899,7 @@ def _render_ema_touch_chart_png(touch, lookback=50):
     return buf.getvalue()
 
 
-def _weekly_ema_fire_alert(touch):
+def _weekly_ema_fire_alert(touch, confidence_note=None):
     ladder_note = {"up": "лесенка вверх (здоровый up-тренд)",
                    "down": "лесенка вниз (здоровый down-тренд)",
                    None: "лесенка не выстроена (боковик/переход)"}[touch["ladder"]]
@@ -4711,6 +4911,7 @@ def _weekly_ema_fire_alert(touch):
         f"• EMA{lv['period']}({'W' if touch['tf']=='1w' else 'D'}): {_fmt_px(lv['value'])} — {lv['role']}"
         for lv in touch.get("levels", [])
     )
+    confidence_line = f"\n⚠️ {confidence_note}" if confidence_note else ""
     msg = (f"📐 <b>{touch['symbol']}</b> | EMA{touch['period']}({'W' if touch['tf']=='1w' else 'D'}) | "
            f"{touch['classic_bias'].upper()}\n"
            f"Цена: {_fmt_px(touch['price'])}\n"
@@ -4718,7 +4919,8 @@ def _weekly_ema_fire_alert(touch):
            f"Стоп: {_fmt_px(touch['stop'])} | Тейк: {_fmt_px(touch['take'])} (RR {touch['rr']})\n\n"
            f"Уровни:\n{levels_lines}\n\n"
            f"Расстояние: {touch['dist_atr']} ATR | подход {side_note}\n"
-           f"{bias_note} (если сыграет отскок, а не пробой) | {ladder_note}")
+           f"{bias_note} (если сыграет отскок, а не пробой) | {ladder_note}"
+           f"{confidence_line}")
     png = None
     try:
         png = _render_ema_touch_chart_png(touch)
@@ -4726,14 +4928,15 @@ def _weekly_ema_fire_alert(touch):
         olog(f"[weekly_ema] {touch['symbol']}: ошибка рендера графика: {e}")
     _send_alert_photo(png, msg)
     olog(f"[weekly_ema] {touch['symbol']}: касание EMA{touch['period']} на {touch['tf']} "
-         f"(dist={touch['dist_atr']} ATR, side={touch['side']}) — алерт отправлен")
+         f"(dist={touch['dist_atr']} ATR, side={touch['side']}) — алерт отправлен"
+         + (f" [{confidence_note}]" if confidence_note else ""))
     rec = {"ts": int(time.time()), "symbol": touch["symbol"], "tf": touch["tf"],
            "period": touch["period"],
            "price": touch["price"], "ema_value": touch["ema_value"],
            "dist_atr": touch["dist_atr"], "ladder": touch["ladder"],
            "side": touch["side"], "classic_bias": touch["classic_bias"],
            "entry": touch["entry"], "stop": touch["stop"], "take": touch["take"],
-           "rr": touch["rr"],
+           "rr": touch["rr"], "confidence_note": confidence_note,
            "outcome": "open", "resolved_at": None, "resolved_price": None}
     global _weekly_ema_recent
     _weekly_ema_recent.append(rec)
