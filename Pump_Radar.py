@@ -1,7 +1,51 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.20.0 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.22.0 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.22.0: автор стороннего бота подтвердил напрямую (не по пикселям) — red
+  это объём на red-свечах (продажи), по симметрии зелёное — объём на
+  green-свечах (покупки). Это ровно volume_mode="directional" +
+  source="volume", уже бывший дефолтом в коде — но старый /pump_match
+  (слепой визуальный грид-серч по десяткам гипотез: dual_period,
+  dual_source, разные source) мог сохранить ДРУГОЙ режим, и тот файл имел
+  приоритет над дефолтом. _load_pump_render_params и _save_pump_render_params
+  теперь форсируют подтверждённые volume_mode/source при каждой загрузке
+  И сохранении — не зависит от того, что лежит в файле, не потеряется при
+  следующем обновлении, и будущий прогон /pump_match больше не сможет
+  случайно переключить обратно на неверную гипотезу. Заодно упростил сам
+  /pump_match: раз источник/режим больше не гипотеза, а факт — перебор
+  сократился с тысяч комбинаций (перебирал ещё и source/dual_period/
+  dual_source вслепую) до перебора только способа/периода сглаживания
+  поверх подтверждённых directional/volume — быстрее и не тратит время на
+  заведомо неверные варианты. Проверено тестом: сохранённый файл с
+  "неверным" режимом (dual_source/price_change) корректно переписывается
+  на directional/volume при загрузке, а неподтверждённые параметры
+  сглаживания сохраняются как были.
+- v0.21.0: по прямой цитате автора стороннего бота ("Первый фильтр — это
+  большие объёмы на продажу, дисперсия отклонений от среднего", скрин RARE
+  со стрелкой на всплеск red-объёма за 30-40 минут до пробоя цены) — новый
+  Sell-Volume Anomaly Watcher, с тем же статусом триггера, что у Pump/Dump
+  Detector (по прямому запросу — не отдельный экспериментальный слой, а
+  полноценная часть пайплайна). _detect_sell_volume_anomaly считает
+  z-score объёма ПОСЛЕДНЕЙ red-свечи относительно среднего/std всех
+  red-свечей за 2 часа — при z>=2.5 шлёт алерт И сразу проверяет EMA-
+  уровень (expected_bias="short", та же логика, что у пампа — в примере
+  RARE аномалия предшествовала именно росту цены в сопротивление), может
+  дать полный сигнал раньше, чем цена вообще успеет заметно сдвинуться.
+  Известен только "первый шаг" его алгоритма (сам автор пишет "второй шаг
+  анализа кидать?") — реализован он один, трекинг MFE/MAE (тот же принцип,
+  что у пампа/дампа) оставлен, чтобы дальше было видно, насколько он сам
+  по себе полезен. Новая таблица "Аномальный объём продаж" на главной
+  странице, /vol_anomaly_status, кнопка очистки. Проверено тестом: детект
+  корректно ловит выброс и корректно молчит на обычном объёме; полная
+  цепочка аномалия→EMA-проверка→полный сигнал отработала на синтетике.
+- v0.20.1: по запросу — скринсейвер теперь ещё и уходит в полноэкранный
+  режим (Fullscreen API, с кроссбраузерными префиксами webkit/moz/ms) —
+  весь экран чёрный, включая адресную строку/статус-бар, не только
+  видимая область страницы. Если полноэкранный режим сняли снаружи
+  (системный жест/кнопка назад), а не через тап по экрану — состояние
+  синхронизируется само (wake lock освобождается, оверлей скрывается),
+  не остаётся повисшим.
 - v0.20.0: по реальным скринам — Pump/Dump Detector ловил только РЕЗКИЕ
   движения (одно окно 20 минут / 5%). Медленный разгон (час-полтора, как
   на присланных примерах) не давал 5%+ ни в одном 20-минутном сегменте —
@@ -353,7 +397,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.20.0"
+APP_VERSION  = "0.22.0"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2439,7 +2483,18 @@ details[open] summary:before{content:"▾ "}
 
 <div class="section-card">
   <div class="section-head">
-    <h3>&#128204; Касания EMA7/14/28 (триггер — памп/дамп)</h3>
+    <h3>&#128300; Аномальный объём продаж</h3>
+    <button onclick="clearHistory('vol_anomaly')" class="btn-danger-sm">Очистить</button>
+  </div>
+  <div id="volAnomalySummary" class="summary-line">пока не было срабатываний</div>
+  <div class="table-scroll">
+    <table id="volAnomaly"><thead><tr><th>Монета</th><th>z-score</th><th>Объём</th><th>Цена</th><th>После сигнала</th><th>Когда</th></tr></thead><tbody></tbody></table>
+  </div>
+</div>
+
+<div class="section-card">
+  <div class="section-head">
+    <h3>&#128204; Касания EMA7/14/28 (триггер — памп/дамп/объём)</h3>
     <button onclick="clearHistory('weekly_ema')" class="btn-danger-sm">Очистить</button>
   </div>
   <div id="weeklyEmaSummary" class="summary-line">пока не было срабатываний</div>
@@ -2516,8 +2571,22 @@ async function saveTopN(){
 loadTopN();
 
 let _wakeLock = null;
+function _requestFullscreenCompat(el){
+  const fn = el.requestFullscreen || el.webkitRequestFullscreen || el.mozRequestFullScreen || el.msRequestFullscreen;
+  return fn ? fn.call(el) : Promise.reject(new Error('Fullscreen API недоступен'));
+}
+function _exitFullscreenCompat(){
+  const fn = document.exitFullscreen || document.webkitExitFullscreen || document.mozCancelFullScreen || document.msExitFullscreen;
+  return (document.fullscreenElement || document.webkitFullscreenElement) && fn ? fn.call(document) : Promise.resolve();
+}
 async function startScreensaver(){
   document.getElementById('screensaverOverlay').style.display = 'block';
+  try{
+    await _requestFullscreenCompat(document.documentElement);
+  }catch(e){
+    // не критично -- чёрный экран всё равно покажется, просто адресная
+    // строка/статус-бар браузера останутся видны
+  }
   try{
     if('wakeLock' in navigator){
       _wakeLock = await navigator.wakeLock.request('screen');
@@ -2529,6 +2598,7 @@ async function startScreensaver(){
 function stopScreensaver(){
   document.getElementById('screensaverOverlay').style.display = 'none';
   if(_wakeLock){ _wakeLock.release().catch(()=>{}); _wakeLock = null; }
+  _exitFullscreenCompat().catch(()=>{});
 }
 document.addEventListener('visibilitychange', () => {
   // некоторые браузеры сами снимают wake lock при уходе со страницы —
@@ -2536,6 +2606,17 @@ document.addEventListener('visibilitychange', () => {
   if(document.visibilityState === 'visible' && document.getElementById('screensaverOverlay').style.display === 'block' && !_wakeLock && 'wakeLock' in navigator){
     navigator.wakeLock.request('screen').then(wl => { _wakeLock = wl; }).catch(()=>{});
   }
+});
+['fullscreenchange','webkitfullscreenchange','mozfullscreenchange','MSFullscreenChange'].forEach(evt => {
+  document.addEventListener(evt, () => {
+    // если полноэкранный режим сняли СНАРУЖИ (жест/кнопка назад системы),
+    // а не через stopScreensaver() -- держать состояние в синхроне, иначе
+    // wake lock продолжит висеть, а оверлей — нет
+    const isFs = document.fullscreenElement || document.webkitFullscreenElement;
+    if(!isFs && document.getElementById('screensaverOverlay').style.display === 'block'){
+      stopScreensaver();
+    }
+  });
 });
 
 function fmtAgo(ts){
@@ -2557,6 +2638,7 @@ function fmtTrack(it){
 const CLEAR_ENDPOINTS = {
   pump: {url:'/pump_history_clear', label:'пампов', refresh:() => refreshPumps()},
   dump: {url:'/dump_history_clear', label:'дампов', refresh:() => refreshDumps()},
+  vol_anomaly: {url:'/vol_anomaly_history_clear', label:'аномалий объёма', refresh:() => refreshVolAnomaly()},
   weekly_ema: {url:'/weekly_ema_history_clear', label:'EMA-сигналов (включая открытые)', refresh:() => refreshWeeklyEma()},
 };
 async function clearHistory(kind){
@@ -2596,6 +2678,22 @@ async function refreshDumps(){
     for(const it of items.slice(0,50)){
       const tr = document.createElement('tr');
       tr.innerHTML = `<td>${it.symbol}</td><td style="color:#f85149">-${it.pct}%</td><td>${it.base_price} -> ${it.last_price}</td><td>${fmtTrack(it)}</td><td>${fmtAgo(it.ts)}</td>`;
+      tbody.appendChild(tr);
+    }
+  }catch(e){}
+}
+
+async function refreshVolAnomaly(){
+  try{
+    const r = await fetch('/vol_anomaly_status'); const d = await r.json();
+    const tbody = document.querySelector('#volAnomaly tbody'); tbody.innerHTML = '';
+    const items = (d.recent || []).slice().reverse();
+    document.getElementById('volAnomalySummary').innerHTML = items.length
+      ? `сработало: <b>${items.length}</b>`
+      : 'пока не было срабатываний';
+    for(const it of items.slice(0,50)){
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${it.symbol}</td><td>${it.z}</td><td>${Math.round(it.vol)}</td><td>${it.price}</td><td>${fmtTrack(it)}</td><td>${fmtAgo(it.ts)}</td>`;
       tbody.appendChild(tr);
     }
   }catch(e){}
@@ -2656,6 +2754,7 @@ async function pollPumpLogs(){
 pollPumpLogs(); setInterval(pollPumpLogs, 4000);
 refreshPumps(); setInterval(refreshPumps, 8000);
 refreshDumps(); setInterval(refreshDumps, 8000);
+refreshVolAnomaly(); setInterval(refreshVolAnomaly, 8000);
 refreshWeeklyEma(); setInterval(refreshWeeklyEma, 15000);
 </script></body></html>"""
 
@@ -3551,10 +3650,33 @@ def _load_pump_render_params():
         olog(f"[pump_match] загружены сохранённые параметры рендера: {_pump_render_params}")
     except Exception:
         pass  # первый запуск — файла ещё нет, живём с дефолтами выше
+    # v0.22.0: автор стороннего бота подтвердил напрямую (не по пикселям) —
+    # красное = объём на продажу (red-свечи), зелёное по симметрии = объём
+    # на покупку (green-свечи). Это ровно volume_mode="directional" +
+    # source="volume", уже бывший дефолтом в коде — но если когда-то
+    # запускался /pump_match (визуальный грид-серч по слепым гипотезам) и
+    # он сохранил ДРУГОЙ режим (dual_period/dual_source/другой source), тот
+    # файл имел приоритет и мог всё это время рисовать неверную гипотезу.
+    # Форсируем подтверждённые поля здесь — применяется при каждом
+    # перезапуске, не зависит от того, что лежит в сохранённом файле, не
+    # потеряется при следующем обновлении с GitHub.
+    if _pump_render_params.get("volume_mode") != "directional" or _pump_render_params.get("source") != "volume":
+        olog(f"[pump_match] сохранённый режим рендера ({_pump_render_params.get('volume_mode')}/"
+             f"{_pump_render_params.get('source')}) не совпадает с подтверждённым — "
+             f"принудительно переключаем на directional/volume")
+    _pump_render_params["volume_mode"] = "directional"
+    _pump_render_params["source"] = "volume"
+    _pump_render_params["source_slow"] = None
 
 def _save_pump_render_params(params):
     global _pump_render_params
     _pump_render_params.update({k: params[k] for k in _PUMP_PARAM_FIELDS if k in params})
+    # тот же форс, что и в _load_pump_render_params — подтверждённые
+    # напрямую полу режим/источник не должны сбрасываться будущим
+    # прогоном /pump_match (тот всё ещё слепо перебирает и это измерение)
+    _pump_render_params["volume_mode"] = "directional"
+    _pump_render_params["source"] = "volume"
+    _pump_render_params["source_slow"] = None
     try:
         with open(PUMP_RENDER_PARAMS_FILE, "w") as f:
             json.dump(_pump_render_params, f)
@@ -4026,6 +4148,178 @@ def _pump_detect_loop():
             olog(f"[pump_detect] ошибка цикла: {e}")
         time.sleep(PUMP_DETECT_POLL_SEC)
 # ─── конец Live Pump/Dump Detector ──────────────────────────────────────────
+
+# ─── Sell-Volume Anomaly Watcher ─────────────────────────────────────────────
+# По прямому свидетельству автора стороннего бота (скрин с "Первый фильтр —
+# это большие объёмы на продажу, дисперсия отклонений от среднего" +
+# стрелка на реальном примере RARE, указывающая на всплеск красного объёма
+# за 30-40 минут ДО фактического пробоя цены) — первый шаг ЕГО алгоритма
+# это НЕ реакция на цену, а поиск монет со СТАТИСТИЧЕСКИ АНОМАЛЬНЫМ (z-score)
+# объёмом именно на red (bearish) свечах — потенциально более ранний сигнал,
+# чем наш текущий ценовой Pump/Dump Detector. По запросу — реализовано с тем
+# же статусом триггера, что и памп/дамп (см. _vol_anomaly_fire_alert): шлёт
+# алерт И сразу проверяет EMA-уровень, может дать полноценный сигнал раньше,
+# чем цена вообще успеет заметно сдвинуться. "Второй шаг" его алгоритма
+# неизвестен (сам автор пишет "второй шаг анализа кидать?") — реализован
+# только известный первый; трекинг MFE/MAE оставлен, чтобы дальше было
+# видно, насколько он сам по себе полезен как самостоятельный триггер.
+VOL_ANOMALY_SCAN_POLL_SEC     = 300    # раз в 5 минут — фетч реальных свечей дороже тикеров, топ-N каждую минуту дорого
+VOL_ANOMALY_LOOKBACK_MIN      = 120    # окно для расчёта среднего/дисперсии объёма red-свечей
+VOL_ANOMALY_ZSCORE_THRESHOLD  = 2.5    # во сколько стандартных отклонений выше среднего должен быть всплеск
+VOL_ANOMALY_COOLDOWN_SEC      = 60 * 60
+VOL_ANOMALY_TRACK_WINDOW_SEC  = 2 * 3600   # сколько времени после сигнала следим, пошла ли цена
+VOL_ANOMALY_HISTORY_FILE      = os.path.expanduser("~/pumpradar_vol_anomaly_history.json")
+
+_vol_anomaly_state = {}   # symbol -> last_alert_ts
+_vol_anomaly_lock = threading.Lock()
+
+
+def _detect_sell_volume_anomaly(symbol):
+    """Тянет последние VOL_ANOMALY_LOOKBACK_MIN минут 1m-свечей, считает
+    объём ОТДЕЛЬНО на red (bearish, close<open) свечах в этом окне, и
+    проверяет z-score ПОСЛЕДНЕЙ такой свечи относительно среднего/std всех
+    red-свечей окна — "дисперсия отклонений от среднего", как описал автор
+    референса. Возвращает {"z","vol","mean","std","price"} если
+    z >= VOL_ANOMALY_ZSCORE_THRESHOLD, иначе None."""
+    try:
+        days = max(1, math.ceil(VOL_ANOMALY_LOOKBACK_MIN * 60 / 86400) + 1)
+        candles = _fetch_candles(symbol, "1m", days)
+    except Exception:
+        return None
+    cutoff = time.time() - VOL_ANOMALY_LOOKBACK_MIN * 60
+    candles = [c for c in candles if c["t"] >= cutoff]
+    red_candles = [c for c in candles if c["close"] < c["open"]]
+    if len(red_candles) < 10:
+        return None
+    red_vols = [c.get("vol", 0) or 0 for c in red_candles]
+    mean_v = sum(red_vols) / len(red_vols)
+    var = sum((v - mean_v) ** 2 for v in red_vols) / len(red_vols)
+    std_v = var ** 0.5
+    if std_v <= 0:
+        return None
+    last_red = red_candles[-1]
+    last_vol = last_red.get("vol", 0) or 0
+    z = (last_vol - mean_v) / std_v
+    if z >= VOL_ANOMALY_ZSCORE_THRESHOLD:
+        return {"z": round(z, 2), "vol": last_vol, "mean": round(mean_v, 2),
+                "std": round(std_v, 2), "price": last_red["close"],
+                "candle_t": last_red["t"]}
+    return None
+
+
+def _vol_anomaly_fire_alert(symbol, res):
+    """Первый фильтр из его алгоритма ("большие объёмы на продажу,
+    дисперсия отклонений от среднего") — тот же статус, что у пампа/дампа:
+    шлёт алерт И запускает проверку EMA-уровня (expected_bias="short" —
+    в его же примере RARE аномальный red-объём предшествовал росту цены
+    в сопротивление, та же логика, что у нашего Pump Detector). Плюс
+    трекинг MFE/MAE для дальнейшего анализа."""
+    _send_alert(
+        f"📐 <b>{symbol}</b> — аномальный объём на продажу\n"
+        f"z-score: {res['z']} (объём {res['vol']:.0f} против среднего {res['mean']:.0f} ± {res['std']:.0f})\n"
+        f"Цена: {_fmt_px(res['price'])}"
+    )
+    olog(f"[vol_anomaly] {symbol}: z-score={res['z']} vol={res['vol']:.0f} — алерт отправлен")
+    now = time.time()
+    rec = {"ts": int(now), "symbol": symbol, "z": res["z"], "vol": res["vol"],
+           "mean": res["mean"], "std": res["std"], "price": res["price"],
+           "track_until": now + VOL_ANOMALY_TRACK_WINDOW_SEC, "track_done": False,
+           "max_follow_pct": 0.0, "max_reverse_pct": 0.0,
+           "last_tracked_price": res["price"], "last_tracked_ts": int(now)}
+    _pump_dump_history_append(VOL_ANOMALY_HISTORY_FILE, rec)
+
+    try:
+        _pump_or_dump_maybe_trigger_ema_signal(symbol, expected_bias="short")
+    except Exception as e:
+        olog(f"[vol_anomaly] {symbol}: ошибка проверки EMA-триггера: {e}")
+
+
+def _vol_anomaly_scan_loop():
+    """Раз в VOL_ANOMALY_SCAN_POLL_SEC проходит топ-N монет (та же
+    настраиваемая _get_scan_top_n()) и проверяет каждую на аномальный
+    объём продаж. Дороже пампа/дампа (реальные свечи на монету, не общий
+    тикер-снапшот) — поэтому реже опрашивается."""
+    time.sleep(70)
+    while True:
+        try:
+            symbols = _fetch_all_symbols()[:_get_scan_top_n()]
+            now = time.time()
+            for symbol in symbols:
+                try:
+                    res = _detect_sell_volume_anomaly(symbol)
+                except Exception as e:
+                    olog(f"[vol_anomaly] {symbol}: ошибка проверки: {e}")
+                    continue
+                if not res:
+                    continue
+                with _vol_anomaly_lock:
+                    last_alert = _vol_anomaly_state.get(symbol, 0)
+                if now - last_alert < VOL_ANOMALY_COOLDOWN_SEC:
+                    continue
+                _vol_anomaly_fire_alert(symbol, res)
+                with _vol_anomaly_lock:
+                    _vol_anomaly_state[symbol] = now
+        except Exception as e:
+            olog(f"[vol_anomaly] ошибка цикла сканирования: {e}")
+        time.sleep(VOL_ANOMALY_SCAN_POLL_SEC)
+
+
+def _vol_anomaly_track_loop():
+    """Зеркало _pump_dump_track_loop для истории аномалий объёма — те же
+    max_follow_pct/max_reverse_pct, чтобы честно измерить, действительно
+    ли цена потом двигалась (и в какую сторону) после сигнала."""
+    time.sleep(100)
+    while True:
+        try:
+            if not os.path.exists(VOL_ANOMALY_HISTORY_FILE):
+                time.sleep(VOL_ANOMALY_SCAN_POLL_SEC)
+                continue
+            try:
+                with open(VOL_ANOMALY_HISTORY_FILE) as f:
+                    hist = json.load(f)
+            except Exception as e:
+                olog(f"[vol_anomaly_track] не смог прочитать историю: {e}")
+                time.sleep(VOL_ANOMALY_SCAN_POLL_SEC)
+                continue
+            now = time.time()
+            price_cache = {}
+            changed = False
+            for rec in hist:
+                if rec.get("track_done", True):
+                    continue
+                try:
+                    sym = rec["symbol"]
+                    if sym not in price_cache:
+                        try:
+                            price_cache[sym] = _gate_get_price(sym)
+                        except Exception as e:
+                            olog(f"[vol_anomaly_track] {sym}: ошибка получения цены: {e}")
+                            price_cache[sym] = None
+                    price = price_cache[sym]
+                    if price and rec.get("price"):
+                        pct = (price - rec["price"]) / rec["price"] * 100.0
+                        # гипотеза автора — сигнал ПРЕДШЕСТВУЕТ ПАМПУ (рост
+                        # цены), поэтому "в пользу" здесь = рост, "против" = падение
+                        follow, reverse = pct, -pct
+                        rec["max_follow_pct"] = round(max(rec.get("max_follow_pct", 0.0), follow), 2)
+                        rec["max_reverse_pct"] = round(max(rec.get("max_reverse_pct", 0.0), reverse), 2)
+                        rec["last_tracked_price"] = price
+                        rec["last_tracked_ts"] = int(now)
+                        changed = True
+                    if now >= rec.get("track_until", 0):
+                        rec["track_done"] = True
+                        changed = True
+                except Exception as e:
+                    olog(f"[vol_anomaly_track] ⚠ пропущена битая запись "
+                         f"({rec.get('symbol','?')}): {e}")
+                    continue
+            if changed:
+                _pump_dump_history_save_all(VOL_ANOMALY_HISTORY_FILE, hist)
+        except Exception as e:
+            olog(f"[vol_anomaly_track] ошибка цикла: {e}")
+        time.sleep(VOL_ANOMALY_SCAN_POLL_SEC)
+# ─── конец Sell-Volume Anomaly Watcher ──────────────────────────────────────
+
 
 # ─── Weekly/Daily EMA Touch Watcher ─────────────────────────────────────────
 # Отдельный, независимый ни от Pump Detector, ни от (остановленного) EMA-
@@ -5672,14 +5966,12 @@ def _pm_color_balance_ratio(g_profile, r_profile):
 
 def _pm_grid_total_combos():
     """Сколько вариантов реально перебирается — для прогресс-бара и оценки
-    времени. Держать формулу синхронной с циклами в _pm_style_grid_search."""
-    per_ff = 0
-    for _src in PUMP_MATCH_GRID_SOURCES:
-        per_ff += 1  # directional "none"
-        per_ff += (len(PUMP_MATCH_GRID_SMOOTHING_METHODS) - 1) * len(PUMP_MATCH_GRID_EMA_PERIODS)
-        per_ff += (len(PUMP_MATCH_GRID_SMOOTHING_METHODS) - 1) * len(PUMP_MATCH_GRID_DUAL_PAIRS)
-    per_ff += (len(PUMP_MATCH_GRID_SOURCE_PAIRS) *
-               (len(PUMP_MATCH_GRID_SMOOTHING_METHODS) - 1) * len(PUMP_MATCH_GRID_EMA_PERIODS))
+    времени. Держать формулу синхронной с циклом в _pm_style_grid_search.
+    v0.22.0: режим/источник подтверждены напрямую (directional/volume) —
+    перебираются только способ и период сглаживания, не десятки гипотез
+    про источник данных, как раньше."""
+    per_ff = 1  # directional "none"
+    per_ff += (len(PUMP_MATCH_GRID_SMOOTHING_METHODS) - 1) * len(PUMP_MATCH_GRID_EMA_PERIODS)
     return per_ff * len(PUMP_MATCH_GRID_FLOOR_FRACS)
 
 
@@ -5687,50 +5979,35 @@ def _pm_style_grid_search(candles, base_price, ref_g, ref_r, progress_cb=None):
     """Перебирает сетку параметров ОТРИСОВКИ (не времени) на уже
     зафиксированном наборе свечей и оценивает каждый вариант по цветовому
     профилю. Возвращает список результатов, отсортированный по score.
-    progress_cb(done, total), если передан, вызывается периодически (не на
-    каждом варианте — лишний оверхед на блокировке при ~4000+ комбинаций)."""
+    progress_cb(done, total), если передан, вызывается периодически.
+    v0.22.0: автор стороннего бота подтвердил напрямую — красное это объём
+    на продажу (red-свечи), зелёное по симметрии объём на покупку
+    (green-свечи). Это ровно volume_mode="directional" + source="volume" —
+    та гипотеза, что мы и так уже держали дефолтом. Раньше здесь вслепую
+    перебирались ещё dual_period/dual_source и 6 разных source (тысячи
+    комбинаций) — больше нет смысла тратить на них время, раз известно,
+    что это неверные гипотезы. Перебираем только то, что ДЕЙСТВИТЕЛЬНО
+    неизвестно — способ и период сглаживания поверх подтверждённых
+    directional/volume."""
     ref_balance = _pm_color_balance_ratio(ref_g, ref_r)
     total = _pm_grid_total_combos()
     done = 0
     results = []
+    src = "volume"
     for ff in PUMP_MATCH_GRID_FLOOR_FRACS:
-        for src in PUMP_MATCH_GRID_SOURCES:
-            # directional: "none" один раз на источник (период не важен),
-            # остальные методы — по сетке периодов
-            results.extend(_pm_try_variant(candles, base_price, ref_g, ref_r, ref_balance,
-                                            "directional", src, None, "none", 1, None, ff))
-            done += 1
-            for method in PUMP_MATCH_GRID_SMOOTHING_METHODS:
-                if method == "none":
-                    continue
-                for ep in PUMP_MATCH_GRID_EMA_PERIODS:
-                    results.extend(_pm_try_variant(candles, base_price, ref_g, ref_r, ref_balance,
-                                                    "directional", src, None, method, ep, None, ff))
-                    done += 1
-                    if progress_cb and done % 20 == 0:
-                        progress_cb(done, total)
-            # dual_period: "none" бессмысленен (обе линии снова совпали бы)
-            for method in PUMP_MATCH_GRID_SMOOTHING_METHODS:
-                if method == "none":
-                    continue
-                for fast, slow in PUMP_MATCH_GRID_DUAL_PAIRS:
-                    results.extend(_pm_try_variant(candles, base_price, ref_g, ref_r, ref_balance,
-                                                    "dual_period", src, None, method, fast, slow, ff))
-                    done += 1
-                    if progress_cb and done % 20 == 0:
-                        progress_cb(done, total)
-        # dual_source: зелёная и красная волна из ДВУХ РАЗНЫХ источников —
-        # самая "агностичная" гипотеза, раз мы вообще не знаем формулу
-        for src_a, src_b in PUMP_MATCH_GRID_SOURCE_PAIRS:
-            for method in PUMP_MATCH_GRID_SMOOTHING_METHODS:
-                if method == "none":
-                    continue
-                for ep in PUMP_MATCH_GRID_EMA_PERIODS:
-                    results.extend(_pm_try_variant(candles, base_price, ref_g, ref_r, ref_balance,
-                                                    "dual_source", src_a, src_b, method, ep, None, ff))
-                    done += 1
-                    if progress_cb and done % 20 == 0:
-                        progress_cb(done, total)
+        # "none" один раз (период не важен), остальные методы — по сетке периодов
+        results.extend(_pm_try_variant(candles, base_price, ref_g, ref_r, ref_balance,
+                                        "directional", src, None, "none", 1, None, ff))
+        done += 1
+        for method in PUMP_MATCH_GRID_SMOOTHING_METHODS:
+            if method == "none":
+                continue
+            for ep in PUMP_MATCH_GRID_EMA_PERIODS:
+                results.extend(_pm_try_variant(candles, base_price, ref_g, ref_r, ref_balance,
+                                                "directional", src, None, method, ep, None, ff))
+                done += 1
+                if progress_cb and done % 20 == 0:
+                    progress_cb(done, total)
     if progress_cb:
         progress_cb(total, total)
     results.sort(key=lambda r: r["score"], reverse=True)
@@ -6571,6 +6848,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except Exception:
                 recent = []
             self._json({"tracked": tracked, "recent": recent[-100:]})
+        elif self.path == "/vol_anomaly_status":
+            recent = []
+            try:
+                if os.path.exists(VOL_ANOMALY_HISTORY_FILE):
+                    with open(VOL_ANOMALY_HISTORY_FILE) as f:
+                        recent = json.load(f)
+            except Exception:
+                recent = []
+            self._json({"recent": recent[-100:]})
         elif self.path == "/weekly_ema_status":
             with _weekly_ema_touch_lock:
                 recent = list(_weekly_ema_recent[-100:])
@@ -6749,6 +7035,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             with _pump_detect_lock:
                 _pump_dump_history_save_all(DUMP_DETECT_HISTORY_FILE, [])
             olog("[dump_detect] история дампов очищена вручную")
+            self._json({"ok": True})
+
+        elif self.path == "/vol_anomaly_history_clear":
+            _pump_dump_history_save_all(VOL_ANOMALY_HISTORY_FILE, [])
+            olog("[vol_anomaly] история аномалий объёма очищена вручную")
             self._json({"ok": True})
 
         elif self.path == "/ema_diag_clear":
@@ -6963,6 +7254,8 @@ def main():
     threading.Thread(target=_pump_dump_track_loop, daemon=True).start()
     threading.Thread(target=_diag_scan_loop, daemon=True).start()
     threading.Thread(target=_diag_track_loop, daemon=True).start()
+    threading.Thread(target=_vol_anomaly_scan_loop, daemon=True).start()
+    threading.Thread(target=_vol_anomaly_track_loop, daemon=True).start()
     # v0.13.0: полностью заменено на триггер от пампа/дампа (см.
     # _pump_or_dump_maybe_trigger_ema_signal, вызывается изнутри
     # _pump_fire_alert/_dump_fire_alert) — постоянный опрос топ-100 монет
