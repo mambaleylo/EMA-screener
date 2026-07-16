@@ -1,7 +1,55 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.19.1 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.20.0 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.20.0: по реальным скринам — Pump/Dump Detector ловил только РЕЗКИЕ
+  движения (одно окно 20 минут / 5%). Медленный разгон (час-полтора, как
+  на присланных примерах) не давал 5%+ ни в одном 20-минутном сегменте —
+  алерт либо опаздывал почти к самому пику, либо не срабатывал вовсе.
+  Симулировал синтетикой той же формы, что на скрине: старая логика на
+  88-минутном разгоне НЕ СРАБОТАЛА ВООБЩЕ; новая сработала на 69-й минуте,
+  за 18 минут до истинного пика, при цене заметно ниже максимума.
+  _pump_detect_check/_dump_detect_check теперь проверяют НЕСКОЛЬКО окон
+  одновременно (PUMP_MOVE_WINDOWS_MIN=[120,60,20], пороги по убыванию
+  длины окна выше: 8%/6%/5% — PUMP_THRESHOLD_PCT_BY_WINDOW), от длинного к
+  короткому, первое сработавшее и даёт алерт. Резкие пампы по-прежнему
+  ловятся так же быстро коротким 20-минутным окном (RR не изменился,
+  проверено тестом отдельно). История price теперь хранится на 120+15
+  минут (было 120+10 — небольшой запас под самое длинное окно). Алерт и
+  запись истории показывают, каким именно окном поймали ("окно 120м").
+- v0.19.4: по вопросу "после изменения алгоритма старые и новые данные не
+  смешаются молча?" — раньше действительно смешались бы, никакой пометки
+  версии не было. Добавлен DIAG_SCHEMA_VERSION (сейчас 1) — каждая новая
+  запись помечается им при создании. Поднимать эту версию нужно ТОЛЬКО при
+  изменении того, что делает записи несопоставимыми (формула детекта,
+  сетка чекпоинтов, счёт MFE/MAE) — НЕ при изменении бизнес-порогов вроде
+  DIAG_BOUNCE_THRESHOLD_PCT (те применяются при анализе поверх сырых
+  данных, старые записи пересчитываются под них одинаково корректно).
+  Старые записи без поля (собранные до этого фикса) считаются "версия 0" —
+  не теряются, просто отдельно помечены. Сводная таблица на /ema_diag
+  показывает список версий в каждой строке и подсвечивает ⚠, если группа
+  смешала несколько версий — та же идея, что и предупреждение про среднее/
+  медиану. У сырых записей — фильтр по версии + колонка "Схема". Проверено
+  тестом: легаси-данные (без поля) корректно определяются как v0,
+  смешение новой и старой версии в одной группе ловится.
+- v0.19.3: разбор первой реальной ночи диагностики выявил, что среднее
+  (mean) может быть полностью искажено 1-2 экстремальными выбросами на
+  тонких монетах — конкретный случай: AKE_USDT дал +250% за 15 минут на
+  недельном касании, единолично утащив среднюю всей связки 1w-EMA7-SHORT
+  с честных +0.04% (без него) до -3.7% — при том что медиана всё время
+  показывала правильные +0.27%. _diag_summary теперь считает median_mfe_pct
+  /median_mae_pct рядом со средним (сырые данные НЕ отсекаются — экстремальный
+  исход тоже реальный, просто мера отдельно), таблица на /ema_diag
+  подсвечивает ⚠ жёлтым, если среднее разошлось с медианой больше чем в 2
+  раза — сразу видно, где выброс, без ручного разбора.
+- v0.19.2: по запросу — кнопка "Скринсейвер" на главной странице. Чисто
+  клиентская фича (никакого сервера): полноэкранный чёрный div поверх
+  всего + Screen Wake Lock API (navigator.wakeLock), не даёт экрану
+  заблокироваться, пока страница открыта. Тап по чёрному экрану — выход.
+  На visibilitychange перезапрашивает лок, если браузер сам его снял при
+  уходе со страницы (так делают некоторые мобильные браузеры). Требует
+  secure context — на localhost (как здесь, раз Termux и браузер на одном
+  устройстве) работает и по http.
 - v0.19.1: по запросу — кнопка "Скачать JSON" на /ema_diag (GET
   /ema_diag_export, с Content-Disposition: attachment — телефон сохранит
   файл, а не просто покажет JSON текстом в браузере). Экспорт включает и
@@ -285,7 +333,7 @@ EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
   резать/переделывать/выключать, ничего в оригинальном EMA_Invert_
   Experiment.py от этого не пострадает.
 """
-import os, sys, json, time, math, random, threading, base64, hashlib, subprocess, io, gc, uuid
+import os, sys, json, time, math, random, threading, base64, hashlib, subprocess, io, gc, uuid, statistics
 import multiprocessing
 import http.server, urllib.request, urllib.parse
 from functools import lru_cache
@@ -305,7 +353,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.19.1"
+APP_VERSION  = "0.20.0"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2334,6 +2382,8 @@ details[open] summary:before{content:"▾ "}
 <a href="/pump_match" style="text-decoration:none"><button style="background:#8250df">&#127919; Pump Match (подбор параметров отрисовки)</button></a>
 <a href="/weekly_ema_backtest" style="text-decoration:none"><button style="background:#8250df">&#128202; Weekly EMA Backtest</button></a>
 <a href="/ema_diag" style="text-decoration:none"><button style="background:#8250df">&#128300; EMA Diagnostics</button></a>
+<button onclick="startScreensaver()" style="background:#21262d;border:1px solid #30363d">&#128421; Скринсейвер</button>
+<div id="screensaverOverlay" style="display:none;position:fixed;inset:0;background:#000;z-index:9999" onclick="stopScreensaver()"></div>
 <div class="section-card" style="max-width:420px">
   <label style="display:block;font-size:13px;color:#8b949e">Сколько монет по объёму участвует в поиске (топ-N)</label>
   <div style="display:flex;gap:8px;margin-top:6px;align-items:center">
@@ -2464,6 +2514,29 @@ async function saveTopN(){
   }catch(e){ msg.style.color = '#f85149'; msg.innerText = 'Ошибка запроса'; }
 }
 loadTopN();
+
+let _wakeLock = null;
+async function startScreensaver(){
+  document.getElementById('screensaverOverlay').style.display = 'block';
+  try{
+    if('wakeLock' in navigator){
+      _wakeLock = await navigator.wakeLock.request('screen');
+    }
+  }catch(e){
+    // не критично -- чёрный экран всё равно покажется, просто без гарантии от блокировки
+  }
+}
+function stopScreensaver(){
+  document.getElementById('screensaverOverlay').style.display = 'none';
+  if(_wakeLock){ _wakeLock.release().catch(()=>{}); _wakeLock = null; }
+}
+document.addEventListener('visibilitychange', () => {
+  // некоторые браузеры сами снимают wake lock при уходе со страницы —
+  // если вернулись, а скринсейвер всё ещё показан, переберём лок заново
+  if(document.visibilityState === 'visible' && document.getElementById('screensaverOverlay').style.display === 'block' && !_wakeLock && 'wakeLock' in navigator){
+    navigator.wakeLock.request('screen').then(wl => { _wakeLock = wl; }).catch(()=>{});
+  }
+});
 
 function fmtAgo(ts){
   const s = Math.floor(Date.now()/1000) - ts;
@@ -3219,8 +3292,8 @@ def _send_alert_photo(png_bytes, caption):
 
 PUMP_DETECT_TF            = "1m"
 PUMP_CHART_WINDOW_MIN     = 120   # сколько минут истории показываем на картинке (как на референсе ~11:30-13:30)
-PUMP_MOVE_WINDOW_MIN      = 20    # окно, по которому считаем % пампа: (last - min_in_window)/min_in_window
-PUMP_THRESHOLD_PCT        = 5.0   # порог срабатывания
+# PUMP_MOVE_WINDOWS_MIN / PUMP_THRESHOLD_PCT_BY_WINDOW определены ниже, рядом
+# с _pump_detect_check — несколько окон разной длины вместо одного (v0.20.0)
 PUMP_DETECT_POLL_SEC      = 60    # как часто обновляем цены (один общий /tickers запрос)
 PUMP_DETECT_COOLDOWN_SEC  = 30 * 60   # не повторять алерт по той же монете чаще, пока памп длится
 PUMP_DETECT_TOP_N_DEFAULT = 100   # дефолт для _scan_settings["top_n"] — сколько монет по объёму отслеживаем
@@ -3312,7 +3385,7 @@ def _pump_update_history(snapshot, top_symbols):
     Монеты, выпавшие из топа по объёму, из истории удаляются — иначе
     словарь рос бы неограниченно по мере ротации топа за дни/недели."""
     now = time.time()
-    cutoff = now - (PUMP_CHART_WINDOW_MIN + 10) * 60
+    cutoff = now - (PUMP_CHART_WINDOW_MIN + 15) * 60
     top_set = set(top_symbols)
     with _pump_detect_lock:
         for sym in top_symbols:
@@ -3328,31 +3401,52 @@ def _pump_update_history(snapshot, top_symbols):
             del _pump_price_history[s]
 
 
+# v0.20.0: по прямому запросу с реальными скринами — старое ОДНО окно
+# (20 минут) ловило только резкие пампы. Медленный разгон (час-полтора,
+# как на обоих присланных примерах) не давал 5%+ ни в одном 20-минутном
+# сегменте, и алерт либо опаздывал к самому пику, либо не срабатывал
+# вообще, пока движение не ускорялось резко под конец — а лучшая точка
+# входа в шорт была РАНЬШЕ, там, где цена только-только пробила локальный
+# уровень. Теперь несколько окон разной длины проверяются ОДНОВРЕМЕННО, у
+# длинных — порог выше (иначе будут ловить обычную дневную волатильность,
+# не памп). Проверяем от САМОГО ДЛИННОГО к короткому и берём первое
+# сработавшее — так медленный разгон ловится максимально рано, как только
+# его накопленное движение впервые пересекает порог для своего окна, а не
+# только когда он уже разогнался и попал в короткое 20-минутное окно.
+PUMP_MOVE_WINDOWS_MIN = [120, 60, 20]                  # от длинного к короткому
+PUMP_THRESHOLD_PCT_BY_WINDOW = {120: 8.0, 60: 6.0, 20: 5.0}  # длиннее окно -> выше порог
+
+
 def _pump_detect_check(symbol):
-    """Возвращает {"base_price":..,"last_price":..,"pct":..} если за
-    последние PUMP_MOVE_WINDOW_MIN минут цена выросла от своего минимума
-    в этом окне на PUMP_THRESHOLD_PCT% и больше — иначе None. Базовая цена
-    намеренно берётся как МИНИМУМ в коротком недавнем окне (а не самая
-    старая точка всего графика) — так же, как на референсном скрине: %
-    считается от цены прямо перед разгоном, а не от начала всего показанного
-    двухчасового окна (оно там чисто для визуального контекста)."""
+    """Возвращает {"base_price":..,"last_price":..,"pct":..,"window_min":..}
+    если хотя бы ОДНО из PUMP_MOVE_WINDOWS_MIN окон показывает рост от
+    своего минимума на PUMP_THRESHOLD_PCT_BY_WINDOW[окно]% и больше —
+    иначе None. Проверка от длинного окна к короткому: медленный
+    многочасовой разгон ловится максимально рано (как только пересёк ПОРОГ
+    ДЛЯ СВОЕГО окна), а не только тогда, когда уже попал в короткое
+    20-минутное окно ближе к пику."""
     now = time.time()
     with _pump_detect_lock:
         hist = list(_pump_price_history.get(symbol, ()))
     if len(hist) < 3:
         return None
-    move_cutoff = now - PUMP_MOVE_WINDOW_MIN * 60
-    window = [(t, p) for t, p in hist if t >= move_cutoff]
-    if len(window) < 3:
-        return None
-    base_t, base_p = min(window, key=lambda tp: tp[1])
     last_t, last_p = hist[-1]
-    if base_p <= 0:
+    if last_p <= 0:
         return None
-    pct = (last_p - base_p) / base_p * 100.0
-    if pct < PUMP_THRESHOLD_PCT:
-        return None
-    return {"base_price": base_p, "last_price": last_p, "pct": round(pct, 2)}
+    for window_min in PUMP_MOVE_WINDOWS_MIN:
+        move_cutoff = now - window_min * 60
+        window = [(t, p) for t, p in hist if t >= move_cutoff]
+        if len(window) < 3:
+            continue
+        base_t, base_p = min(window, key=lambda tp: tp[1])
+        if base_p <= 0:
+            continue
+        pct = (last_p - base_p) / base_p * 100.0
+        threshold = PUMP_THRESHOLD_PCT_BY_WINDOW[window_min]
+        if pct >= threshold:
+            return {"base_price": base_p, "last_price": last_p, "pct": round(pct, 2),
+                    "window_min": window_min}
+    return None
 
 
 # v0.13.0: по прямому запросу — "эти пампы и есть триггер сигнала". Зеркало
@@ -3360,34 +3454,38 @@ def _pump_detect_check(symbol):
 # общая — не тянем тикеры второй раз), просто ищем движение от МАКСИМУМА
 # вниз, а не от минимума вверх. Даёт LONG-сторону (дамп в поддержку) так же,
 # как памп даёт SHORT-сторону (памп в сопротивление).
-DUMP_MOVE_WINDOW_MIN      = PUMP_MOVE_WINDOW_MIN
-DUMP_THRESHOLD_PCT        = PUMP_THRESHOLD_PCT
+DUMP_MOVE_WINDOWS_MIN = PUMP_MOVE_WINDOWS_MIN
+DUMP_THRESHOLD_PCT_BY_WINDOW = PUMP_THRESHOLD_PCT_BY_WINDOW
 DUMP_DETECT_COOLDOWN_SEC  = PUMP_DETECT_COOLDOWN_SEC
 DUMP_DETECT_HISTORY_FILE  = os.path.expanduser("~/pumpradar_dump_history.json")
 _dump_detect_state = {}   # symbol -> {"last_alert_ts": float, "last_pct": float}
 
 
 def _dump_detect_check(symbol):
-    """Зеркало _pump_detect_check: {"base_price":..(максимум окна),
-    "last_price":..,"pct":..} если цена упала от максимума за
-    DUMP_MOVE_WINDOW_MIN минут на DUMP_THRESHOLD_PCT% и больше."""
+    """Зеркало _pump_detect_check (см. его докстринг про несколько окон) —
+    только от МАКСИМУМА окна вниз, а не от минимума вверх."""
     now = time.time()
     with _pump_detect_lock:
         hist = list(_pump_price_history.get(symbol, ()))
     if len(hist) < 3:
         return None
-    move_cutoff = now - DUMP_MOVE_WINDOW_MIN * 60
-    window = [(t, p) for t, p in hist if t >= move_cutoff]
-    if len(window) < 3:
-        return None
-    base_t, base_p = max(window, key=lambda tp: tp[1])
     last_t, last_p = hist[-1]
-    if base_p <= 0:
+    if last_p <= 0:
         return None
-    pct = (base_p - last_p) / base_p * 100.0
-    if pct < DUMP_THRESHOLD_PCT:
-        return None
-    return {"base_price": base_p, "last_price": last_p, "pct": round(pct, 2)}
+    for window_min in DUMP_MOVE_WINDOWS_MIN:
+        move_cutoff = now - window_min * 60
+        window = [(t, p) for t, p in hist if t >= move_cutoff]
+        if len(window) < 3:
+            continue
+        base_t, base_p = max(window, key=lambda tp: tp[1])
+        if base_p <= 0:
+            continue
+        pct = (base_p - last_p) / base_p * 100.0
+        threshold = DUMP_THRESHOLD_PCT_BY_WINDOW[window_min]
+        if pct >= threshold:
+            return {"base_price": base_p, "last_price": last_p, "pct": round(pct, 2),
+                    "window_min": window_min}
+    return None
 
 
 def _pump_or_dump_maybe_trigger_ema_signal(symbol, expected_bias):
@@ -3819,7 +3917,7 @@ def _pump_fire_alert(symbol, res):
         olog(f"[pump_detect] {symbol}: ошибка рендера графика: {e}")
 
     caption = (f"<b>{symbol}</b>\n"
-               f"Pump: {res['pct']}%\n"
+               f"Pump: {res['pct']}% (окно {res.get('window_min','?')}м)\n"
                f"{_fmt_px(res['base_price'])} -> {_fmt_px(res['last_price'])}")
     _send_alert_photo(png, caption)
     olog(f"[pump_detect] 🔥 {symbol}: памп {res['pct']}% "
@@ -3828,6 +3926,7 @@ def _pump_fire_alert(symbol, res):
     now = time.time()
     rec = {"ts": int(now), "symbol": symbol, "pct": res["pct"],
            "base_price": res["base_price"], "last_price": res["last_price"],
+           "window_min": res.get("window_min"),
            "kind": "pump", "track_until": now + PUMP_TRACK_WINDOW_SEC,
            "track_done": False, "max_follow_pct": 0.0, "max_reverse_pct": 0.0,
            "last_tracked_price": res["last_price"], "last_tracked_ts": int(now)}
@@ -3862,7 +3961,7 @@ def _dump_fire_alert(symbol, res):
         olog(f"[dump_detect] {symbol}: ошибка рендера графика: {e}")
 
     caption = (f"<b>{symbol}</b>\n"
-               f"Dump: -{res['pct']}%\n"
+               f"Dump: -{res['pct']}% (окно {res.get('window_min','?')}м)\n"
                f"{_fmt_px(res['base_price'])} -> {_fmt_px(res['last_price'])}")
     _send_alert_photo(png, caption)
     olog(f"[dump_detect] 💧 {symbol}: дамп -{res['pct']}% "
@@ -3871,6 +3970,7 @@ def _dump_fire_alert(symbol, res):
     now = time.time()
     rec = {"ts": int(now), "symbol": symbol, "pct": res["pct"],
            "base_price": res["base_price"], "last_price": res["last_price"],
+           "window_min": res.get("window_min"),
            "kind": "dump", "track_until": now + PUMP_TRACK_WINDOW_SEC,
            "track_done": False, "max_follow_pct": 0.0, "max_reverse_pct": 0.0,
            "last_tracked_price": res["last_price"], "last_tracked_ts": int(now)}
@@ -4682,6 +4782,15 @@ def _weekly_ema_backtest_run_background(job_id, symbols, tf, days, window_min, t
 # источника (Coinglass и т.п.), Gate.io публично такое не отдаёт. Вместо
 # неё — funding rate (реально доступный, хоть и более грубый прокси
 # перекошенности позиций лонг/шорт).
+# Версия СХЕМЫ диагностики — отдельно от APP_VERSION (тот растёт на каждый
+# релиз вообще). Эту поднимаем ТОЛЬКО когда меняется что-то, что делает
+# старые записи несопоставимыми с новыми: формула детекта касания/side,
+# сетка чекпоинтов (DIAG_CHECKPOINTS_MIN), ширина допуска DIAG_TOUCH_ATR,
+# способ счёта MFE/MAE. НЕ поднимаем из-за: порога DIAG_BOUNCE_THRESHOLD_PCT
+# (он применяется при АНАЛИЗЕ поверх сырых mfe/mae, а не при записи — старые
+# записи одинаково корректно пересчитываются под новый порог), добавления
+# нового поля (старые записи просто не будут его иметь, это не конфликт).
+DIAG_SCHEMA_VERSION = 1
 DIAG_TIMEFRAMES     = ["1h", "4h", "1d", "1w"]
 DIAG_TOUCH_ATR      = 1.0        # значительно шире алертового порога — собираем данные, а не только то, что алертим
 DIAG_FETCH_DAYS     = {"1h": 30, "4h": 60, "1d": 120, "1w": 400}
@@ -4826,6 +4935,7 @@ def _diag_check_symbol(symbol, tf):
         classic_bias = "short" if side == "from_below" else "long"
         records.append({
             "id": f"{symbol}|{tf}|{period}|{int(now)}",
+            "diag_version": DIAG_SCHEMA_VERSION,
             "ts": int(now), "symbol": symbol, "tf": tf, "period": period,
             "price": price, "ema_value": _round_price(ema_now),
             "dist_atr": round(dist_atr, 3), "side": side, "classic_bias": classic_bias,
@@ -4977,9 +5087,16 @@ DIAG_BOUNCE_THRESHOLD_PCT = 1.0   # от какого MFE считаем, что
 def _diag_summary(min_touches=3):
     """Сводка по каждой связке (период EMA × таймфрейм): сколько касаний,
     доля реально отскочивших (MFE >= порога) против пробитых (MAE >= порога
-    без соответствующего MFE), средний MFE/MAE, доля с просадкой перед
-    движением по тренду. Отдельно то же самое разбито по классической
-    стороне (short/long) — они часто ведут себя по-разному."""
+    без соответствующего MFE), средний И МЕДИАННЫЙ MFE/MAE, доля с
+    просадкой перед движением по тренду. Отдельно то же самое разбито по
+    классической стороне (short/long) — они часто ведут себя по-разному.
+    v0.19.3: добавлена медиана — на реальных данных выяснилось, что среднее
+    по крипте может быть полностью искажено 1-2 экстремальными выбросами на
+    тонких монетах (конкретный случай: один шиткоин дал +250% за 15 минут и
+    утащил среднюю по всей связке 1w-SHORT с +0.04% до -3.7%, хотя медиана
+    всё время показывала честные +0.27%). Сырые данные не отсекаем (это
+    реальный исход, не ошибка) — просто считаем медиану РЯДОМ со средним,
+    чтобы расхождение между ними сразу было видно как сигнал "тут выброс"."""
     with _diag_lock:
         records = list(_diag_records)
     groups = {}
@@ -4993,13 +5110,24 @@ def _diag_summary(min_touches=3):
         bounced = sum(1 for r in evaluated if r["mfe_pct"] >= DIAG_BOUNCE_THRESHOLD_PCT)
         broke = sum(1 for r in evaluated if r["mae_pct"] >= DIAG_BOUNCE_THRESHOLD_PCT and r["mfe_pct"] < DIAG_BOUNCE_THRESHOLD_PCT)
         retraced = sum(1 for r in evaluated if r.get("retrace_before_favorable"))
-        avg_mfe = round(sum(r["mfe_pct"] for r in evaluated) / len(evaluated), 2) if evaluated else None
-        avg_mae = round(sum(r["mae_pct"] for r in evaluated) / len(evaluated), 2) if evaluated else None
+        mfe_vals = [r["mfe_pct"] for r in evaluated]
+        mae_vals = [r["mae_pct"] for r in evaluated]
+        avg_mfe = round(sum(mfe_vals) / len(mfe_vals), 2) if mfe_vals else None
+        avg_mae = round(sum(mae_vals) / len(mae_vals), 2) if mae_vals else None
+        med_mfe = round(statistics.median(mfe_vals), 2) if mfe_vals else None
+        med_mae = round(statistics.median(mae_vals), 2) if mae_vals else None
+        # v0.19.4: 0 = "легаси" (запись создана до появления этого поля) —
+        # если в группе смешались разные версии схемы, это значит логика
+        # детекта/чекпоинтов менялась в середине выборки, и сравнивать
+        # такую группу как единое целое некорректно (см. changelog).
+        versions = sorted({r.get("diag_version", 0) for r in evaluated})
         return {
             "total": total, "evaluated": len(evaluated), "bounced": bounced, "broke": broke,
             "bounce_rate": round(bounced / len(evaluated) * 100, 1) if evaluated else None,
             "avg_mfe_pct": avg_mfe, "avg_mae_pct": avg_mae,
+            "median_mfe_pct": med_mfe, "median_mae_pct": med_mae,
             "retrace_rate": round(retraced / len(evaluated) * 100, 1) if evaluated else None,
+            "diag_versions": versions, "mixed_versions": len(versions) > 1,
         }
 
     result = []
@@ -5850,7 +5978,7 @@ select,input{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-ra
   <div id="summaryStatus" class="summary-line">загрузка...</div>
   <div class="table-scroll">
     <table id="summaryTable">
-      <thead><tr><th>ТФ</th><th>EMA</th><th>Касаний</th><th>Оценено</th><th>Bounce rate</th><th>Avg MFE</th><th>Avg MAE</th><th>С просадкой</th><th>LONG bounce%</th><th>SHORT bounce%</th></tr></thead>
+      <thead><tr><th>ТФ</th><th>EMA</th><th>Схема</th><th>Касаний</th><th>Оценено</th><th>Bounce rate</th><th>Avg MFE</th><th>Med MFE</th><th>Avg MAE</th><th>Med MAE</th><th>С просадкой</th><th>LONG bounce%</th><th>SHORT bounce%</th></tr></thead>
       <tbody></tbody>
     </table>
   </div>
@@ -5873,6 +6001,9 @@ select,input{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-ra
         <option value="14">EMA14</option>
         <option value="28">EMA28</option>
       </select>
+      <select id="filterVersion" onchange="loadRaw()">
+        <option value="">Все версии схемы</option>
+      </select>
       <a href="/ema_diag_export" style="text-decoration:none"><button>&#128190; Скачать JSON</button></a>
       <button onclick="clearDiag()" class="btn-danger-sm">Очистить всё</button>
     </div>
@@ -5880,7 +6011,7 @@ select,input{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-ra
   <div id="rawStatus" class="summary-line"></div>
   <div class="table-scroll">
     <table id="rawTable">
-      <thead><tr><th>Монета</th><th>ТФ</th><th>EMA</th><th>Подход</th><th>Dist(ATR)</th><th>Vol ratio</th><th>Funding</th><th>MFE</th><th>MAE</th><th>Откат</th><th>15м</th><th>30м</th><th>60м</th><th>120м</th><th>240м</th><th>Статус</th><th>Когда</th></tr></thead>
+      <thead><tr><th>Монета</th><th>ТФ</th><th>EMA</th><th>Схема</th><th>Подход</th><th>Dist(ATR)</th><th>Vol ratio</th><th>Funding</th><th>MFE</th><th>MAE</th><th>Откат</th><th>15м</th><th>30м</th><th>60м</th><th>120м</th><th>240м</th><th>Статус</th><th>Когда</th></tr></thead>
       <tbody></tbody>
     </table>
   </div>
@@ -5915,9 +6046,21 @@ async function loadSummary(){
       const tr = document.createElement('tr');
       const longBr = e.long ? e.long.bounce_rate : null;
       const shortBr = e.short ? e.short.bounce_rate : null;
-      tr.innerHTML = `<td>${e.tf}</td><td>EMA${e.period}</td><td>${o.total}</td><td>${o.evaluated}</td>`
+      // если среднее сильно разошлось с медианой -- знак, что среднее
+      // искажено выбросом (см. случай AKE_USDT: +250% за 15м утащил
+      // среднюю связки с +0.04% до -3.7%, хотя медиана была честной)
+      const mfeSkewed = o.avg_mfe_pct!=null && o.median_mfe_pct!=null && Math.abs(o.avg_mfe_pct - o.median_mfe_pct) > Math.abs(o.median_mfe_pct)*2 + 1;
+      const maeSkewed = o.avg_mae_pct!=null && o.median_mae_pct!=null && Math.abs(o.avg_mae_pct - o.median_mae_pct) > Math.abs(o.median_mae_pct)*2 + 1;
+      const verLabel = (o.diag_versions||[]).join(',') || '—';
+      const verCell = o.mixed_versions
+        ? `<span style="color:#d29922" title="В этой группе смешаны записи из РАЗНЫХ версий схемы (${verLabel}) -- логика детекта/чекпоинтов менялась в середине выборки, сравнение как единого целого некорректно">⚠ ${verLabel}</span>`
+        : verLabel;
+      tr.innerHTML = `<td>${e.tf}</td><td>EMA${e.period}</td><td>${verCell}</td><td>${o.total}</td><td>${o.evaluated}</td>`
         + `<td class="${wrClass(o.bounce_rate,60,35)}">${o.bounce_rate ?? '—'}%</td>`
-        + `<td>${o.avg_mfe_pct ?? '—'}%</td><td>${o.avg_mae_pct ?? '—'}%</td>`
+        + `<td${mfeSkewed?' style="color:#d29922" title="Среднее сильно разошлось с медианой -- похоже на выброс"':''}>${o.avg_mfe_pct ?? '—'}%${mfeSkewed?' ⚠':''}</td>`
+        + `<td>${o.median_mfe_pct ?? '—'}%</td>`
+        + `<td${maeSkewed?' style="color:#d29922" title="Среднее сильно разошлось с медианой -- похоже на выброс"':''}>${o.avg_mae_pct ?? '—'}%${maeSkewed?' ⚠':''}</td>`
+        + `<td>${o.median_mae_pct ?? '—'}%</td>`
         + `<td>${o.retrace_rate ?? '—'}%</td>`
         + `<td class="${wrClass(longBr,60,35)}">${longBr ?? '—'}${longBr!=null?'%':''}</td>`
         + `<td class="${wrClass(shortBr,60,35)}">${shortBr ?? '—'}${shortBr!=null?'%':''}</td>`;
@@ -5931,17 +6074,22 @@ async function loadRaw(){
   const statusEl = document.getElementById('rawStatus');
   const tf = document.getElementById('filterTf').value;
   const period = document.getElementById('filterPeriod').value;
+  const version = document.getElementById('filterVersion').value;
   let url = '/ema_diag_status?limit=100';
   if(tf) url += '&tf=' + tf;
   if(period) url += '&period=' + period;
+  if(version) url += '&diag_version=' + version;
   try{
     const r = await fetch(url); const d = await r.json();
     const tbody = document.querySelector('#rawTable tbody'); tbody.innerHTML = '';
+    const seenVersions = new Set();
     for(const it of d.recent){
       const tr = document.createElement('tr');
       const biasCol = it.classic_bias === 'short' ? '#f85149' : '#3fb950';
       const cps = it.checkpoints || {};
-      tr.innerHTML = `<td>${it.symbol}</td><td>${it.tf}</td><td>EMA${it.period}</td>`
+      const ver = it.diag_version ?? 0;
+      seenVersions.add(ver);
+      tr.innerHTML = `<td>${it.symbol}</td><td>${it.tf}</td><td>EMA${it.period}</td><td>${ver}</td>`
         + `<td style="color:${biasCol}">${it.side==='from_below'?'снизу→SHORT':'сверху→LONG'}</td>`
         + `<td>${it.dist_atr}</td><td>${it.vol_ratio ?? '—'}</td><td>${it.funding_rate ?? '—'}</td>`
         + `<td style="color:#3fb950">+${it.mfe_pct}%</td><td style="color:#f85149">-${it.mae_pct}%</td>`
@@ -5949,6 +6097,15 @@ async function loadRaw(){
         + `<td>${fmtCp(cps['15'])}</td><td>${fmtCp(cps['30'])}</td><td>${fmtCp(cps['60'])}</td><td>${fmtCp(cps['120'])}</td><td>${fmtCp(cps['240'])}</td>`
         + `<td>${it.track_done ? 'закрыт' : 'отслеживаем'}</td><td>${fmtAgo(it.ts)}</td>`;
       tbody.appendChild(tr);
+    }
+    // подсказка списка версий для выпадающего фильтра (наполняем один раз при первой загрузке)
+    const verSel = document.getElementById('filterVersion');
+    if(verSel.options.length <= 1){
+      for(const v of [...seenVersions].sort()){
+        const opt = document.createElement('option');
+        opt.value = v; opt.text = `Схема v${v}`;
+        verSel.appendChild(opt);
+      }
     }
     statusEl.innerText = `Показано ${d.recent.length} из ${d.total}`;
   }catch(e){ statusEl.innerText = '❌ ошибка загрузки'; }
@@ -6482,6 +6639,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             params = urllib.parse.parse_qs(qs)
             tf_filter = (params.get("tf") or [None])[0]
             period_filter = (params.get("period") or [None])[0]
+            version_filter = (params.get("diag_version") or [None])[0]
             limit = int((params.get("limit") or [200])[0])
             with _diag_lock:
                 items = list(_diag_records)
@@ -6489,6 +6647,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 items = [r for r in items if r["tf"] == tf_filter]
             if period_filter:
                 items = [r for r in items if str(r["period"]) == str(period_filter)]
+            if version_filter:
+                items = [r for r in items if str(r.get("diag_version", 0)) == str(version_filter)]
             items.sort(key=lambda r: r["ts"], reverse=True)
             self._json({"total": len(items), "recent": items[:limit]})
         elif self.path == "/ema_diag_summary":
