@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.22.0 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.22.1 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.22.1: по запросу — кнопки "Скачать" (💾) на всех четырёх таблицах
+  главной страницы (Живые пампы / Живые дампы / Аномальный объём продаж /
+  Касания EMA), не только на /ema_diag как раньше. Новые эндпоинты
+  /pump_export, /dump_export, /vol_anomaly_export, /weekly_ema_export — с
+  тем же Content-Disposition: attachment, что и у ema_diag_export (общий
+  метод _json_download на Handler). Это именно те данные, что реально
+  проходят через изменения v0.20-0.22 (мультиокно пампа/дампа, аномалия
+  объёма) — в отличие от EMA Diagnostics (независимый широкий сканер),
+  сравнение ДО/ПОСЛЕ по этим экспортам покажет реальный эффект. Проверено
+  HTTP-тестом на все четыре эндпоинта и кнопки на странице.
 - v0.22.0: автор стороннего бота подтвердил напрямую (не по пикселям) — red
   это объём на red-свечах (продажи), по симметрии зелёное — объём на
   green-свечах (покупки). Это ровно volume_mode="directional" +
@@ -397,7 +407,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.22.0"
+APP_VERSION  = "0.22.1"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2462,7 +2472,7 @@ details[open] summary:before{content:"▾ "}
 <div class="section-card">
   <div class="section-head">
     <h3>&#128293; Живые пампы</h3>
-    <button onclick="clearHistory('pump')" class="btn-danger-sm">Очистить</button>
+    <div><a href="/pump_export" style="text-decoration:none"><button style="background:#21262d;border:1px solid #30363d;margin-right:6px">&#128190;</button></a><button onclick="clearHistory('pump')" class="btn-danger-sm">Очистить</button></div>
   </div>
   <div id="pumpSummary" class="summary-line">пока не было срабатываний</div>
   <div class="table-scroll">
@@ -2473,7 +2483,7 @@ details[open] summary:before{content:"▾ "}
 <div class="section-card">
   <div class="section-head">
     <h3>&#128167; Живые дампы</h3>
-    <button onclick="clearHistory('dump')" class="btn-danger-sm">Очистить</button>
+    <div><a href="/dump_export" style="text-decoration:none"><button style="background:#21262d;border:1px solid #30363d;margin-right:6px">&#128190;</button></a><button onclick="clearHistory('dump')" class="btn-danger-sm">Очистить</button></div>
   </div>
   <div id="dumpSummary" class="summary-line">пока не было срабатываний</div>
   <div class="table-scroll">
@@ -2484,7 +2494,7 @@ details[open] summary:before{content:"▾ "}
 <div class="section-card">
   <div class="section-head">
     <h3>&#128300; Аномальный объём продаж</h3>
-    <button onclick="clearHistory('vol_anomaly')" class="btn-danger-sm">Очистить</button>
+    <div><a href="/vol_anomaly_export" style="text-decoration:none"><button style="background:#21262d;border:1px solid #30363d;margin-right:6px">&#128190;</button></a><button onclick="clearHistory('vol_anomaly')" class="btn-danger-sm">Очистить</button></div>
   </div>
   <div id="volAnomalySummary" class="summary-line">пока не было срабатываний</div>
   <div class="table-scroll">
@@ -2495,7 +2505,7 @@ details[open] summary:before{content:"▾ "}
 <div class="section-card">
   <div class="section-head">
     <h3>&#128204; Касания EMA7/14/28 (триггер — памп/дамп/объём)</h3>
-    <button onclick="clearHistory('weekly_ema')" class="btn-danger-sm">Очистить</button>
+    <div><a href="/weekly_ema_export" style="text-decoration:none"><button style="background:#21262d;border:1px solid #30363d;margin-right:6px">&#128190;</button></a><button onclick="clearHistory('weekly_ema')" class="btn-danger-sm">Очистить</button></div>
   </div>
   <div id="weeklyEmaSummary" class="summary-line">пока не было срабатываний</div>
   <div class="table-scroll">
@@ -6752,6 +6762,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _json_download(self, obj, filename_prefix):
+        # то же, что _json, но с Content-Disposition: attachment — браузер
+        # на телефоне сохранит файл вместо того, чтобы показать JSON текстом
+        body = json.dumps(obj, ensure_ascii=False, indent=2).encode()
+        fname = f"{filename_prefix}_{time.strftime('%Y%m%d_%H%M')}.json"
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
+        self.send_header("Content-Length", len(body))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
       try:
         if self.path == "/" or self.path == "/index.html":
@@ -6861,6 +6883,41 @@ class Handler(http.server.BaseHTTPRequestHandler):
             with _weekly_ema_touch_lock:
                 recent = list(_weekly_ema_recent[-100:])
             self._json({"recent": recent})
+        elif self.path == "/pump_export":
+            recent = []
+            try:
+                if os.path.exists(PUMP_DETECT_HISTORY_FILE):
+                    with open(PUMP_DETECT_HISTORY_FILE) as f:
+                        recent = json.load(f)
+            except Exception:
+                recent = []
+            self._json_download({"exported_at": int(time.time()), "count": len(recent),
+                                 "records": recent}, "pump_history")
+        elif self.path == "/dump_export":
+            recent = []
+            try:
+                if os.path.exists(DUMP_DETECT_HISTORY_FILE):
+                    with open(DUMP_DETECT_HISTORY_FILE) as f:
+                        recent = json.load(f)
+            except Exception:
+                recent = []
+            self._json_download({"exported_at": int(time.time()), "count": len(recent),
+                                 "records": recent}, "dump_history")
+        elif self.path == "/vol_anomaly_export":
+            recent = []
+            try:
+                if os.path.exists(VOL_ANOMALY_HISTORY_FILE):
+                    with open(VOL_ANOMALY_HISTORY_FILE) as f:
+                        recent = json.load(f)
+            except Exception:
+                recent = []
+            self._json_download({"exported_at": int(time.time()), "count": len(recent),
+                                 "records": recent}, "vol_anomaly_history")
+        elif self.path == "/weekly_ema_export":
+            with _weekly_ema_touch_lock:
+                recent = list(_weekly_ema_recent)
+            self._json_download({"exported_at": int(time.time()), "count": len(recent),
+                                 "records": recent}, "weekly_ema_signals")
         elif self.path == "/alert_cfg":
             self._json({"tg_token": TG_TOKEN, "tg_chat": TG_CHAT, "ntfy_url": NTFY_URL,
                         "hc_url": HC_URL,
