@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.29.0 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.29.1 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.29.1: по запросу — фильтр по истории (v0.29.0) применялся ПОСЛЕ среза
+  топ-N по объёму: если среди топ-N оказывалось много молодых монет,
+  реально просканированных получалось меньше запрошенного N (список
+  "усыхал"). Теперь порядок обратный — сначала фильтр по истории на
+  расширенном пуле (топ-N с запасом ×3 для Pump/Dump Detector'а, не вся
+  биржа целиком — лишней нагрузки на сотнях нерелевантных низколиквидных
+  контрактов не добавляет; у Volume Peak Watcher'а буфер не нужен —
+  _fetch_all_symbols() уже сам ограничен ~100 монетами), потом топ-N по
+  объёму среди прошедших фильтр. Список честно добирается до
+  запрошенного N за счёт следующих по объёму монет, а не обрезается.
+  Проверено тестом: 3 молодых монеты в начале списка по объёму — итоговый
+  список всё равно наполняется до полных запрошенных 5.
 - v0.29.0: по запросу — монеты с недостаточной торговой историей (пара
   дней/недель) теперь фильтруются из поиска пампов/дампов/аномалий объёма
   целиком, не только из EMA-триггера. Если дневной EMA7/14/28(D)
@@ -632,7 +644,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.29.0"
+APP_VERSION  = "0.29.1"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3696,10 +3708,15 @@ def _has_sufficient_ema_history(symbol):
 
 def _get_tradeable_symbols():
     """Топ-N по объёму (настраиваемый), отфильтрованный по достаточности
-    истории — используется и Pump/Dump Detector'ом, и Volume Peak
-    Watcher'ом, чтобы не гонять детект на монетах, где EMA-сигнал
-    физически невозможен."""
-    return [s for s in _fetch_all_symbols()[:_get_scan_top_n()] if _has_sufficient_ema_history(s)]
+    истории — используется Volume Peak Watcher'ом, чтобы не гонять детект
+    на монетах, где EMA-сигнал физически невозможен.
+    v0.29.1: фильтр по истории теперь ДО среза top-N — иначе если среди
+    топ-N по объёму много молодых монет, реально просканированных
+    оказывалось меньше запрошенного N. _fetch_all_symbols() уже сам
+    ограничен ~100 монетами по объёму/спреду — дополнительный буфер сверх
+    этого не нужен, лишней нагрузки не добавляет."""
+    qualifying = [s for s in _fetch_all_symbols() if _has_sufficient_ema_history(s)]
+    return qualifying[:_get_scan_top_n()]
 
 
 _pump_detect_lock   = threading.Lock()
@@ -4517,10 +4534,19 @@ def _pump_detect_loop():
         try:
             snapshot = _pump_fetch_tickers_snapshot()
             if snapshot:
-                top_symbols = sorted(snapshot.keys(),
-                                      key=lambda s: snapshot[s]["vol24"],
-                                      reverse=True)[:_get_scan_top_n()]
-                top_symbols = [s for s in top_symbols if _has_sufficient_ema_history(s)]
+                by_volume = sorted(snapshot.keys(), key=lambda s: snapshot[s]["vol24"], reverse=True)
+                # v0.29.1: по запросу — фильтр по истории теперь ДО среза
+                # top-N, не после. Раньше: топ-N по объёму -> потом фильтр
+                # -> если среди топ-N много молодых монет, реально
+                # просканированных оказывалось МЕНЬШЕ N. Теперь: фильтр по
+                # РАСШИРЕННОМУ пулу (топ-N с запасом x3, не вся биржа
+                # целиком — иначе лишняя нагрузка на сотнях нерелевантных
+                # низколиквидных контрактов) -> топ-N по объёму среди
+                # прошедших фильтр -> всегда честные N (или сколько
+                # реально наберётся) пригодных для сделки монет.
+                pool = by_volume[:max(300, _get_scan_top_n() * 3)]
+                qualifying = [s for s in pool if _has_sufficient_ema_history(s)]
+                top_symbols = qualifying[:_get_scan_top_n()]
                 _pump_update_history(snapshot, top_symbols)
                 now = time.time()
                 for sym in top_symbols:
