@@ -1,7 +1,21 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.25.0 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.26.0 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.26.0: ИСПРАВЛЕНА суть логики Volume Peak Watcher по разбору
+  аннотированных скринов — v0.25.0 была основана на неверном понимании:
+  "пик" это не цена свечи со всплеском объёма, а НОВЫЙ ЛОКАЛЬНЫЙ МАКСИМУМ
+  ЦЕНЫ, который формируется ПОСЛЕ всплеска (пользователь обвёл именно
+  точку на самой линии цены в момент её локального пика, не место
+  всплеска объёма). Всплеск объёма — просто триггер "начать следить",
+  сигнал шлётся когда цена РЕАЛЬНО сделала пик и НАЧАЛА ОТКАТЫВАТЬ.
+  Логика теперь: (1) всплеск найден — начинаем следить, бегущий максимум
+  = цена всплеска; (2) пока живая цена растёт — просто двигаем бегущий
+  максимум дальше, без алерта; (3) как только цена откатила от максимума
+  на VOL_PEAK_ROLLOVER_PCT=0.4% — пик подтверждён, вот тогда алерт с
+  ценой/временем этого пика. Проверено тестом с реальными числами из
+  скрина (SOL_USDT, пик на 75.28 — та же цифра, что была на графике):
+  рост цены НЕ вызывает алерт, только подтверждённый откат.
 - v0.25.0: ПОЛНАЯ ПЕРЕРАБОТКА Sell-Volume Anomaly Watcher → Volume Peak
   Level Watcher, по прямому запросу после разбора ~10 реальных скринов
   стороннего бота. Обнаружилась ОДНА постоянная структура на каждом
@@ -462,7 +476,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.25.0"
+APP_VERSION  = "0.26.0"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4351,28 +4365,27 @@ def _pump_detect_loop():
 # ─── конец Live Pump/Dump Detector ──────────────────────────────────────────
 
 # ─── Volume Peak Level Watcher ───────────────────────────────────────────────
-# v0.25.0: полная переработка по прямому запросу — разобрав ~10 реальных
-# скринов стороннего бота, обнаружилась ОДНА постоянная структура на
-# каждом: где-то в прошлом происходит пик объёма (на определённой ЦЕНЕ),
-# а сигнал шлётся НЕ в момент самого пика, а ПОЗЖЕ — когда цена, двигаясь
-# дальше, ВОЗВРАЩАЕТСЯ на ценовой уровень этого пика (пример RARE: красный
-# всплеск на уровне ~0.0140, сигнал пришёл когда цена вернулась туда же,
-# ~0.01399). Раньше у нас было наоборот: алерт слался МГНОВЕННО в момент
-# самого пика — отсюда и "графики выглядят как попало", не как у него.
-# Теперь двухэтапно: (1) находим пики red-объёма (z-score) в широком окне
-# и КЛАДЁМ УРОВЕНЬ ЦЕНЫ В WATCHLIST, не алертя сразу; (2) на каждом
-# проходе проверяем, не вернулась ли живая цена к уровню какого-то из
-# запомненных пиков — и ТОЛЬКО ТОГДА шлём алерт.
+# v0.26.0: исправлена сама суть логики по разбору аннотированных скринов —
+# "пик" это НЕ цена свечи со всплеском объёма, а НОВЫЙ ЛОКАЛЬНЫЙ МАКСИМУМ
+# ЦЕНЫ, который формируется УЖЕ ПОСЛЕ всплеска объёма (пользователь обвёл
+# именно точку на самой ЧЁРНОЙ ЛИНИИ ЦЕНЫ, в момент её локального пика, а
+# не место всплеска). Всплеск объёма — просто триггер "начать следить за
+# монетой", а сигнал шлётся, когда цена РЕАЛЬНО сделала свой пик и
+# НАЧАЛА ОТКАТЫВАТЬ — то есть пик уже подтверждён, а не в процессе роста.
+# Логика: (1) находим всплеск red-объёма (z-score) — начинаем следить;
+# (2) на каждом проходе обновляем БЕГУЩИЙ МАКСИМУМ цены с момента всплеска;
+# (3) как только цена откатила от этого максимума на VOL_PEAK_ROLLOVER_PCT —
+# пик подтверждён, шлём алерт с ценой (и временем) того максимума.
 VOL_PEAK_SCAN_POLL_SEC       = 300     # раз в 5 минут — фетч реальных свечей дороже тикеров
-VOL_PEAK_LOOKBACK_MIN        = 240     # ищем пики в пределах последних 4 часов
+VOL_PEAK_LOOKBACK_MIN        = 240     # ищем всплески объёма в пределах последних 4 часов
 VOL_PEAK_ZSCORE_THRESHOLD    = 2.5     # тот же порог, что был у мгновенного детектора
-VOL_PEAK_EXPIRY_SEC          = 12 * 3600   # если цена не вернулась к уровню за 12 часов — забываем пик
-VOL_PEAK_TOUCH_TOLERANCE_PCT = 0.5     # насколько близко цена должна подойти к уровню пика, чтобы считать "достигла"
+VOL_PEAK_EXPIRY_SEC          = 12 * 3600   # если пик так и не подтвердится за 12 часов — забываем
+VOL_PEAK_ROLLOVER_PCT        = 0.4     # насколько цена должна откатить от бегущего максимума, чтобы пик считался подтверждённым
 VOL_PEAK_TRACK_WINDOW_SEC    = 2 * 3600    # трекинг исхода после срабатывания — тот же принцип, что у пампа/дампа
 VOL_ANOMALY_HISTORY_FILE     = os.path.expanduser("~/pumpradar_vol_anomaly_history.json")  # тот же файл, что и раньше
 VOL_PEAK_WATCHLIST_FILE      = os.path.expanduser("~/pumpradar_vol_peak_watchlist.json")
 
-_vol_peak_watchlist = {}   # symbol -> [{"peak_price","peak_ts","peak_vol","z","mean","std","expires_at"}, ...]
+_vol_peak_watchlist = {}   # symbol -> [{"spike_ts","spike_vol","z","mean","std","peak_price","peak_ts","expires_at"}, ...]
 _vol_peak_lock = threading.Lock()
 
 
@@ -4380,8 +4393,10 @@ def _find_volume_peaks(symbol):
     """Сканирует ВСЁ окно VOL_PEAK_LOOKBACK_MIN (не только последнюю
     свечу, как раньше) и находит ВСЕ red-свечи, чей объём — статистический
     выброс (z-score) относительно среднего/std всех red-свечей окна.
-    Возвращает список пиков (может быть несколько на монету) — каждый со
-    своей ценой (уровень для watchlist), временем и объёмом."""
+    Возвращает список всплесков (может быть несколько на монету) — каждый
+    со своим временем/объёмом/ценой НА МОМЕНТ ВСПЛЕСКА (это ещё не
+    "пик" — пик это будущий локальный максимум цены, который подтвердится
+    позже, см. _vol_peak_scan_loop)."""
     try:
         days = max(1, math.ceil(VOL_PEAK_LOOKBACK_MIN * 60 / 86400) + 1)
         candles = _fetch_candles(symbol, "1m", days)
@@ -4398,14 +4413,14 @@ def _find_volume_peaks(symbol):
     std_v = var ** 0.5
     if std_v <= 0:
         return []
-    peaks = []
+    spikes = []
     for c in red_candles:
         vol = c.get("vol", 0) or 0
         z = (vol - mean_v) / std_v
         if z >= VOL_PEAK_ZSCORE_THRESHOLD:
-            peaks.append({"peak_price": c["close"], "peak_ts": c["t"], "peak_vol": vol,
-                          "z": round(z, 2), "mean": round(mean_v, 2), "std": round(std_v, 2)})
-    return peaks
+            spikes.append({"spike_price": c["close"], "spike_ts": c["t"], "spike_vol": vol,
+                           "z": round(z, 2), "mean": round(mean_v, 2), "std": round(std_v, 2)})
+    return spikes
 
 
 def _save_vol_peak_watchlist():
@@ -4435,43 +4450,52 @@ def _load_vol_peak_watchlist():
         olog(f"[vol_peak] ⚠ не смог подхватить watchlist с диска: {e}")
 
 
-def _vol_peak_fire_alert(symbol, peak, current_price):
-    """Цена ВЕРНУЛАСЬ на уровень запомненного пика объёма — вот теперь,
-    как на референсе, шлём алерт. Картинка — тот же _render_vol_anomaly_chart_png
-    (фиолетовая заливка red-объёма + подсветка), но окно теперь достаточно
-    широкое, чтобы на графике было видно ОБА момента: сам пик (в прошлом)
-    и текущую точку возврата цены к его уровню."""
+def _vol_peak_fire_alert(symbol, watch_item, current_price):
+    """Цена ОТКАТИЛА от бегущего максимума (watch_item['peak_price']) на
+    VOL_PEAK_ROLLOVER_PCT — пик подтверждён, вот теперь шлём алерт.
+    Картинка — тот же _render_vol_anomaly_chart_png (фиолетовая заливка
+    red-объёма + подсветка), окно достаточно широкое, чтобы на графике
+    было видно и сам всплеск объёма (в прошлом), и подтверждённый пик
+    цены (позже, до отката)."""
     candles = []
     try:
-        chart_lookback_min = max(VOL_PEAK_LOOKBACK_MIN, int((time.time() - peak["peak_ts"]) / 60) + 30)
+        chart_lookback_min = max(VOL_PEAK_LOOKBACK_MIN,
+                                  int((time.time() - watch_item["spike_ts"]) / 60) + 30)
         days = max(1, math.ceil(chart_lookback_min * 60 / 86400) + 1)
         raw = _fetch_candles(symbol, "1m", days)
-        cutoff = peak["peak_ts"] - 20 * 60
+        cutoff = watch_item["spike_ts"] - 20 * 60
         candles = [c for c in raw if c["t"] >= cutoff]
     except Exception as e:
         olog(f"[vol_peak] {symbol}: не смог получить свечи для графика: {e}")
 
     png = None
     try:
-        png = _render_vol_anomaly_chart_png(candles, peak["peak_price"], anomaly_t=peak["peak_ts"])
+        # подсвечиваем именно ПОДТВЕРЖДЁННЫЙ ЦЕНОВОЙ ПИК (peak_ts), не
+        # момент самого всплеска объёма — это и есть точка сигнала
+        png = _render_vol_anomaly_chart_png(candles, watch_item["peak_price"],
+                                             anomaly_t=watch_item["peak_ts"])
     except Exception as e:
         olog(f"[vol_peak] {symbol}: ошибка рендера графика: {e}")
 
-    ago_min = round((time.time() - peak["peak_ts"]) / 60)
+    spike_ago_min = round((time.time() - watch_item["spike_ts"]) / 60)
+    peak_ago_min = round((time.time() - watch_item["peak_ts"]) / 60)
+    rollback_pct = round((watch_item["peak_price"] - current_price) / watch_item["peak_price"] * 100, 2)
     caption = (
-        f"📐 <b>{symbol}</b> — цена вернулась к уровню аномального объёма\n"
-        f"Пик объёма был {ago_min} мин назад: z-score {peak['z']} "
-        f"(объём {peak['peak_vol']:.0f} против среднего {peak['mean']:.0f} ± {peak['std']:.0f})\n"
-        f"Уровень пика: {_fmt_px(peak['peak_price'])} | Текущая цена: {_fmt_px(current_price)}"
+        f"📐 <b>{symbol}</b> — цена сделала пик и откатывает\n"
+        f"Всплеск объёма был {spike_ago_min} мин назад: z-score {watch_item['z']} "
+        f"(объём {watch_item['spike_vol']:.0f} против среднего {watch_item['mean']:.0f} ± {watch_item['std']:.0f})\n"
+        f"Пик цены: {_fmt_px(watch_item['peak_price'])} ({peak_ago_min}м назад) "
+        f"| Сейчас: {_fmt_px(current_price)} (откат {rollback_pct}%)"
     )
     _send_alert_photo(png, caption)
-    olog(f"[vol_peak] {symbol}: цена {current_price:.6g} вернулась к уровню пика "
-         f"{peak['peak_price']:.6g} (z={peak['z']}, {ago_min}м назад) — алерт отправлен")
+    olog(f"[vol_peak] {symbol}: пик {watch_item['peak_price']:.6g} подтверждён, откат до "
+         f"{current_price:.6g} ({rollback_pct}%, z={watch_item['z']}) — алерт отправлен")
 
     now = time.time()
-    rec = {"ts": int(now), "symbol": symbol, "z": peak["z"], "vol": peak["peak_vol"],
-           "mean": peak["mean"], "std": peak["std"], "price": current_price,
-           "peak_price": peak["peak_price"], "peak_ts": peak["peak_ts"], "peak_age_min": ago_min,
+    rec = {"ts": int(now), "symbol": symbol, "z": watch_item["z"], "vol": watch_item["spike_vol"],
+           "mean": watch_item["mean"], "std": watch_item["std"], "price": current_price,
+           "peak_price": watch_item["peak_price"], "peak_ts": watch_item["peak_ts"],
+           "peak_age_min": peak_ago_min,
            "track_until": now + VOL_PEAK_TRACK_WINDOW_SEC, "track_done": False,
            "max_follow_pct": 0.0, "max_reverse_pct": 0.0,
            "last_tracked_price": current_price, "last_tracked_ts": int(now)}
@@ -4484,13 +4508,15 @@ def _vol_peak_fire_alert(symbol, peak, current_price):
 
 
 def _vol_peak_scan_loop():
-    """Раз в VOL_PEAK_SCAN_POLL_SEC: (1) ищет НОВЫЕ пики объёма по топ-N
-    монетам и кладёт уровень их цены в watchlist (не алертит сразу);
-    (2) для каждой монеты в watchlist проверяет, дошла ли ЖИВАЯ цена до
-    уровня какого-то из запомненных пиков (в пределах
-    VOL_PEAK_TOUCH_TOLERANCE_PCT) — если да, вот тогда шлёт алерт;
-    (3) чистит записи watchlist старше VOL_PEAK_EXPIRY_SEC (цена так и не
-    вернулась — забываем, не копим бесконечно)."""
+    """Раз в VOL_PEAK_SCAN_POLL_SEC: (1) ищет НОВЫЕ всплески объёма по
+    топ-N монетам и начинает следить (кладёт в watchlist с
+    peak_price=цена всплеска — стартовая точка бегущего максимума);
+    (2) для каждой уже отслеживаемой монеты подтягивает живую цену: если
+    она ВЫШЕ текущего peak_price — обновляет бегущий максимум (пик ещё
+    формируется, цена продолжает расти); если цена ОТКАТИЛА от
+    peak_price на VOL_PEAK_ROLLOVER_PCT — пик подтверждён (цена
+    развернулась), вот тогда шлёт алерт; (3) чистит записи старше
+    VOL_PEAK_EXPIRY_SEC (пик так и не подтвердился — забываем)."""
     time.sleep(80)
     _load_vol_peak_watchlist()
     while True:
@@ -4500,20 +4526,24 @@ def _vol_peak_scan_loop():
             changed = False
             for symbol in symbols:
                 try:
-                    new_peaks = _find_volume_peaks(symbol)
+                    new_spikes = _find_volume_peaks(symbol)
                 except Exception as e:
-                    olog(f"[vol_peak] {symbol}: ошибка поиска пиков: {e}")
-                    new_peaks = []
+                    olog(f"[vol_peak] {symbol}: ошибка поиска всплесков: {e}")
+                    new_spikes = []
                 with _vol_peak_lock:
                     existing = _vol_peak_watchlist.get(symbol, [])
-                    existing_ts = {p["peak_ts"] for p in existing}
+                    existing_spike_ts = {p["spike_ts"] for p in existing}
                     added = 0
-                    for peak in new_peaks:
-                        if peak["peak_ts"] in existing_ts:
+                    for spike in new_spikes:
+                        if spike["spike_ts"] in existing_spike_ts:
                             continue
-                        peak = dict(peak)
-                        peak["expires_at"] = now + VOL_PEAK_EXPIRY_SEC
-                        existing.append(peak)
+                        item = dict(spike)
+                        # бегущий максимум СТАРТУЕТ с цены самого всплеска —
+                        # дальше будет только расти, пока цена продолжает идти вверх
+                        item["peak_price"] = spike["spike_price"]
+                        item["peak_ts"] = spike["spike_ts"]
+                        item["expires_at"] = now + VOL_PEAK_EXPIRY_SEC
+                        existing.append(item)
                         added += 1
                     before = len(existing)
                     existing = [p for p in existing if p["expires_at"] > now]
@@ -4530,16 +4560,29 @@ def _vol_peak_scan_loop():
                     price = None
                 if not price:
                     continue
-                for peak in watch_now:
-                    tolerance = peak["peak_price"] * VOL_PEAK_TOUCH_TOLERANCE_PCT / 100.0
-                    if abs(price - peak["peak_price"]) <= tolerance:
-                        _vol_peak_fire_alert(symbol, peak, price)
+                fired_ts = set()
+                for item in watch_now:
+                    if price > item["peak_price"]:
+                        # цена ещё растёт -- пик ещё не сформирован, просто
+                        # подвигаем бегущий максимум дальше и ждём разворота
                         with _vol_peak_lock:
-                            _vol_peak_watchlist[symbol] = [
-                                p for p in _vol_peak_watchlist.get(symbol, [])
-                                if p["peak_ts"] != peak["peak_ts"]
-                            ]
+                            for p in _vol_peak_watchlist.get(symbol, []):
+                                if p["spike_ts"] == item["spike_ts"]:
+                                    p["peak_price"] = price
+                                    p["peak_ts"] = now
                         changed = True
+                        continue
+                    rollback_pct = (item["peak_price"] - price) / item["peak_price"] * 100.0
+                    if rollback_pct >= VOL_PEAK_ROLLOVER_PCT:
+                        _vol_peak_fire_alert(symbol, item, price)
+                        fired_ts.add(item["spike_ts"])
+                        changed = True
+                if fired_ts:
+                    with _vol_peak_lock:
+                        _vol_peak_watchlist[symbol] = [
+                            p for p in _vol_peak_watchlist.get(symbol, [])
+                            if p["spike_ts"] not in fired_ts
+                        ]
             if changed:
                 _save_vol_peak_watchlist()
         except Exception as e:
