@@ -1,7 +1,21 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.28.6 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.29.0 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.29.0: по запросу — монеты с недостаточной торговой историей (пара
+  дней/недель) теперь фильтруются из поиска пампов/дампов/аномалий объёма
+  целиком, не только из EMA-триггера. Если дневной EMA7/14/28(D)
+  физически невозможно посчитать — не от чего оттолкнуться, чтобы зайти в
+  сделку, даже обычный памп/дамп на такой монете бесполезен для торговли.
+  Новая _has_sufficient_ema_history(symbol) переиспользует уже
+  существовавший негативный кэш (_ema_touch_get_closed_ctx, 3 дня между
+  перепроверками) — почти бесплатно после первого раза, не гоняет сеть
+  заново каждую минуту на одну и ту же свежую монету. Применено к Pump/Dump
+  Detector'у (топ-N по тикерам) и Volume Peak Watcher'у (общий
+  _get_tradeable_symbols()). EMA Diagnostics (широкий исследовательский
+  сканер) намеренно НЕ фильтруется — там ценность именно в охвате всех
+  монет для анализа, не в готовности к сделке прямо сейчас. Проверено
+  тестом: монета с 10 днями истории отсеивается, с 400 днями — проходит.
 - v0.28.6: реальный случай (SKHY_USDT, три разных всплеска — z-score 2.84,
   2.72, 6.72 — выстрелили почти одним пакетом за 1 минуту, все на одну и
   ту же цену 165.13). Причина: по мере того, как 4-часовое окно сдвигается
@@ -618,7 +632,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.28.6"
+APP_VERSION  = "0.29.0"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3664,6 +3678,30 @@ def _get_scan_top_n():
         return _scan_settings["top_n"]
 
 
+def _has_sufficient_ema_history(symbol):
+    """По прямому запросу — монеты с маленькой историей (несколько дней
+    или недель) фильтруются из поиска пампов/дампов/аномалий объёма:
+    если дневной EMA7/14/28(D) физически невозможно посчитать (мало
+    баров), то и полноценный сигнал со входом/стопом/тейком никогда не
+    получится — не от чего оттолкнуться, чтобы зайти в сделку. Переиспользует
+    _ema_touch_get_closed_ctx — тот же негативный кэш на 3 дня, что уже
+    был для EMA-триггера, так что повторная проверка почти бесплатна
+    после первого раза (не тратим сеть на одну и ту же свежую монету
+    заново каждую минуту)."""
+    try:
+        return _ema_touch_get_closed_ctx(symbol, "1d") is not None
+    except Exception:
+        return True  # не блокируем при сетевой ошибке -- лучше пропустить лишний раз, чем упустить сигнал
+
+
+def _get_tradeable_symbols():
+    """Топ-N по объёму (настраиваемый), отфильтрованный по достаточности
+    истории — используется и Pump/Dump Detector'ом, и Volume Peak
+    Watcher'ом, чтобы не гонять детект на монетах, где EMA-сигнал
+    физически невозможен."""
+    return [s for s in _fetch_all_symbols()[:_get_scan_top_n()] if _has_sufficient_ema_history(s)]
+
+
 _pump_detect_lock   = threading.Lock()
 _pump_price_history = {}   # symbol -> [(ts, price), ...] по возрастанию времени
 _pump_detect_state  = {}   # symbol -> {"last_alert_ts": float, "last_pct": float}
@@ -4482,6 +4520,7 @@ def _pump_detect_loop():
                 top_symbols = sorted(snapshot.keys(),
                                       key=lambda s: snapshot[s]["vol24"],
                                       reverse=True)[:_get_scan_top_n()]
+                top_symbols = [s for s in top_symbols if _has_sufficient_ema_history(s)]
                 _pump_update_history(snapshot, top_symbols)
                 now = time.time()
                 for sym in top_symbols:
@@ -4700,7 +4739,7 @@ def _vol_peak_find_loop():
     _load_vol_peak_watchlist()
     while True:
         try:
-            symbols = _fetch_all_symbols()[:_get_scan_top_n()]
+            symbols = _get_tradeable_symbols()
             now = time.time()
             changed = False
             fired_keys = _vol_peak_get_fired_keys()
