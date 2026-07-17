@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.27.1 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.28.0 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.28.0: по прямому уточнению — ориентир только на САМЫЙ КРУПНЫЙ всплеск
+  объёма в отображаемом окне (4 часа), не на любой, что просто перевалил
+  порог z-score. Раньше _find_volume_peaks возвращала ВСЕ red-свечи,
+  проходящие порог — теперь берёт red-свечу с максимальным объёмом во
+  всём окне и проверяет z-score только для неё одной. Дедуп по spike_ts
+  в watchlist сохранён — если в окне позже появляется ЕЩЁ БОЛЕЕ крупный
+  всплеск (новый максимум), он тоже начнёт отслеживаться отдельно; но на
+  каждый конкретный проход сканирования из нескольких одновременно
+  квалифицирующихся всплесков остаётся только реально самый большой.
+  Проверено тестом: из трёх всплесков, каждый по отдельности проходящих
+  порог z>=4.0, в watchlist попадает только один — с максимальным объёмом.
 - v0.27.1: попробовал добавить фильтр "всплеск объёма должен совпадать по
   времени с локальным пиком цены" (по разбору скрина ESP0RTS, где как
   показалось, крупный всплеск посреди ровного роста был "неправильным"
@@ -510,7 +521,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.27.1"
+APP_VERSION  = "0.28.0"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4427,14 +4438,12 @@ _vol_peak_lock = threading.Lock()
 
 def _find_volume_peaks(symbol):
     """Сканирует ВСЁ окно VOL_PEAK_LOOKBACK_MIN (не только последнюю
-    свечу, как раньше) и находит red-свечи, чей объём — статистический
-    выброс (z-score) относительно среднего/std всех red-свечей окна.
-    v0.28.0: пробовал добавить фильтр "всплеск должен совпадать с
-    локальным пиком цены" — по прямому уточнению это была ОШИБКА, убрано.
-    Ориентир — сам крупный/доминирующий всплеск (z-score), а не совпадение
-    по времени с чем-либо ещё. Тот самый порог VOL_PEAK_ZSCORE_THRESHOLD
-    (доминирующие всплески, не мелкая рябь) остаётся как единственный
-    фильтр отбора."""
+    свечу, как раньше) и находит red-свечу с САМЫМ БОЛЬШИМ объёмом во всём
+    окне — если её z-score (относительно среднего/std всех red-свечей)
+    проходит порог. По прямому уточнению — ориентир только на САМЫЙ
+    крупный всплеск в отображаемом окне, не на любой, что просто
+    перевалил порог (раньше возвращались ВСЕ квалифицирующиеся всплески,
+    что могло размывать внимание на не-самые-значимые события)."""
     try:
         days = max(1, math.ceil(VOL_PEAK_LOOKBACK_MIN * 60 / 86400) + 1)
         candles = _fetch_candles(symbol, "1m", days)
@@ -4451,15 +4460,13 @@ def _find_volume_peaks(symbol):
     std_v = var ** 0.5
     if std_v <= 0:
         return []
-    spikes = []
-    for c in red_candles:
-        vol = c.get("vol", 0) or 0
-        z = (vol - mean_v) / std_v
-        if z < VOL_PEAK_ZSCORE_THRESHOLD:
-            continue
-        spikes.append({"spike_price": c["close"], "spike_ts": c["t"], "spike_vol": vol,
-                       "z": round(z, 2), "mean": round(mean_v, 2), "std": round(std_v, 2)})
-    return spikes
+    biggest = max(red_candles, key=lambda c: c.get("vol", 0) or 0)
+    vol = biggest.get("vol", 0) or 0
+    z = (vol - mean_v) / std_v
+    if z < VOL_PEAK_ZSCORE_THRESHOLD:
+        return []
+    return [{"spike_price": biggest["close"], "spike_ts": biggest["t"], "spike_vol": vol,
+             "z": round(z, 2), "mean": round(mean_v, 2), "std": round(std_v, 2)}]
 
 
 def _save_vol_peak_watchlist():
