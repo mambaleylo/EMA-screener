@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.26.0 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.26.1 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.26.1: по реальному скрину (SNDK_USDT) — сигнал пришёл с откатом уже
+  0.9% при пороге 0.4%, потому что проверка цены была завязана на тот же
+  5-минутный цикл, что и дорогой поиск новых всплесков (фетч свечей) — за
+  эти 5 минут цена успевала укатиться далеко за порог, прежде чем мы
+  вообще замечали. Разделено на два независимых цикла: _vol_peak_find_loop
+  (5 минут, дорогой — только поиск новых всплесков) и _vol_peak_watch_loop
+  (30 секунд, дешёвый — только живая цена уже отслеживаемых монет, без
+  фетча свечей). Проверено тестом: то же самое срабатывание теперь ловит
+  откат ровно у порога (0.4%), а не убежавший до 0.9%.
 - v0.26.0: ИСПРАВЛЕНА суть логики Volume Peak Watcher по разбору
   аннотированных скринов — v0.25.0 была основана на неверном понимании:
   "пик" это не цена свечи со всплеском объёма, а НОВЫЙ ЛОКАЛЬНЫЙ МАКСИМУМ
@@ -476,7 +485,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.26.0"
+APP_VERSION  = "0.26.1"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4376,7 +4385,8 @@ def _pump_detect_loop():
 # (2) на каждом проходе обновляем БЕГУЩИЙ МАКСИМУМ цены с момента всплеска;
 # (3) как только цена откатила от этого максимума на VOL_PEAK_ROLLOVER_PCT —
 # пик подтверждён, шлём алерт с ценой (и временем) того максимума.
-VOL_PEAK_SCAN_POLL_SEC       = 300     # раз в 5 минут — фетч реальных свечей дороже тикеров
+VOL_PEAK_SCAN_POLL_SEC       = 300     # раз в 5 минут — фетч реальных свечей дороже тикеров (только поиск новых всплесков)
+VOL_PEAK_WATCH_POLL_SEC      = 30      # раз в 30 секунд — только живая цена (дёшево), ловит откат почти сразу, а не с опозданием в минуты
 VOL_PEAK_LOOKBACK_MIN        = 240     # ищем всплески объёма в пределах последних 4 часов
 VOL_PEAK_ZSCORE_THRESHOLD    = 2.5     # тот же порог, что был у мгновенного детектора
 VOL_PEAK_EXPIRY_SEC          = 12 * 3600   # если пик так и не подтвердится за 12 часов — забываем
@@ -4507,16 +4517,13 @@ def _vol_peak_fire_alert(symbol, watch_item, current_price):
         olog(f"[vol_peak] {symbol}: ошибка проверки EMA-триггера: {e}")
 
 
-def _vol_peak_scan_loop():
-    """Раз в VOL_PEAK_SCAN_POLL_SEC: (1) ищет НОВЫЕ всплески объёма по
-    топ-N монетам и начинает следить (кладёт в watchlist с
-    peak_price=цена всплеска — стартовая точка бегущего максимума);
-    (2) для каждой уже отслеживаемой монеты подтягивает живую цену: если
-    она ВЫШЕ текущего peak_price — обновляет бегущий максимум (пик ещё
-    формируется, цена продолжает расти); если цена ОТКАТИЛА от
-    peak_price на VOL_PEAK_ROLLOVER_PCT — пик подтверждён (цена
-    развернулась), вот тогда шлёт алерт; (3) чистит записи старше
-    VOL_PEAK_EXPIRY_SEC (пик так и не подтвердился — забываем)."""
+def _vol_peak_find_loop():
+    """Раз в VOL_PEAK_SCAN_POLL_SEC (5 минут — фетч реальных свечей на
+    монету, дорого) ищет НОВЫЕ всплески объёма по топ-N монетам и
+    начинает следить (кладёт в watchlist с peak_price=цена всплеска —
+    стартовая точка бегущего максимума). Только поиск — проверка цены
+    вынесена в отдельный частый _vol_peak_watch_loop (см. ниже), чтобы не
+    зависеть от 5-минутного шага при ловле отката."""
     time.sleep(80)
     _load_vol_peak_watchlist()
     while True:
@@ -4538,8 +4545,6 @@ def _vol_peak_scan_loop():
                         if spike["spike_ts"] in existing_spike_ts:
                             continue
                         item = dict(spike)
-                        # бегущий максимум СТАРТУЕТ с цены самого всплеска —
-                        # дальше будет только расти, пока цена продолжает идти вверх
                         item["peak_price"] = spike["spike_price"]
                         item["peak_ts"] = spike["spike_ts"]
                         item["expires_at"] = now + VOL_PEAK_EXPIRY_SEC
@@ -4550,21 +4555,44 @@ def _vol_peak_scan_loop():
                     if added or len(existing) != before:
                         changed = True
                     _vol_peak_watchlist[symbol] = existing
-                    watch_now = list(existing)
+            if changed:
+                _save_vol_peak_watchlist()
+        except Exception as e:
+            olog(f"[vol_peak] ошибка цикла поиска всплесков: {e}")
+        time.sleep(VOL_PEAK_SCAN_POLL_SEC)
+
+
+def _vol_peak_watch_loop():
+    """По прямому запросу — раньше проверка отката шла вместе с поиском
+    новых всплесков, раз в 5 минут; за это время цена успевала укатиться
+    далеко за порог VOL_PEAK_ROLLOVER_PCT (пример: порог 0.4%, а реально
+    поймали 0.9% — 5 минут между проверками достаточно, чтобы промахнуться
+    мимо самого момента подтверждения пика). Теперь отдельный ЧАСТЫЙ цикл
+    (только живая цена — дёшево, без фетча свечей) — ловит откат гораздо
+    ближе к моменту, когда он реально пересёк порог, а не когда цена уже
+    далеко укатилась."""
+    time.sleep(90)
+    while True:
+        try:
+            with _vol_peak_lock:
+                watched_symbols = [s for s, items in _vol_peak_watchlist.items() if items]
+            now = time.time()
+            changed = False
+            for symbol in watched_symbols:
+                with _vol_peak_lock:
+                    watch_now = list(_vol_peak_watchlist.get(symbol, []))
                 if not watch_now:
                     continue
                 try:
                     price = _gate_get_price(symbol)
                 except Exception as e:
-                    olog(f"[vol_peak] {symbol}: ошибка получения цены: {e}")
+                    olog(f"[vol_peak_watch] {symbol}: ошибка получения цены: {e}")
                     price = None
                 if not price:
                     continue
                 fired_ts = set()
                 for item in watch_now:
                     if price > item["peak_price"]:
-                        # цена ещё растёт -- пик ещё не сформирован, просто
-                        # подвигаем бегущий максимум дальше и ждём разворота
                         with _vol_peak_lock:
                             for p in _vol_peak_watchlist.get(symbol, []):
                                 if p["spike_ts"] == item["spike_ts"]:
@@ -4586,8 +4614,8 @@ def _vol_peak_scan_loop():
             if changed:
                 _save_vol_peak_watchlist()
         except Exception as e:
-            olog(f"[vol_peak] ошибка цикла сканирования: {e}")
-        time.sleep(VOL_PEAK_SCAN_POLL_SEC)
+            olog(f"[vol_peak_watch] ошибка цикла: {e}")
+        time.sleep(VOL_PEAK_WATCH_POLL_SEC)
 
 
 def _vol_anomaly_track_loop():
@@ -7652,7 +7680,8 @@ def main():
     threading.Thread(target=_pump_dump_track_loop, daemon=True).start()
     threading.Thread(target=_diag_scan_loop, daemon=True).start()
     threading.Thread(target=_diag_track_loop, daemon=True).start()
-    threading.Thread(target=_vol_peak_scan_loop, daemon=True).start()
+    threading.Thread(target=_vol_peak_find_loop, daemon=True).start()
+    threading.Thread(target=_vol_peak_watch_loop, daemon=True).start()
     threading.Thread(target=_vol_anomaly_track_loop, daemon=True).start()
     # v0.13.0: полностью заменено на триггер от пампа/дампа (см.
     # _pump_or_dump_maybe_trigger_ema_signal, вызывается изнутри
