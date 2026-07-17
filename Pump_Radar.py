@@ -1,7 +1,31 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.24.0 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.25.0 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.25.0: ПОЛНАЯ ПЕРЕРАБОТКА Sell-Volume Anomaly Watcher → Volume Peak
+  Level Watcher, по прямому запросу после разбора ~10 реальных скринов
+  стороннего бота. Обнаружилась ОДНА постоянная структура на каждом
+  примере: пик объёма происходит в прошлом на определённой ЦЕНЕ, а сигнал
+  шлётся НЕ в момент пика, а ПОЗЖЕ — когда цена, двигаясь дальше,
+  ВОЗВРАЩАЕТСЯ на ценовой уровень этого пика (пример RARE: красный
+  всплеск на уровне ~0.0140, сигнал пришёл когда цена вернулась туда же,
+  ~0.01399 — воспроизведено тестом с точностью до этих же цифр). Раньше
+  алерт слался МГНОВЕННО в момент самого пика — двухэтапная механика
+  теперь: (1) _find_volume_peaks сканирует ВСЁ окно 4 часа (не только
+  последнюю свечу, как раньше) и кладёт УРОВЕНЬ ЦЕНЫ пика в watchlist, не
+  алертя сразу; (2) _vol_peak_scan_loop на каждом проходе проверяет,
+  вернулась ли живая цена к уровню (допуск VOL_PEAK_TOUCH_TOLERANCE_PCT=
+  0.5%) — и только тогда шлёт алерт + запускает EMA-триггер, как раньше;
+  (3) записи watchlist старше 12 часов забываются (цена так и не
+  вернулась). Watchlist переживает перезапуск процесса (атомарная запись,
+  как и остальные файлы состояния), новый эндпоинт
+  /vol_peak_watchlist_status показывает, что сейчас отслеживается. Картинка
+  к алерту теперь показывает достаточно широкое окно, чтобы был виден и
+  сам пик (в прошлом), и текущая точка возврата. Таблица на главной
+  странице получила колонки "Уровень пика"/"Пик был". Проверено тестом на
+  всех этапах: поиск пика в середине окна (не только последняя свеча),
+  отсутствие алерта пока цена далеко от уровня, срабатывание при возврате,
+  персистентность watchlist через "падение процесса".
 - v0.24.0: по запросу — Sell-Volume Anomaly Watcher теперь тоже шлёт
   картинку, но ДРУГОГО стиля, чем памп/дамп (визуально отличать в списке
   Telegram-уведомлений). Новый _render_vol_anomaly_chart_png: та же общая
@@ -438,7 +462,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.24.0"
+APP_VERSION  = "0.25.0"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2529,7 +2553,7 @@ details[open] summary:before{content:"▾ "}
   </div>
   <div id="volAnomalySummary" class="summary-line">пока не было срабатываний</div>
   <div class="table-scroll">
-    <table id="volAnomaly"><thead><tr><th>Монета</th><th>z-score</th><th>Объём</th><th>Цена</th><th>После сигнала</th><th>Когда</th></tr></thead><tbody></tbody></table>
+    <table id="volAnomaly"><thead><tr><th>Монета</th><th>z-score</th><th>Объём</th><th>Уровень пика</th><th>Пик был</th><th>Цена сейчас</th><th>После сигнала</th><th>Когда</th></tr></thead><tbody></tbody></table>
   </div>
 </div>
 
@@ -2726,15 +2750,19 @@ async function refreshDumps(){
 
 async function refreshVolAnomaly(){
   try{
-    const r = await fetch('/vol_anomaly_status'); const d = await r.json();
+    const [r, rw] = await Promise.all([fetch('/vol_anomaly_status'), fetch('/vol_peak_watchlist_status')]);
+    const d = await r.json();
+    const w = await rw.json();
     const tbody = document.querySelector('#volAnomaly tbody'); tbody.innerHTML = '';
     const items = (d.recent || []).slice().reverse();
-    document.getElementById('volAnomalySummary').innerHTML = items.length
-      ? `сработало: <b>${items.length}</b>`
-      : 'пока не было срабатываний';
+    const watchLine = w.total_watched
+      ? `отслеживается пиков: <b>${w.total_watched}</b> по <b>${w.coins}</b> монетам (ждём возврата цены)`
+      : 'сейчас нет отслеживаемых пиков';
+    document.getElementById('volAnomalySummary').innerHTML = (items.length ? `сработало: <b>${items.length}</b> &nbsp;·&nbsp; ` : '') + watchLine;
     for(const it of items.slice(0,50)){
       const tr = document.createElement('tr');
-      tr.innerHTML = `<td>${it.symbol}</td><td>${it.z}</td><td>${Math.round(it.vol)}</td><td>${it.price}</td><td>${fmtTrack(it)}</td><td>${fmtAgo(it.ts)}</td>`;
+      const peakAge = it.peak_age_min != null ? `${it.peak_age_min}м назад` : '—';
+      tr.innerHTML = `<td>${it.symbol}</td><td>${it.z}</td><td>${Math.round(it.vol)}</td><td>${it.peak_price ?? '—'}</td><td>${peakAge}</td><td>${it.price}</td><td>${fmtTrack(it)}</td><td>${fmtAgo(it.ts)}</td>`;
       tbody.appendChild(tr);
     }
   }catch(e){}
@@ -4322,139 +4350,201 @@ def _pump_detect_loop():
         time.sleep(PUMP_DETECT_POLL_SEC)
 # ─── конец Live Pump/Dump Detector ──────────────────────────────────────────
 
-# ─── Sell-Volume Anomaly Watcher ─────────────────────────────────────────────
-# По прямому свидетельству автора стороннего бота (скрин с "Первый фильтр —
-# это большие объёмы на продажу, дисперсия отклонений от среднего" +
-# стрелка на реальном примере RARE, указывающая на всплеск красного объёма
-# за 30-40 минут ДО фактического пробоя цены) — первый шаг ЕГО алгоритма
-# это НЕ реакция на цену, а поиск монет со СТАТИСТИЧЕСКИ АНОМАЛЬНЫМ (z-score)
-# объёмом именно на red (bearish) свечах — потенциально более ранний сигнал,
-# чем наш текущий ценовой Pump/Dump Detector. По запросу — реализовано с тем
-# же статусом триггера, что и памп/дамп (см. _vol_anomaly_fire_alert): шлёт
-# алерт И сразу проверяет EMA-уровень, может дать полноценный сигнал раньше,
-# чем цена вообще успеет заметно сдвинуться. "Второй шаг" его алгоритма
-# неизвестен (сам автор пишет "второй шаг анализа кидать?") — реализован
-# только известный первый; трекинг MFE/MAE оставлен, чтобы дальше было
-# видно, насколько он сам по себе полезен как самостоятельный триггер.
-VOL_ANOMALY_SCAN_POLL_SEC     = 300    # раз в 5 минут — фетч реальных свечей дороже тикеров, топ-N каждую минуту дорого
-VOL_ANOMALY_LOOKBACK_MIN      = 120    # окно для расчёта среднего/дисперсии объёма red-свечей
-VOL_ANOMALY_ZSCORE_THRESHOLD  = 2.5    # во сколько стандартных отклонений выше среднего должен быть всплеск
-VOL_ANOMALY_COOLDOWN_SEC      = 60 * 60
-VOL_ANOMALY_TRACK_WINDOW_SEC  = 2 * 3600   # сколько времени после сигнала следим, пошла ли цена
-VOL_ANOMALY_HISTORY_FILE      = os.path.expanduser("~/pumpradar_vol_anomaly_history.json")
+# ─── Volume Peak Level Watcher ───────────────────────────────────────────────
+# v0.25.0: полная переработка по прямому запросу — разобрав ~10 реальных
+# скринов стороннего бота, обнаружилась ОДНА постоянная структура на
+# каждом: где-то в прошлом происходит пик объёма (на определённой ЦЕНЕ),
+# а сигнал шлётся НЕ в момент самого пика, а ПОЗЖЕ — когда цена, двигаясь
+# дальше, ВОЗВРАЩАЕТСЯ на ценовой уровень этого пика (пример RARE: красный
+# всплеск на уровне ~0.0140, сигнал пришёл когда цена вернулась туда же,
+# ~0.01399). Раньше у нас было наоборот: алерт слался МГНОВЕННО в момент
+# самого пика — отсюда и "графики выглядят как попало", не как у него.
+# Теперь двухэтапно: (1) находим пики red-объёма (z-score) в широком окне
+# и КЛАДЁМ УРОВЕНЬ ЦЕНЫ В WATCHLIST, не алертя сразу; (2) на каждом
+# проходе проверяем, не вернулась ли живая цена к уровню какого-то из
+# запомненных пиков — и ТОЛЬКО ТОГДА шлём алерт.
+VOL_PEAK_SCAN_POLL_SEC       = 300     # раз в 5 минут — фетч реальных свечей дороже тикеров
+VOL_PEAK_LOOKBACK_MIN        = 240     # ищем пики в пределах последних 4 часов
+VOL_PEAK_ZSCORE_THRESHOLD    = 2.5     # тот же порог, что был у мгновенного детектора
+VOL_PEAK_EXPIRY_SEC          = 12 * 3600   # если цена не вернулась к уровню за 12 часов — забываем пик
+VOL_PEAK_TOUCH_TOLERANCE_PCT = 0.5     # насколько близко цена должна подойти к уровню пика, чтобы считать "достигла"
+VOL_PEAK_TRACK_WINDOW_SEC    = 2 * 3600    # трекинг исхода после срабатывания — тот же принцип, что у пампа/дампа
+VOL_ANOMALY_HISTORY_FILE     = os.path.expanduser("~/pumpradar_vol_anomaly_history.json")  # тот же файл, что и раньше
+VOL_PEAK_WATCHLIST_FILE      = os.path.expanduser("~/pumpradar_vol_peak_watchlist.json")
 
-_vol_anomaly_state = {}   # symbol -> last_alert_ts
-_vol_anomaly_lock = threading.Lock()
+_vol_peak_watchlist = {}   # symbol -> [{"peak_price","peak_ts","peak_vol","z","mean","std","expires_at"}, ...]
+_vol_peak_lock = threading.Lock()
 
 
-def _detect_sell_volume_anomaly(symbol):
-    """Тянет последние VOL_ANOMALY_LOOKBACK_MIN минут 1m-свечей, считает
-    объём ОТДЕЛЬНО на red (bearish, close<open) свечах в этом окне, и
-    проверяет z-score ПОСЛЕДНЕЙ такой свечи относительно среднего/std всех
-    red-свечей окна — "дисперсия отклонений от среднего", как описал автор
-    референса. Возвращает {"z","vol","mean","std","price"} если
-    z >= VOL_ANOMALY_ZSCORE_THRESHOLD, иначе None."""
+def _find_volume_peaks(symbol):
+    """Сканирует ВСЁ окно VOL_PEAK_LOOKBACK_MIN (не только последнюю
+    свечу, как раньше) и находит ВСЕ red-свечи, чей объём — статистический
+    выброс (z-score) относительно среднего/std всех red-свечей окна.
+    Возвращает список пиков (может быть несколько на монету) — каждый со
+    своей ценой (уровень для watchlist), временем и объёмом."""
     try:
-        days = max(1, math.ceil(VOL_ANOMALY_LOOKBACK_MIN * 60 / 86400) + 1)
+        days = max(1, math.ceil(VOL_PEAK_LOOKBACK_MIN * 60 / 86400) + 1)
         candles = _fetch_candles(symbol, "1m", days)
     except Exception:
-        return None
-    cutoff = time.time() - VOL_ANOMALY_LOOKBACK_MIN * 60
+        return []
+    cutoff = time.time() - VOL_PEAK_LOOKBACK_MIN * 60
     candles = [c for c in candles if c["t"] >= cutoff]
     red_candles = [c for c in candles if c["close"] < c["open"]]
     if len(red_candles) < 10:
-        return None
+        return []
     red_vols = [c.get("vol", 0) or 0 for c in red_candles]
     mean_v = sum(red_vols) / len(red_vols)
     var = sum((v - mean_v) ** 2 for v in red_vols) / len(red_vols)
     std_v = var ** 0.5
     if std_v <= 0:
-        return None
-    last_red = red_candles[-1]
-    last_vol = last_red.get("vol", 0) or 0
-    z = (last_vol - mean_v) / std_v
-    if z >= VOL_ANOMALY_ZSCORE_THRESHOLD:
-        return {"z": round(z, 2), "vol": last_vol, "mean": round(mean_v, 2),
-                "std": round(std_v, 2), "price": last_red["close"],
-                "candle_t": last_red["t"]}
-    return None
+        return []
+    peaks = []
+    for c in red_candles:
+        vol = c.get("vol", 0) or 0
+        z = (vol - mean_v) / std_v
+        if z >= VOL_PEAK_ZSCORE_THRESHOLD:
+            peaks.append({"peak_price": c["close"], "peak_ts": c["t"], "peak_vol": vol,
+                          "z": round(z, 2), "mean": round(mean_v, 2), "std": round(std_v, 2)})
+    return peaks
 
 
-def _vol_anomaly_fire_alert(symbol, res):
-    """Первый фильтр из его алгоритма ("большие объёмы на продажу,
-    дисперсия отклонений от среднего") — тот же статус, что у пампа/дампа:
-    шлёт алерт И запускает проверку EMA-уровня (expected_bias="short" —
-    в его же примере RARE аномальный red-объём предшествовал росту цены
-    в сопротивление, та же логика, что у нашего Pump Detector). Плюс
-    трекинг MFE/MAE для дальнейшего анализа.
-    v0.24.0: по запросу — картинка вместо голого текста, но ДРУГОГО стиля,
-    чем у пампа/дампа (_render_vol_anomaly_chart_png — фиолетовая заливка
-    реального red-объёма + подсветка самой аномальной свечи), чтобы в
-    списке уведомлений Telegram сразу было видно, какой это тип алерта."""
+def _save_vol_peak_watchlist():
+    try:
+        with _vol_peak_lock:
+            snapshot = dict(_vol_peak_watchlist)
+        tmp_path = VOL_PEAK_WATCHLIST_FILE + f".tmp{os.getpid()}"
+        with open(tmp_path, "w") as f:
+            json.dump(snapshot, f)
+        os.replace(tmp_path, VOL_PEAK_WATCHLIST_FILE)
+    except Exception as e:
+        olog(f"[vol_peak] ⚠ не смог сохранить watchlist: {e}")
+
+
+def _load_vol_peak_watchlist():
+    global _vol_peak_watchlist
+    try:
+        if os.path.exists(VOL_PEAK_WATCHLIST_FILE):
+            with open(VOL_PEAK_WATCHLIST_FILE) as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                with _vol_peak_lock:
+                    _vol_peak_watchlist = loaded
+                total = sum(len(v) for v in loaded.values())
+                olog(f"[vol_peak] watchlist подхвачен с диска: {total} пиков по {len(loaded)} монетам")
+    except Exception as e:
+        olog(f"[vol_peak] ⚠ не смог подхватить watchlist с диска: {e}")
+
+
+def _vol_peak_fire_alert(symbol, peak, current_price):
+    """Цена ВЕРНУЛАСЬ на уровень запомненного пика объёма — вот теперь,
+    как на референсе, шлём алерт. Картинка — тот же _render_vol_anomaly_chart_png
+    (фиолетовая заливка red-объёма + подсветка), но окно теперь достаточно
+    широкое, чтобы на графике было видно ОБА момента: сам пик (в прошлом)
+    и текущую точку возврата цены к его уровню."""
     candles = []
     try:
-        days = max(1, math.ceil(VOL_ANOMALY_LOOKBACK_MIN * 60 / 86400) + 1)
+        chart_lookback_min = max(VOL_PEAK_LOOKBACK_MIN, int((time.time() - peak["peak_ts"]) / 60) + 30)
+        days = max(1, math.ceil(chart_lookback_min * 60 / 86400) + 1)
         raw = _fetch_candles(symbol, "1m", days)
-        cutoff = time.time() - VOL_ANOMALY_LOOKBACK_MIN * 60
+        cutoff = peak["peak_ts"] - 20 * 60
         candles = [c for c in raw if c["t"] >= cutoff]
     except Exception as e:
-        olog(f"[vol_anomaly] {symbol}: не смог получить свечи для графика: {e}")
+        olog(f"[vol_peak] {symbol}: не смог получить свечи для графика: {e}")
 
     png = None
     try:
-        png = _render_vol_anomaly_chart_png(candles, res["price"], anomaly_t=res.get("candle_t"))
+        png = _render_vol_anomaly_chart_png(candles, peak["peak_price"], anomaly_t=peak["peak_ts"])
     except Exception as e:
-        olog(f"[vol_anomaly] {symbol}: ошибка рендера графика: {e}")
+        olog(f"[vol_peak] {symbol}: ошибка рендера графика: {e}")
 
+    ago_min = round((time.time() - peak["peak_ts"]) / 60)
     caption = (
-        f"📐 <b>{symbol}</b> — аномальный объём на продажу\n"
-        f"z-score: {res['z']} (объём {res['vol']:.0f} против среднего {res['mean']:.0f} ± {res['std']:.0f})\n"
-        f"Цена: {_fmt_px(res['price'])}"
+        f"📐 <b>{symbol}</b> — цена вернулась к уровню аномального объёма\n"
+        f"Пик объёма был {ago_min} мин назад: z-score {peak['z']} "
+        f"(объём {peak['peak_vol']:.0f} против среднего {peak['mean']:.0f} ± {peak['std']:.0f})\n"
+        f"Уровень пика: {_fmt_px(peak['peak_price'])} | Текущая цена: {_fmt_px(current_price)}"
     )
     _send_alert_photo(png, caption)
-    olog(f"[vol_anomaly] {symbol}: z-score={res['z']} vol={res['vol']:.0f} — алерт отправлен")
+    olog(f"[vol_peak] {symbol}: цена {current_price:.6g} вернулась к уровню пика "
+         f"{peak['peak_price']:.6g} (z={peak['z']}, {ago_min}м назад) — алерт отправлен")
+
     now = time.time()
-    rec = {"ts": int(now), "symbol": symbol, "z": res["z"], "vol": res["vol"],
-           "mean": res["mean"], "std": res["std"], "price": res["price"],
-           "track_until": now + VOL_ANOMALY_TRACK_WINDOW_SEC, "track_done": False,
+    rec = {"ts": int(now), "symbol": symbol, "z": peak["z"], "vol": peak["peak_vol"],
+           "mean": peak["mean"], "std": peak["std"], "price": current_price,
+           "peak_price": peak["peak_price"], "peak_ts": peak["peak_ts"], "peak_age_min": ago_min,
+           "track_until": now + VOL_PEAK_TRACK_WINDOW_SEC, "track_done": False,
            "max_follow_pct": 0.0, "max_reverse_pct": 0.0,
-           "last_tracked_price": res["price"], "last_tracked_ts": int(now)}
+           "last_tracked_price": current_price, "last_tracked_ts": int(now)}
     _pump_dump_history_append(VOL_ANOMALY_HISTORY_FILE, rec)
 
     try:
         _pump_or_dump_maybe_trigger_ema_signal(symbol, expected_bias="short")
     except Exception as e:
-        olog(f"[vol_anomaly] {symbol}: ошибка проверки EMA-триггера: {e}")
+        olog(f"[vol_peak] {symbol}: ошибка проверки EMA-триггера: {e}")
 
 
-def _vol_anomaly_scan_loop():
-    """Раз в VOL_ANOMALY_SCAN_POLL_SEC проходит топ-N монет (та же
-    настраиваемая _get_scan_top_n()) и проверяет каждую на аномальный
-    объём продаж. Дороже пампа/дампа (реальные свечи на монету, не общий
-    тикер-снапшот) — поэтому реже опрашивается."""
-    time.sleep(70)
+def _vol_peak_scan_loop():
+    """Раз в VOL_PEAK_SCAN_POLL_SEC: (1) ищет НОВЫЕ пики объёма по топ-N
+    монетам и кладёт уровень их цены в watchlist (не алертит сразу);
+    (2) для каждой монеты в watchlist проверяет, дошла ли ЖИВАЯ цена до
+    уровня какого-то из запомненных пиков (в пределах
+    VOL_PEAK_TOUCH_TOLERANCE_PCT) — если да, вот тогда шлёт алерт;
+    (3) чистит записи watchlist старше VOL_PEAK_EXPIRY_SEC (цена так и не
+    вернулась — забываем, не копим бесконечно)."""
+    time.sleep(80)
+    _load_vol_peak_watchlist()
     while True:
         try:
             symbols = _fetch_all_symbols()[:_get_scan_top_n()]
             now = time.time()
+            changed = False
             for symbol in symbols:
                 try:
-                    res = _detect_sell_volume_anomaly(symbol)
+                    new_peaks = _find_volume_peaks(symbol)
                 except Exception as e:
-                    olog(f"[vol_anomaly] {symbol}: ошибка проверки: {e}")
+                    olog(f"[vol_peak] {symbol}: ошибка поиска пиков: {e}")
+                    new_peaks = []
+                with _vol_peak_lock:
+                    existing = _vol_peak_watchlist.get(symbol, [])
+                    existing_ts = {p["peak_ts"] for p in existing}
+                    added = 0
+                    for peak in new_peaks:
+                        if peak["peak_ts"] in existing_ts:
+                            continue
+                        peak = dict(peak)
+                        peak["expires_at"] = now + VOL_PEAK_EXPIRY_SEC
+                        existing.append(peak)
+                        added += 1
+                    before = len(existing)
+                    existing = [p for p in existing if p["expires_at"] > now]
+                    if added or len(existing) != before:
+                        changed = True
+                    _vol_peak_watchlist[symbol] = existing
+                    watch_now = list(existing)
+                if not watch_now:
                     continue
-                if not res:
+                try:
+                    price = _gate_get_price(symbol)
+                except Exception as e:
+                    olog(f"[vol_peak] {symbol}: ошибка получения цены: {e}")
+                    price = None
+                if not price:
                     continue
-                with _vol_anomaly_lock:
-                    last_alert = _vol_anomaly_state.get(symbol, 0)
-                if now - last_alert < VOL_ANOMALY_COOLDOWN_SEC:
-                    continue
-                _vol_anomaly_fire_alert(symbol, res)
-                with _vol_anomaly_lock:
-                    _vol_anomaly_state[symbol] = now
+                for peak in watch_now:
+                    tolerance = peak["peak_price"] * VOL_PEAK_TOUCH_TOLERANCE_PCT / 100.0
+                    if abs(price - peak["peak_price"]) <= tolerance:
+                        _vol_peak_fire_alert(symbol, peak, price)
+                        with _vol_peak_lock:
+                            _vol_peak_watchlist[symbol] = [
+                                p for p in _vol_peak_watchlist.get(symbol, [])
+                                if p["peak_ts"] != peak["peak_ts"]
+                            ]
+                        changed = True
+            if changed:
+                _save_vol_peak_watchlist()
         except Exception as e:
-            olog(f"[vol_anomaly] ошибка цикла сканирования: {e}")
-        time.sleep(VOL_ANOMALY_SCAN_POLL_SEC)
+            olog(f"[vol_peak] ошибка цикла сканирования: {e}")
+        time.sleep(VOL_PEAK_SCAN_POLL_SEC)
 
 
 def _vol_anomaly_track_loop():
@@ -4465,14 +4555,14 @@ def _vol_anomaly_track_loop():
     while True:
         try:
             if not os.path.exists(VOL_ANOMALY_HISTORY_FILE):
-                time.sleep(VOL_ANOMALY_SCAN_POLL_SEC)
+                time.sleep(VOL_PEAK_SCAN_POLL_SEC)
                 continue
             try:
                 with open(VOL_ANOMALY_HISTORY_FILE) as f:
                     hist = json.load(f)
             except Exception as e:
                 olog(f"[vol_anomaly_track] не смог прочитать историю: {e}")
-                time.sleep(VOL_ANOMALY_SCAN_POLL_SEC)
+                time.sleep(VOL_PEAK_SCAN_POLL_SEC)
                 continue
             now = time.time()
             price_cache = {}
@@ -4510,8 +4600,8 @@ def _vol_anomaly_track_loop():
                 _pump_dump_history_save_all(VOL_ANOMALY_HISTORY_FILE, hist)
         except Exception as e:
             olog(f"[vol_anomaly_track] ошибка цикла: {e}")
-        time.sleep(VOL_ANOMALY_SCAN_POLL_SEC)
-# ─── конец Sell-Volume Anomaly Watcher ──────────────────────────────────────
+        time.sleep(VOL_PEAK_SCAN_POLL_SEC)
+# ─── конец Volume Peak Level Watcher ─────────────────────────────────────────
 
 
 # ─── Weekly/Daily EMA Touch Watcher ─────────────────────────────────────────
@@ -7082,6 +7172,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except Exception:
                 recent = []
             self._json({"recent": recent[-100:]})
+        elif self.path == "/vol_peak_watchlist_status":
+            with _vol_peak_lock:
+                snapshot = {sym: len(peaks) for sym, peaks in _vol_peak_watchlist.items() if peaks}
+            total = sum(snapshot.values())
+            self._json({"total_watched": total, "coins": len(snapshot), "by_symbol": snapshot})
         elif self.path == "/weekly_ema_status":
             with _weekly_ema_touch_lock:
                 recent = list(_weekly_ema_recent[-100:])
@@ -7514,7 +7609,7 @@ def main():
     threading.Thread(target=_pump_dump_track_loop, daemon=True).start()
     threading.Thread(target=_diag_scan_loop, daemon=True).start()
     threading.Thread(target=_diag_track_loop, daemon=True).start()
-    threading.Thread(target=_vol_anomaly_scan_loop, daemon=True).start()
+    threading.Thread(target=_vol_peak_scan_loop, daemon=True).start()
     threading.Thread(target=_vol_anomaly_track_loop, daemon=True).start()
     # v0.13.0: полностью заменено на триггер от пампа/дампа (см.
     # _pump_or_dump_maybe_trigger_ema_signal, вызывается изнутри
