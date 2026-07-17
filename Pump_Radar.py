@@ -1,7 +1,20 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.28.4 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.28.5 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.28.5: по прямому запросу — хватит гадать про сроки жизни, нужна
+  прямая надёжная проверка. Добавлена _vol_peak_verify_at_peak —
+  САМОСТОЯТЕЛЬНАЯ, независимая от накопленного за много опросов
+  running_max проверка ПРЯМО ПЕРЕД отправкой: свежий запрос последних 20
+  минут реальных свечей и явное сравнение — текущая цена и есть максимум
+  за это время, а не что-то уже откатившееся от более высокой точки.
+  Не зависит от возможных багов в накоплении состояния между опросами —
+  каждый раз пересчитывается заново из реальных рыночных данных. Если
+  формальный порог (VOL_PEAK_CONFIRM_PCT + бегущий максимум) пройден, но
+  эта свежая проверка показывает, что цена НЕ на максимуме последних 20
+  минут — алерт не шлётся, ждём дальше. Проверено тестом на точных цифрах
+  из реального алерта SKHYNIX_USDT (пик 1225, попытка алерта на 1213) —
+  корректно отсекается; на реальном максимуме — корректно проходит.
 - v0.28.4: по наводке пользователя (SKHYNIX_USDT, 511 мин при лимите 90) —
   реальный баг, найден повторным разбором собственного кода. Срок жизни
   всплеска (VOL_PEAK_EXPIRY_SEC=90 мин) отсчитывался от момента, КОГДА МЫ
@@ -590,7 +603,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.28.4"
+APP_VERSION  = "0.28.5"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4714,6 +4727,31 @@ def _vol_peak_find_loop():
         time.sleep(VOL_PEAK_SCAN_POLL_SEC)
 
 
+def _vol_peak_verify_at_peak(symbol, price, lookback_min=20):
+    """v0.28.5: по прямому запросу — не полагаться на накопленное за много
+    опросов состояние (там могут прятаться баги, которые сложно поймать
+    статическим чтением кода), а сделать САМОСТОЯТЕЛЬНУЮ, свежую проверку
+    ПРЯМО ПЕРЕД отправкой: реальный запрос последних lookback_min минут
+    свечей и явное сравнение — текущая цена и есть максимум за это время,
+    а не что-то, что уже откатилось от более высокой точки. Если сетевой
+    запрос не удался — не блокируем алерт (лучше отправить, чем молчать
+    из-за временной сетевой ошибки), но логируем."""
+    try:
+        days = max(1, math.ceil(lookback_min * 60 / 86400) + 1)
+        candles = _fetch_candles(symbol, "1m", days)
+    except Exception as e:
+        olog(f"[vol_peak_watch] {symbol}: не смог проверить пик свежими свечами: {e}")
+        return True
+    cutoff = time.time() - lookback_min * 60
+    recent = [c["close"] for c in candles if c["t"] >= cutoff]
+    if not recent:
+        return True
+    recent_max = max(recent + [price])
+    if recent_max <= 0:
+        return True
+    return price >= recent_max * (1 - VOL_PEAK_MAX_TOLERANCE_PCT / 100)
+
+
 def _vol_peak_watch_loop():
     """Раз в VOL_PEAK_WATCH_POLL_SEC (30 секунд — дёшево, только живая
     цена) проверяет цену каждой отслеживаемой монеты.
@@ -4764,9 +4802,14 @@ def _vol_peak_watch_loop():
                     pct_move = round((price - item["spike_price"]) / item["spike_price"] * 100, 2)
                     at_running_max = price >= running_max * (1 - VOL_PEAK_MAX_TOLERANCE_PCT / 100)
                     if pct_move >= VOL_PEAK_CONFIRM_PCT and at_running_max:
-                        _vol_peak_fire_alert(symbol, item, price, pct_move)
-                        fired_ts.add(item["spike_ts"])
-                        changed = True
+                        if _vol_peak_verify_at_peak(symbol, price):
+                            _vol_peak_fire_alert(symbol, item, price, pct_move)
+                            fired_ts.add(item["spike_ts"])
+                            changed = True
+                        else:
+                            olog(f"[vol_peak_watch] {symbol}: порог формально пройден "
+                                 f"({pct_move}%), но свежая проверка свечей показала — "
+                                 f"цена уже НЕ на максимуме последних 20 минут, ждём дальше")
                 if fired_ts:
                     with _vol_peak_lock:
                         _vol_peak_watchlist[symbol] = [
