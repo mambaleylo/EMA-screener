@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.29.8 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.29.9 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.29.9: по запросу — добавлены ещё и чекпоинты цены (5/15/30/60/90/120
+  минут после сигнала) в историю пампов/дампов, и в файл аномалий объёма
+  рядом с уже существующим полным path (для единообразия между файлами).
+  _track_record_checkpoint пишет значение (та же система знаков, что у
+  max_follow_pct) на каждой фиксированной отметке — компактная версия той
+  же идеи, что и path (знать порядок событий для честной симуляции
+  стоп/тейк), но без роста файла на каждый опрос — фиксированные 6 точек
+  на сделку, для пампа/дампа (у которых полного path не было). Проверено
+  тестом: чекпоинты 5/15/30 минут записываются с верными значениями и не
+  перезаписываются повторно при следующих проходах.
 - v0.29.8: по запросу — записи Volume Peak Watcher теперь несут поле
   "path": весь путь цены по времени (каждая проверка трек-цикла, ~24
   точки на сделку за 2 часа при опросе раз в 5 минут), не только крайние
@@ -739,7 +749,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.29.8"
+APP_VERSION  = "0.29.9"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3816,6 +3826,28 @@ def _get_tradeable_symbols():
 
 _pump_detect_lock   = threading.Lock()
 
+TRACK_CHECKPOINTS_MIN = [5, 15, 30, 60, 90, 120]   # v0.29.8: фиксированные отметки времени после сигнала
+
+def _track_record_checkpoint(rec, now, follow_pct):
+    """v0.29.8: по запросу — раньше хранился только ИТОГОВЫЙ максимум
+    просадки/прибыли за всё окно отслеживания, без порядка событий: нельзя
+    было понять, что случилось РАНЬШЕ — просадка, которая выбила бы стоп,
+    или прибыль, которая дала бы тейк. Теперь при каждом проходе трек-лупа
+    записывается чекпоинт (значение follow_pct — та же система знаков, что
+    у max_follow_pct: положительное = цена продолжила в направлении
+    исходного алерта, отрицательное = развернулась) на фиксированных
+    отметках времени после сигнала (TRACK_CHECKPOINTS_MIN). Не весь путь
+    целиком (было бы слишком много данных на запись), но достаточно точек,
+    чтобы задним числом смоделировать разные комбинации стоп/тейк и
+    понять реальный порядок событий, а не только крайние значения."""
+    elapsed_min = (now - rec["ts"]) / 60.0
+    checkpoints = rec.setdefault("checkpoints", {})
+    for cp_min in TRACK_CHECKPOINTS_MIN:
+        key = str(cp_min)
+        if elapsed_min >= cp_min and key not in checkpoints:
+            checkpoints[key] = round(follow_pct, 2)
+
+
 _history_file_locks_master = threading.Lock()
 _history_file_locks = {}   # file_path -> threading.Lock()
 
@@ -4571,6 +4603,7 @@ def _pump_dump_track_loop():
                                 rec["max_reverse_pct"] = round(max(rec.get("max_reverse_pct", 0.0), reverse), 2)
                                 rec["last_tracked_price"] = price
                                 rec["last_tracked_ts"] = int(now)
+                                _track_record_checkpoint(rec, now, follow)
                                 changed = True
                             if now >= rec.get("track_until", 0):
                                 rec["track_done"] = True
@@ -5160,6 +5193,7 @@ def _vol_anomaly_track_loop():
                             rec["max_reverse_pct"] = round(max(rec.get("max_reverse_pct", 0.0), reverse), 2)
                             rec["last_tracked_price"] = price
                             rec["last_tracked_ts"] = int(now)
+                            _track_record_checkpoint(rec, now, follow)
                             # v0.29.8: дописываем путь по времени — на
                             # VOL_PEAK_TRACK_WINDOW_SEC=2ч и опросе раз в
                             # VOL_PEAK_SCAN_POLL_SEC=5мин это ~24 точки на
