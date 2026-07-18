@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.29.2 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.29.3 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.29.3: по прямому запросу — на графике Volume Peak Watcher теперь
+  ДВА новых визуальных элемента, чтобы не гадать по тексту: (1) сам
+  столбик объёма всплеска, на который ориентируется детектор, закрашен
+  ОТДЕЛЬНЫМ ЯРКИМ АЛЫМ цветом (плюс подпись "ВСПЛЕСК") — на графике с
+  десятками похожих фиолетовых пиков раньше было невозможно на глаз
+  понять, какой из них реально используется; (2) точка на линии цены, где
+  сработал сигнал (последняя свеча — момент отправки алерта), теперь
+  крупный зелёный маркер с тёмной обводкой (плюс подпись "СИГНАЛ"), не
+  такая же мелкая точка, как все остальные на линии. Проверено попиксельно
+  — оба новых элемента (алый столбик, зелёный маркер) корректно
+  присутствуют на тестовом рендере.
 - v0.29.2: реальный баг — v0.28.5 добавила самостоятельную проверку "цена
   сейчас и есть максимум", но с ФИКСИРОВАННЫМ окном 20 минут. Если истинный
   пик случился ЧАСЫ назад (реальный случай: пик дня был в 15:55, алерт
@@ -657,7 +668,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.29.2"
+APP_VERSION  = "0.29.3"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4212,9 +4223,15 @@ def _render_vol_anomaly_chart_png(candles, base_price, anomaly_t=None):
         зелёное/красное, как у пампа/дампа;
       - заливка ФИОЛЕТОВАЯ, не зелёно-красная — сразу видно другой тип
         алерта в списке уведомлений Telegram;
-      - сама аномальная свеча (anomaly_t) подсвечена отдельным маркером
-        (оранжевая звезда сверху) — видно, что именно её увидел детектор,
-        как стрелка на референс-скрине RARE.
+      - v0.29.3: по прямому запросу — САМ СТОЛБИК объёма всплеска, на
+        который ориентируется детектор (anomaly_t), теперь закрашен
+        ОТДЕЛЬНЫМ ЯРКИМ ЦВЕТОМ (алый), не сливается с обычными фиолетовыми
+        столбиками — на графике с десятками похожих пиков раньше было
+        невозможно на глаз понять, какой из них реально используется;
+      - и ТОЧКА НА ЛИНИИ ЦЕНЫ, где сработал сигнал (последняя свеча —
+        момент отправки алерта), теперь крупный зелёный маркер с чёрной
+        обводкой, а не такая же мелкая точка, как все остальные — сразу
+        видно, где именно на графике сигнал, без сравнения текста с осью.
     """
     try:
         from PIL import Image, ImageDraw, ImageFont
@@ -4229,9 +4246,10 @@ def _render_vol_anomaly_chart_png(candles, base_price, anomaly_t=None):
     grid_color   = (70, 70, 150)
     line_color   = (15, 15, 15)
     fill_color   = (142, 68, 201)     # фиолетовый — не зелёный/красный памп-детектора
+    spike_color  = (220, 20, 20)      # алый — именно тот столбик-всплеск, на который ориентируемся
+    signal_color = (30, 190, 90)      # зелёный — точка, где реально сработал сигнал
     baseline_col = (206, 28, 28)
     text_color   = (50, 50, 50)
-    marker_color = (235, 140, 20)     # оранжевая подсветка аномальной свечи
 
     closes = [c["close"] for c in candles]
     opens  = [c["open"] for c in candles]
@@ -4248,6 +4266,10 @@ def _render_vol_anomaly_chart_png(candles, base_price, anomaly_t=None):
     red_vol_raw = [(c.get("vol", 0) or 0) if closes[i] < opens[i] else 0.0
                    for i, c in enumerate(candles)]
     vmax = max(red_vol_raw, default=1.0) or 1.0
+
+    anomaly_idx = None
+    if anomaly_t is not None:
+        anomaly_idx = min(range(n), key=lambda i: abs(times[i] - anomaly_t))
 
     img = Image.new("RGB", (W, H), bg)
     try:
@@ -4290,6 +4312,14 @@ def _render_vol_anomaly_chart_png(candles, base_price, anomaly_t=None):
     poly = [(x_of(0), floor_y)] + pts + [(x_of(n - 1), floor_y)]
     od.polygon(poly, fill=fill_color + (110,))
     od.line(pts, fill=fill_color + (230,), width=2)
+    # столбик-всплеск, на который реально ориентируется детектор — поверх
+    # обычной заливки, отдельным ярким прямоугольником, чтобы не терялся
+    # среди похожих фиолетовых пиков на длинном графике
+    if anomaly_idx is not None and red_vol_raw[anomaly_idx] > 0:
+        bar_half_w = max(2, plot_w / max(n - 1, 1) / 2)
+        ax = x_of(anomaly_idx)
+        ay = y_vol(red_vol_raw[anomaly_idx])
+        od.rectangle([ax - bar_half_w, ay, ax + bar_half_w, floor_y], fill=spike_color + (235,))
     img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
     d = ImageDraw.Draw(img)
 
@@ -4302,12 +4332,20 @@ def _render_vol_anomaly_chart_png(candles, base_price, anomaly_t=None):
     for (xx, yy) in pts_price:
         d.ellipse([xx - 2, yy - 2, xx + 2, yy + 2], fill=line_color)
 
-    # подсветка аномальной свечи -- маленький оранжевый треугольник сверху,
-    # тем же духом, что стрелка на референс-скрине RARE
-    if anomaly_t is not None:
-        idx = min(range(n), key=lambda i: abs(times[i] - anomaly_t))
-        ax, ay = x_of(idx), y_price(closes[idx])
-        d.polygon([(ax - 6, ay - 14), (ax + 6, ay - 14), (ax, ay - 4)], fill=marker_color)
+    # подпись под алым столбиком -- явно "ВСПЛЕСК", не полагаемся на цвет
+    # в одиночку (на маленьком экране телефона оттенки бывает не различить)
+    if anomaly_idx is not None:
+        ax, ay = x_of(anomaly_idx), y_price(closes[anomaly_idx])
+        d.text((ax - 18, min(ay - 22, H - pad_b - 30)), "ВСПЛЕСК", fill=spike_color, font=font)
+
+    # точка, где реально сработал сигнал -- последняя свеча (момент
+    # отправки алерта), крупный зелёный маркер с тёмной обводкой, чтобы
+    # не сравнивать текст алерта с осью на глаз
+    sx, sy = pts_price[-1]
+    d.ellipse([sx - 7, sy - 7, sx + 7, sy + 7], fill=signal_color, outline=(20, 60, 30), width=2)
+    label = "СИГНАЛ"
+    label_x = min(sx - 20, W - pad_r - 55)
+    d.text((label_x, sy - 24 if sy > pad_t + 20 else sy + 12), label, fill=signal_color, font=font)
 
     step = max(1, n // 10)
     for i in range(0, n, step):
