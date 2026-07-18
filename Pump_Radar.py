@@ -1,7 +1,20 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.29.6 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.29.7 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.29.7: по запросу — два добавления в логи для будущего анализа
+  (разбор реального экспорта показал два пробела). (1) Записи Volume Peak
+  Watcher теперь несут schema_version — не нужно вручную вычислять "это
+  точно старая логика" по возрасту/дублям, как пришлось делать при разборе
+  текущего экспорта; поднимать при следующих изменениях порога/выбора
+  пика/подтверждения. (2) source_id — уникальный идентификатор всплеска
+  (символ+время), передаётся через _pump_or_dump_maybe_trigger_ema_signal
+  как triggered_by и сохраняется в итоговую запись EMA-сигнала (если
+  всплеск довёл до полноценного сигнала со входом/стопом/тейком). Теперь
+  можно честно связать "какой именно всплеск объёма привёл к какому именно
+  сигналу" и посчитать реальный винрейт по цепочке целиком, а не только
+  видеть, куда пошла цена в целом. Проверено тестом: source_id корректно
+  передаётся и совпадает по формату symbol|spike_ts.
 - v0.29.6: два фикса по реальному скрину (AKE_USDT). (1) Подсветка
   всплеска была слишком широкой и непрозрачной — столбик высотой близко к
   максимуму окна объёма (общая высота с ценовой осью) визуально выглядел
@@ -716,7 +729,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.29.6"
+APP_VERSION  = "0.29.7"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3961,7 +3974,7 @@ def _dump_detect_check(symbol):
     return None
 
 
-def _pump_or_dump_maybe_trigger_ema_signal(symbol, expected_bias, confidence_note=None):
+def _pump_or_dump_maybe_trigger_ema_signal(symbol, expected_bias, confidence_note=None, triggered_by=None):
     """После срабатывания пампа/дампа проверяет ОБА ТФ (неделя/день) на
     касание EMA7/14/28 — если памп/дамп долетел до уровня, это и есть
     полноценный сигнал (не просто уведомление о движении). expected_bias
@@ -3973,7 +3986,12 @@ def _pump_or_dump_maybe_trigger_ema_signal(symbol, expected_bias, confidence_not
     сочетание направлений). confidence_note — необязательная пометка,
     добавляется в текст алерта как есть (см. вызов из _pump_fire_alert —
     v0.23.0: 120-минутное окно эмпирически даёт заметно худшие исходы для
-    шорта, чем 20/60-минутное — см. changelog)."""
+    шорта, чем 20/60-минутное — см. changelog). triggered_by — v0.29.7:
+    необязательный идентификатор источника (например, ключ записи Volume
+    Peak Watcher) — сохраняется в итоговую запись EMA-сигнала, чтобы потом
+    можно было честно связать "какой именно всплеск объёма привёл к
+    какому именно полноценному сигналу со входом/стопом/тейком", а не
+    только видеть, куда пошла цена в целом."""
     for tf in EMA_TOUCH_TIMEFRAMES:
         try:
             touches = _ema_touch_check_symbol(symbol, tf)
@@ -3990,7 +4008,7 @@ def _pump_or_dump_maybe_trigger_ema_signal(symbol, expected_bias, confidence_not
                 last = _weekly_ema_touch_state.get(key, 0)
             if now - last < cooldown:
                 continue
-            _weekly_ema_fire_alert(touch, confidence_note=confidence_note)
+            _weekly_ema_fire_alert(touch, confidence_note=confidence_note, triggered_by=triggered_by)
             with _weekly_ema_touch_lock:
                 _weekly_ema_touch_state[key] = now
 
@@ -4733,6 +4751,7 @@ VOL_PEAK_LOOKBACK_MIN        = 240     # ищем всплески объёма 
 VOL_PEAK_ZSCORE_THRESHOLD    = 4.0     # доминирующие всплески ("в самом верху графика"), не мелкая рябь — это подтверждено верно
 VOL_PEAK_EXPIRY_SEC          = 6 * 3600     # расширено обратно с 90 минут — по прямому запросу: не каждый памп успевает подтвердиться за 90 минут, а нормальную защиту от протухания теперь даёт _vol_peak_verify_at_peak (v0.29.2, проверяет ВЕСЬ путь цены с момента всплеска, не полагается на таймер) + постоянный реестр сработавших (v0.28.3) + один активный на монету (v0.28.6)
 VOL_PEAK_CONFIRM_PCT         = 5.0     # насколько цена должна вырасти от цены всплеска, чтобы сразу сработал алерт (без ожидания отката) — подтверждено верно на реальном примере ESP0RTS
+VOL_ANOMALY_SCHEMA_VERSION   = 1       # v0.29.7: версия логики срабатывания (не формата файла) — поднимать при изменении порога/выбора пика/подтверждения, чтобы будущий анализ мог явно отсеять записи от старой логики, а не вычислять это вручную по возрасту/дублям
 VOL_PEAK_MAX_TOLERANCE_PCT   = 0.3     # алерт шлётся, только если текущая цена в пределах этого % от бегущего максимума — не после отката от него
 VOL_PEAK_TRACK_WINDOW_SEC    = 2 * 3600    # трекинг исхода после срабатывания — тот же принцип, что у пампа/дампа
 VOL_ANOMALY_HISTORY_FILE     = os.path.expanduser("~/pumpradar_vol_anomaly_history.json")  # тот же файл, что и раньше
@@ -4860,17 +4879,19 @@ def _vol_peak_fire_alert(symbol, watch_item, current_price, pct_move):
          f"({watch_item['spike_price']:.6g} -> {current_price:.6g}, z={watch_item['z']}) — алерт отправлен")
 
     now = time.time()
+    source_id = f"vol_anomaly|{symbol}|{watch_item['spike_ts']}"
     rec = {"ts": int(now), "symbol": symbol, "z": watch_item["z"], "vol": watch_item["spike_vol"],
            "mean": watch_item["mean"], "std": watch_item["std"], "price": current_price,
            "peak_price": watch_item["spike_price"], "peak_ts": watch_item["spike_ts"],
            "peak_age_min": spike_ago_min, "pct_move": pct_move,
+           "schema_version": VOL_ANOMALY_SCHEMA_VERSION, "source_id": source_id,
            "track_until": now + VOL_PEAK_TRACK_WINDOW_SEC, "track_done": False,
            "max_follow_pct": 0.0, "max_reverse_pct": 0.0,
            "last_tracked_price": current_price, "last_tracked_ts": int(now)}
     _pump_dump_history_append(VOL_ANOMALY_HISTORY_FILE, rec)
 
     try:
-        _pump_or_dump_maybe_trigger_ema_signal(symbol, expected_bias="short")
+        _pump_or_dump_maybe_trigger_ema_signal(symbol, expected_bias="short", triggered_by=source_id)
     except Exception as e:
         olog(f"[vol_peak] {symbol}: ошибка проверки EMA-триггера: {e}")
 
@@ -5519,7 +5540,7 @@ def _render_ema_touch_chart_png(touch, lookback=50):
     return buf.getvalue()
 
 
-def _weekly_ema_fire_alert(touch, confidence_note=None):
+def _weekly_ema_fire_alert(touch, confidence_note=None, triggered_by=None):
     ladder_note = {"up": "лесенка вверх (здоровый up-тренд)",
                    "down": "лесенка вниз (здоровый down-тренд)",
                    None: "лесенка не выстроена (боковик/переход)"}[touch["ladder"]]
@@ -5556,7 +5577,7 @@ def _weekly_ema_fire_alert(touch, confidence_note=None):
            "dist_atr": touch["dist_atr"], "ladder": touch["ladder"],
            "side": touch["side"], "classic_bias": touch["classic_bias"],
            "entry": touch["entry"], "stop": touch["stop"], "take": touch["take"],
-           "rr": touch["rr"], "confidence_note": confidence_note,
+           "rr": touch["rr"], "confidence_note": confidence_note, "triggered_by": triggered_by,
            "outcome": "open", "resolved_at": None, "resolved_price": None}
     global _weekly_ema_recent
     _weekly_ema_recent.append(rec)
