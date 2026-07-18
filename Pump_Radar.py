@@ -1,7 +1,24 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.29.9 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.29.10 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.29.10: реальный баг, подтверждённый на АКТУАЛЬНОЙ версии (TAC_USDT,
+  всплеск 29-часовой давности при текущем лимите 6 часов — пользователь
+  явно подтвердил, что скрин со свежей версии, не гадание про старый
+  билд). Причина: expires_at считается и сохраняется на диск ОДИН раз в
+  момент добавления записи, с ТЕМ значением VOL_PEAK_EXPIRY_SEC, что было
+  в коде на тот момент. За этот разговор константа менялась несколько раз
+  (12ч -> 90мин -> 6ч) — но уже сохранённые на диск записи продолжали
+  жить со СТАРЫМ, более длинным сроком, потому что _load_vol_peak_watchlist
+  при подхвате с диска после каждого перезапуска (что происходит при
+  каждом обновлении бота) просто доверяла сохранённому значению, не
+  пересчитывала его под ТЕКУЩУЮ константу. Теперь при загрузке КАЖДАЯ
+  запись пересчитывается заново (expires_at = spike_ts + текущий
+  VOL_PEAK_EXPIRY_SEC) — если по новым правилам она уже должна была
+  истечь, отбрасывается сразу при старте, не ждёт следующего скана.
+  Проверено тестом: запись, ещё "живая" по старому 12-часовому лимиту (её
+  всплеску 8 часов), после загрузки корректно отбрасывается по текущему
+  6-часовому.
 - v0.29.9: по запросу — добавлены ещё и чекпоинты цены (5/15/30/60/90/120
   минут после сигнала) в историю пампов/дампов, и в файл аномалий объёма
   рядом с уже существующим полным path (для единообразия между файлами).
@@ -749,7 +766,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.29.9"
+APP_VERSION  = "0.29.10"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4869,16 +4886,44 @@ def _save_vol_peak_watchlist():
 
 
 def _load_vol_peak_watchlist():
+    """v0.29.10: реальный баг, подтверждённый на актуальной версии —
+    expires_at считается и сохраняется на диск ОДИН раз при добавлении, с
+    ТЕМ значением VOL_PEAK_EXPIRY_SEC, что было в коде на тот момент. Мы
+    за это время несколько раз меняли константу (12ч -> 90мин -> 6ч) — но
+    уже сохранённые на диск записи продолжают жить со СТАРЫМ сроком,
+    потому что при подхвате с диска после перезапуска (что происходит
+    при каждом обновлении бота) мы просто доверяли сохранённому значению,
+    не пересчитывали его под ТЕКУЩУЮ константу (реальный случай:
+    TAC_USDT, всплеск 29-часовой давности пережил уже два обновления
+    лимита). Теперь при загрузке КАЖДАЯ запись пересчитывается заново:
+    expires_at = spike_ts + ТЕКУЩИЙ VOL_PEAK_EXPIRY_SEC — если по новым
+    правилам она уже должна была истечь, отбрасываем сразу, не ждём
+    следующего скана."""
     global _vol_peak_watchlist
     try:
         if os.path.exists(VOL_PEAK_WATCHLIST_FILE):
             with open(VOL_PEAK_WATCHLIST_FILE) as f:
                 loaded = json.load(f)
             if isinstance(loaded, dict):
+                now = time.time()
+                revalidated = {}
+                dropped = 0
+                for symbol, items in loaded.items():
+                    kept = []
+                    for item in items:
+                        item["expires_at"] = item.get("spike_ts", 0) + VOL_PEAK_EXPIRY_SEC
+                        if item["expires_at"] > now:
+                            kept.append(item)
+                        else:
+                            dropped += 1
+                    if kept:
+                        revalidated[symbol] = kept
                 with _vol_peak_lock:
-                    _vol_peak_watchlist = loaded
-                total = sum(len(v) for v in loaded.values())
-                olog(f"[vol_peak] watchlist подхвачен с диска: {total} пиков по {len(loaded)} монетам")
+                    _vol_peak_watchlist = revalidated
+                total = sum(len(v) for v in revalidated.values())
+                olog(f"[vol_peak] watchlist подхвачен с диска: {total} пиков по {len(revalidated)} монетам"
+                     + (f" ({dropped} отброшено — устарели по текущему лимиту {VOL_PEAK_EXPIRY_SEC//60}мин)"
+                        if dropped else ""))
     except Exception as e:
         olog(f"[vol_peak] ⚠ не смог подхватить watchlist с диска: {e}")
 
