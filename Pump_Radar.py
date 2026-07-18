@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.29.10 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.29.11 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.29.11: доп. защита от дублей поверх v0.29.10 — "один активный на
+  монету" (v0.28.6/v0.29.6) проверяется только при добавлении НОВОГО
+  всплеска, не чистит watchlist, если там УЖЕ оказалось несколько записей
+  на одну монету по любой другой причине (старые баги, ручное
+  редактирование файла, будущие пока не найденные пути). Теперь при
+  каждой загрузке с диска watchlist принудительно схлопывается до ОДНОЙ —
+  самой крупной по объёму — записи на монету, независимо от того, как
+  там оказалось несколько. Проверено тестом на точной реконструкции
+  случая TAC_USDT (две разные записи, обе технически ещё "живые" по
+  сохранённому expires_at) — после загрузки остаётся ровно одна, с
+  большим объёмом.
 - v0.29.10: реальный баг, подтверждённый на АКТУАЛЬНОЙ версии (TAC_USDT,
   всплеск 29-часовой давности при текущем лимите 6 часов — пользователь
   явно подтвердил, что скрин со свежей версии, не гадание про старый
@@ -766,7 +777,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.29.10"
+APP_VERSION  = "0.29.11"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4908,6 +4919,7 @@ def _load_vol_peak_watchlist():
                 now = time.time()
                 revalidated = {}
                 dropped = 0
+                consolidated = 0
                 for symbol, items in loaded.items():
                     kept = []
                     for item in items:
@@ -4916,14 +4928,30 @@ def _load_vol_peak_watchlist():
                             kept.append(item)
                         else:
                             dropped += 1
+                    if len(kept) > 1:
+                        # v0.29.11: доп. защита — "один активный на монету"
+                        # (v0.28.6/v0.29.6) проверяется только при
+                        # добавлении НОВОГО всплеска, не чистит то, что уже
+                        # оказалось в файле по любой другой причине (старые
+                        # баги, ручное редактирование, будущие пока не
+                        # найденные пути). При каждой загрузке принудительно
+                        # схлопываем до одной — самой крупной по объёму —
+                        # записи на монету, независимо от того, как там
+                        # оказалось несколько.
+                        consolidated += len(kept) - 1
+                        kept = [max(kept, key=lambda p: p.get("spike_vol", 0))]
                     if kept:
                         revalidated[symbol] = kept
                 with _vol_peak_lock:
                     _vol_peak_watchlist = revalidated
                 total = sum(len(v) for v in revalidated.values())
+                extra = []
+                if dropped:
+                    extra.append(f"{dropped} отброшено — устарели по текущему лимиту {VOL_PEAK_EXPIRY_SEC//60}мин")
+                if consolidated:
+                    extra.append(f"{consolidated} схлопнуто — было несколько записей на одну монету")
                 olog(f"[vol_peak] watchlist подхвачен с диска: {total} пиков по {len(revalidated)} монетам"
-                     + (f" ({dropped} отброшено — устарели по текущему лимиту {VOL_PEAK_EXPIRY_SEC//60}мин)"
-                        if dropped else ""))
+                     + (f" ({'; '.join(extra)})" if extra else ""))
     except Exception as e:
         olog(f"[vol_peak] ⚠ не смог подхватить watchlist с диска: {e}")
 
