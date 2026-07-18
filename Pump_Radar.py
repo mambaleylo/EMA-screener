@@ -1,7 +1,24 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.29.11 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.29.12 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.29.12: по запросу — полный аудит проекта. Найдено и исправлено два
+  реальных бага: (1) _watchdog_loop был ЕДИНСТВЕННЫМ из всех фоновых
+  циклов без try/except вокруг тела — необработанное исключение тихо
+  убило бы поток навсегда, без единой строчки в лог, и мониторинг связи с
+  интернетом просто перестал бы работать до следующего перезапуска, никто
+  бы не узнал почему. Добавлена та же защита, что у всех остальных
+  циклов. Проверено тестом: цикл переживает исключения внутри тела и
+  продолжает работать. (2) _weekly_ema_fire_alert мутировал
+  _weekly_ema_recent (append + обрезка до 200) БЕЗ _weekly_ema_touch_lock,
+  хотя чтение/очистка/сохранение этого же списка отовсюду блокировку
+  используют — функция может вызываться параллельно из пампа, дампа и
+  аномалии объёма одновременно, реальный риск гонки на структурной
+  мутации общего списка. Обёрнуто в тот же лок. Проверены и НЕ подтвердились
+  как баги: _ema_touch_ctx_cache (лок уже был, просто не сразу заметен),
+  _pump_price_history (везде корректно под _pump_detect_lock), _diag_records
+  (везде корректно под _diag_lock), все числовые хелперы (_ema/_atr — с
+  защитой от коротких списков).
 - v0.29.11: доп. защита от дублей поверх v0.29.10 — "один активный на
   монету" (v0.28.6/v0.29.6) проверяется только при добавлении НОВОГО
   всплеска, не чистит watchlist, если там УЖЕ оказалось несколько записей
@@ -777,7 +794,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.29.11"
+APP_VERSION  = "0.29.12"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -5716,9 +5733,15 @@ def _weekly_ema_fire_alert(touch, confidence_note=None, triggered_by=None):
            "rr": touch["rr"], "confidence_note": confidence_note, "triggered_by": triggered_by,
            "outcome": "open", "resolved_at": None, "resolved_price": None}
     global _weekly_ema_recent
-    _weekly_ema_recent.append(rec)
-    _weekly_ema_recent = _weekly_ema_recent[-200:]
-    _save_weekly_ema_history()
+    # v0.29.12: аудит — единственное место, где этот список менялся БЕЗ
+    # _weekly_ema_touch_lock, хотя чтение/очистка/сохранение отовсюду его
+    # используют. Функция может вызываться параллельно из пампа, дампа и
+    # аномалии объёма одновременно — реальный риск гонки на структурной
+    # мутации общего списка.
+    with _weekly_ema_touch_lock:
+        _weekly_ema_recent.append(rec)
+        _weekly_ema_recent = _weekly_ema_recent[-200:]
+        _save_weekly_ema_history()
 
 
 WEEKLY_EMA_RESOLVE_POLL_SEC = 120   # раз в 2 минуты — недельные/дневные уровни не убегают быстро
@@ -6510,32 +6533,40 @@ def _watchdog_loop():
     global _watchdog_down_since, _watchdog_alerted, _watchdog_last_alert
     while True:
         time.sleep(WATCHDOG_CHECK_SEC)
-        if not WATCHDOG_ENABLED:
-            continue
-        online = _check_connectivity()
-        now = time.time()
-        with _watchdog_lock:
-            if online:
-                if _watchdog_alerted and _watchdog_down_since:
-                    down_min = max(1, int((now - _watchdog_down_since) / 60))
-                    _send_alert(f"🟢 Связь восстановлена. Не было интернета/Gate.io ~{down_min} мин.")
-                    olog(f"🟢 watchdog: связь восстановлена, простой ~{down_min} мин")
-                _watchdog_down_since = None
-                _watchdog_alerted    = False
-                _watchdog_last_alert = None
-            else:
-                if _watchdog_down_since is None:
-                    _watchdog_down_since = now
-                    olog("⚠ watchdog: нет связи с интернетом/Gate.io — таймер запущен")
-                    continue
-                elapsed_min = (now - _watchdog_down_since) / 60
-                if elapsed_min < WATCHDOG_TIMEOUT_MIN:
-                    continue
-                if (not _watchdog_alerted) or \
-                   (now - (_watchdog_last_alert or 0) >= WATCHDOG_TIMEOUT_MIN * 60):
-                    _send_alert(f"🔴 Нет связи с интернетом/Gate.io уже {int(elapsed_min)} мин.")
-                    _watchdog_alerted    = True
-                    _watchdog_last_alert = now
+        try:
+            if not WATCHDOG_ENABLED:
+                continue
+            online = _check_connectivity()
+            now = time.time()
+            with _watchdog_lock:
+                if online:
+                    if _watchdog_alerted and _watchdog_down_since:
+                        down_min = max(1, int((now - _watchdog_down_since) / 60))
+                        _send_alert(f"🟢 Связь восстановлена. Не было интернета/Gate.io ~{down_min} мин.")
+                        olog(f"🟢 watchdog: связь восстановлена, простой ~{down_min} мин")
+                    _watchdog_down_since = None
+                    _watchdog_alerted    = False
+                    _watchdog_last_alert = None
+                else:
+                    if _watchdog_down_since is None:
+                        _watchdog_down_since = now
+                        olog("⚠ watchdog: нет связи с интернетом/Gate.io — таймер запущен")
+                        continue
+                    elapsed_min = (now - _watchdog_down_since) / 60
+                    if elapsed_min < WATCHDOG_TIMEOUT_MIN:
+                        continue
+                    if (not _watchdog_alerted) or \
+                       (now - (_watchdog_last_alert or 0) >= WATCHDOG_TIMEOUT_MIN * 60):
+                        _send_alert(f"🔴 Нет связи с интернетом/Gate.io уже {int(elapsed_min)} мин.")
+                        _watchdog_alerted    = True
+                        _watchdog_last_alert = now
+        except Exception as e:
+            # v0.29.12: аудит — единственный из всех фоновых циклов был БЕЗ
+            # этой защиты. Необработанное исключение здесь тихо убивало бы
+            # поток watchdog навсегда, без единой строчки в лог — мониторинг
+            # связи с интернетом просто переставал бы работать до
+            # следующего перезапуска, и никто бы не узнал почему.
+            olog(f"[watchdog] ошибка цикла: {e}")
 
 # ─── Heartbeat healthchecks.io ────────────────────────────────────────────────
 HEARTBEAT_INTERVAL_SEC = 300
