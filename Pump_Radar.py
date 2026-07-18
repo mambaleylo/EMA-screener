@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.29.7 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.29.8 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.29.8: по запросу — записи Volume Peak Watcher теперь несут поле
+  "path": весь путь цены по времени (каждая проверка трек-цикла, ~24
+  точки на сделку за 2 часа при опросе раз в 5 минут), не только крайние
+  max_follow_pct/max_reverse_pct. Крайние точки сами по себе не говорят,
+  В КАКОМ ПОРЯДКЕ случились просадка и разворот в прибыль — а это
+  критично для честной симуляции "стоп -X% / тейк +Y%" (стоп мог
+  сработать раньше, чем случился бы разворот в прибыль, и по одним
+  крайним точкам это было не отличить от честного выигрыша). Первая точка
+  пути — цена входа (момент самого алерта). Проверено тестом: путь
+  корректно накапливается по времени в правильном порядке.
 - v0.29.7: по запросу — два добавления в логи для будущего анализа
   (разбор реального экспорта показал два пробела). (1) Записи Volume Peak
   Watcher теперь несут schema_version — не нужно вручную вычислять "это
@@ -729,7 +739,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.29.7"
+APP_VERSION  = "0.29.8"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4887,7 +4897,15 @@ def _vol_peak_fire_alert(symbol, watch_item, current_price, pct_move):
            "schema_version": VOL_ANOMALY_SCHEMA_VERSION, "source_id": source_id,
            "track_until": now + VOL_PEAK_TRACK_WINDOW_SEC, "track_done": False,
            "max_follow_pct": 0.0, "max_reverse_pct": 0.0,
-           "last_tracked_price": current_price, "last_tracked_ts": int(now)}
+           "last_tracked_price": current_price, "last_tracked_ts": int(now),
+           # v0.29.8: по запросу — весь путь цены по времени, не только
+           # крайние точки. max_follow_pct/max_reverse_pct сами по себе не
+           # говорят, В КАКОМ ПОРЯДКЕ случились просадка и прибыль — а это
+           # критично для честной симуляции "стоп -X% / тейк +Y%" (стоп
+           # мог сработать раньше, чем случился разворот в прибыль).
+           # path — {"ts","price"} на каждой проверке, первая точка это
+           # вход (цена самого алерта).
+           "path": [{"ts": int(now), "price": current_price}]}
     _pump_dump_history_append(VOL_ANOMALY_HISTORY_FILE, rec)
 
     try:
@@ -5097,9 +5115,12 @@ def _vol_peak_watch_loop():
 
 
 def _vol_anomaly_track_loop():
-    """Зеркало _pump_dump_track_loop для истории аномалий объёма — те же
-    max_follow_pct/max_reverse_pct, чтобы честно измерить, действительно
-    ли цена потом двигалась (и в какую сторону) после сигнала."""
+    """Зеркало _pump_dump_track_loop для истории аномалий объёма —
+    max_follow_pct/max_reverse_pct для быстрой сводки, ПЛЮС (v0.29.8)
+    весь путь цены по времени в поле "path" — по запросу, чтобы можно
+    было честно смоделировать любой стоп/тейк с учётом порядка событий
+    (крайние точки сами по себе не говорят, что случилось раньше — просадка
+    или разворот в прибыль)."""
     time.sleep(100)
     while True:
         try:
@@ -5139,6 +5160,14 @@ def _vol_anomaly_track_loop():
                             rec["max_reverse_pct"] = round(max(rec.get("max_reverse_pct", 0.0), reverse), 2)
                             rec["last_tracked_price"] = price
                             rec["last_tracked_ts"] = int(now)
+                            # v0.29.8: дописываем путь по времени — на
+                            # VOL_PEAK_TRACK_WINDOW_SEC=2ч и опросе раз в
+                            # VOL_PEAK_SCAN_POLL_SEC=5мин это ~24 точки на
+                            # сделку, не растёт бесконечно (трекинг сам
+                            # заканчивается через track_until)
+                            path = rec.get("path", [])
+                            path.append({"ts": int(now), "price": price})
+                            rec["path"] = path
                             changed = True
                         if now >= rec.get("track_until", 0):
                             rec["track_done"] = True
