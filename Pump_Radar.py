@@ -1,7 +1,20 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.29.14 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.0 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.0: по прямому запросу — все логи переведены на понятный русский.
+  Раньше текст самого исключения вставлялся как есть ({e}) — а Python
+  формирует его на английском (ConnectionError, Timeout, JSONDecodeError...)
+  даже когда весь остальной текст лога уже на русском, непонятно, в чём
+  проблема, не зная английских терминов. Новая _explain_error(e)
+  переводит частые типы ошибок (нет связи с интернетом, сервер не ответил
+  вовремя, нечитаемый ответ вместо данных, не хватает поля в ответе,
+  пустое значение вместо числа и т.д.) в понятную причину — но НЕ теряет
+  техническую деталь, она остаётся в скобках, пригодится, если понадобится
+  показать мне для разбора. Применено массово во ВСЕХ 125 местах, где лог
+  вставлял текст исключения (включая варианты e2/e_tp/e_tp2). Проверено
+  тестом на реальных типах ошибок (сеть, таймаут, битый JSON, отсутствующее
+  поле) и сквозным тестом через реальную функцию с сетевым сбоем.
 - v0.29.14: по запросу — нестабильный интернет, частые обрывы, нужна
   "бесшовность" (не стартовать проход заново из-за одного сбоя). Аудит
   всех фоновых циклов на предмет "обрыв на одной монете валит весь
@@ -828,7 +841,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.29.14"
+APP_VERSION  = "0.30.0"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -926,14 +939,14 @@ def _gate_req(method, path, params=None, body=None, _retries=3, _retry_delay=2.0
                 requests.exceptions.ReadTimeout) as e:
             last_exc = e
             if attempt < _retries:
-                olog(f"⚠ Gate сеть (попытка {attempt}/{_retries}): {e} — повтор через {_retry_delay}с")
+                olog(f"⚠ Gate сеть (попытка {attempt}/{_retries}): {_explain_error(e)} — повтор через {_retry_delay}с")
                 time.sleep(_retry_delay)
         except RuntimeError:
             raise
         except Exception as e:
             last_exc = e
             if attempt < _retries:
-                olog(f"⚠ Gate ошибка (попытка {attempt}/{_retries}): {e} — повтор через {_retry_delay}с")
+                olog(f"⚠ Gate ошибка (попытка {attempt}/{_retries}): {_explain_error(e)} — повтор через {_retry_delay}с")
                 time.sleep(_retry_delay)
     raise last_exc
 
@@ -1011,7 +1024,7 @@ def _gate_get_balance():
             return cross_bal
         return avail
     except Exception as e:
-        olog(f"⚠ gate_get_balance: {e}")
+        olog(f"⚠ gate_get_balance: {_explain_error(e)}")
         return 0.0
 
 def _gate_get_equity():
@@ -1039,7 +1052,7 @@ def _gate_get_equity():
             return total + upnl
         return avail
     except Exception as e:
-        olog(f"⚠ gate_equity: {e}")
+        olog(f"⚠ gate_equity: {_explain_error(e)}")
         return None
 
 def _gate_cancel_orders(symbol):
@@ -1049,12 +1062,12 @@ def _gate_cancel_orders(symbol):
         _gate_req("DELETE", "/futures/usdt/orders",
                   params={"contract": contract, "status": "open"})
     except Exception as e:
-        olog(f"⚠ gate_cancel_orders (orders) {contract}: {e}")
+        olog(f"⚠ gate_cancel_orders (orders) {contract}: {_explain_error(e)}")
     try:
         _gate_req("DELETE", "/futures/usdt/price_orders",
                   params={"contract": contract, "status": "open"})
     except Exception as e:
-        olog(f"⚠ gate_cancel_orders (price_orders) {contract}: {e}")
+        olog(f"⚠ gate_cancel_orders (price_orders) {contract}: {_explain_error(e)}")
 
 def _gate_get_pnl_from_account_book(symbol, since_ts, until_ts=None, max_lookback_sec=3600):
     """Fallback, когда _gate_get_last_pnl_from_position_close не смог
@@ -1072,7 +1085,7 @@ def _gate_get_pnl_from_account_book(symbol, since_ts, until_ts=None, max_lookbac
             "limit": 50,
         })
     except Exception as e:
-        olog(f"[gate_pnl_fallback] {symbol}: account_book запрос не удался: {e}")
+        olog(f"[gate_pnl_fallback] {symbol}: account_book запрос не удался: {_explain_error(e)}")
         return None
     if not isinstance(entries, list) or not entries:
         return None
@@ -1142,7 +1155,7 @@ def _gate_get_last_pnl_from_position_close(symbol, max_age_sec=1800):
         return {"pnl": pnl, "pnl_pct": pnl_pct, "close_price": close_px,
                 "pnl_fee": pnl_fee, "pnl_fund": pnl_fund, "pnl_price": pnl_price}
     except Exception as e:
-        olog(f"⚠ gate_get_last_pnl: {e}")
+        olog(f"⚠ gate_get_last_pnl: {_explain_error(e)}")
         return None
 
 
@@ -1152,7 +1165,7 @@ def _check_position_closed_and_alert(sym, our_pos_now):
     try:
         still_open = _gate_get_position(sym)
     except Exception as e:
-        olog(f"⚠ Не удалось проверить статус позиции {sym} ({e}) — "
+        olog(f"⚠ Не удалось проверить статус позиции {sym} ({_explain_error(e)}) — "
              f"считаем ещё открытой, проверим на следующем тике")
         return False
     if still_open:
@@ -1198,7 +1211,7 @@ def _gate_close_position(symbol):
         })
         olog(f"📤 Позиция закрыта: {contract} {pos['dir']}")
     except Exception as e:
-        olog(f"⚠ gate_close_position {symbol}: {e}")
+        olog(f"⚠ gate_close_position {symbol}: {_explain_error(e)}")
 
 def _gate_round_price(price, contract):
     """Округляет цену TP/SL до реального шага цены (order_price_round)
@@ -1212,7 +1225,7 @@ def _gate_round_price(price, contract):
         return f"{rounded:.{decimals}f}"
     except Exception as e:
         olog(f"⚠ _gate_round_price: не удалось получить шаг цены для {contract} "
-             f"({e}) — использую грубое округление по диапазону цены")
+             f"({_explain_error(e)}) — использую грубое округление по диапазону цены")
         if price > 1000:  return f"{price:.1f}"
         if price > 10:    return f"{price:.2f}"
         if price > 1:     return f"{price:.4f}"
@@ -1269,7 +1282,7 @@ def _gate_has_protective_orders(symbol, text_prefix):
                        params={"contract": contract, "status": "open"})
         orders = r if isinstance(r, list) else []
     except Exception as e:
-        olog(f"⚠ _gate_has_protective_orders {symbol}: {e}")
+        olog(f"⚠ _gate_has_protective_orders {symbol}: {_explain_error(e)}")
         return None
     tags = {(o.get("initial") or {}).get("text", "") for o in orders}
     return (f"t-{text_prefix}-tp" in tags, f"t-{text_prefix}-sl" in tags)
@@ -1307,9 +1320,9 @@ def _ema_rearm_missing_protection():
                         f"позиции, перевыставил автоматически "
                         f"(SL {_fmt_px(item['sl'])} / TP {_fmt_px(item['tp'])})")
         except Exception as e:
-            olog(f"[ema_rearm] 🚨 {symbol}: не смог перевыставить TP/SL: {e}")
+            olog(f"[ema_rearm] 🚨 {symbol}: не смог перевыставить TP/SL: {_explain_error(e)}")
             _send_alert(f"🚨 <b>{symbol} EMA INVERT</b> — позиция ГОЛАЯ (без TP/SL), "
-                        f"автоперевыставление не удалось: {e}\nВЫСТАВЬ ВРУЧНУЮ!")
+                        f"автоперевыставление не удалось: {_explain_error(e)}\nВЫСТАВЬ ВРУЧНУЮ!")
 
 EMA_INVERT_TIME_STOP_BARS = {"1m": 6, "5m": 6, "15m": 5, "1h": 3}
 EMA_INVERT_TIME_STOP_DEFAULT_BARS = 5
@@ -1342,7 +1355,7 @@ def _ema_invert_timestop_watchdog():
         try:
             pos = _gate_get_position(contract)
         except Exception as e:
-            olog(f"[ema_invert_timestop] {symbol}: не смог проверить биржу ({e}) — пропуск")
+            olog(f"[ema_invert_timestop] {symbol}: не смог проверить биржу ({_explain_error(e)}) — пропуск")
             continue
         if not pos:
             continue
@@ -1350,7 +1363,7 @@ def _ema_invert_timestop_watchdog():
         try:
             _gate_close_position(symbol)
         except Exception as e:
-            olog(f"[ema_invert_timestop] 🚨 {symbol}: не удалось закрыть по времени: {e}")
+            olog(f"[ema_invert_timestop] 🚨 {symbol}: не удалось закрыть по времени: {_explain_error(e)}")
             _ema_event_log_write("timestop_close_failed", symbol=symbol, error=str(e))
             continue
         held_sec = now - opened_at
@@ -1360,7 +1373,7 @@ def _ema_invert_timestop_watchdog():
         try:
             pnl_info = _gate_get_last_pnl(symbol, fallback_since_ts=opened_at)
         except Exception as e:
-            olog(f"[ema_invert_timestop] {symbol}: не смог получить PnL закрытия ({e})")
+            olog(f"[ema_invert_timestop] {symbol}: не смог получить PnL закрытия ({_explain_error(e)})")
         _ema_event_log_write("timestop_closed", symbol=symbol, held_sec=round(held_sec, 1),
                               limit_sec=limit_sec, tf=item["tf"],
                               pnl=pnl_info["pnl"] if pnl_info else None)
@@ -1394,7 +1407,7 @@ def _ema_invert_diag_log_write(record):
             with open(EMA_INVERT_DIAG_FILE, "a") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception as e:
-        olog(f"[ema_invert_diag] ошибка записи лога: {e}")
+        olog(f"[ema_invert_diag] ошибка записи лога: {_explain_error(e)}")
 
 def _ema_invert_diag_schedule(item):
     item["diag_status"] = "pending"
@@ -1479,7 +1492,7 @@ def _ema_invert_run_diagnostics():
         try:
             record = _ema_invert_diagnose_one(item)
         except Exception as e:
-            olog(f"[ema_invert_diag] {item.get('symbol')} ошибка разбора: {e}")
+            olog(f"[ema_invert_diag] {item.get('symbol')} ошибка разбора: {_explain_error(e)}")
             continue
         if record is None:
             continue
@@ -1529,7 +1542,7 @@ def _gate_open_position(symbol, direction, entry_px, sl_px, tp_px, risk_pct, **k
             applied_leverage = int(r.get("leverage", leverage)) if isinstance(r, dict) else leverage
             olog(f"✓ Плечо: {applied_leverage}×")
         except Exception as e:
-            olog(f"⚠ Плечо попытка 1: {e} — повтор через 1с")
+            olog(f"⚠ Плечо попытка 1: {_explain_error(e)} — повтор через 1с")
             time.sleep(1.0)
             try:
                 r = _gate_req("POST", f"/futures/usdt/positions/{contract}/leverage",
@@ -1537,7 +1550,7 @@ def _gate_open_position(symbol, direction, entry_px, sl_px, tp_px, risk_pct, **k
                 applied_leverage = int(r.get("leverage", leverage)) if isinstance(r, dict) else leverage
                 olog(f"✓ Плечо (попытка 2): {applied_leverage}×")
             except Exception as e2:
-                olog(f"⚠ Плечо не применено: {e2} — используем leverage=1")
+                olog(f"⚠ Плечо не применено: {_explain_error(e2)} — используем leverage=1")
                 applied_leverage = 1
 
         qm = _gate_get_quanto(symbol)
@@ -1613,17 +1626,17 @@ def _gate_open_position(symbol, direction, entry_px, sl_px, tp_px, risk_pct, **k
             _place_tp_sl()
             tp_sl_ok = True
         except Exception as e_tp:
-            olog(f"⚠ TP/SL попытка 1 упала: {e_tp} — повтор через 2с")
+            olog(f"⚠ TP/SL попытка 1 упала: {_explain_error(e_tp)} — повтор через 2с")
             time.sleep(2.0)
             try:
                 _place_tp_sl()
                 tp_sl_ok = True
                 olog("✓ TP/SL выставлены со второй попытки")
             except Exception as e_tp2:
-                olog(f"🚨 TP/SL НЕ выставлены после 2 попыток: {e_tp2}")
+                olog(f"🚨 TP/SL НЕ выставлены после 2 попыток: {_explain_error(e_tp2)}")
                 _send_alert(
                     f"🚨 <b>{symbol}</b> — позиция открыта, но TP/SL НЕ выставлены!\n"
-                    f"Причина: {e_tp2}\nВыставь стоп вручную! "
+                    f"Причина: {_explain_error(e_tp2)}\nВыставь стоп вручную! "
                     f"TP={_fmt_px(tp_px)} SL={_fmt_px(sl_px)}"
                 )
 
@@ -1638,8 +1651,8 @@ def _gate_open_position(symbol, direction, entry_px, sl_px, tp_px, risk_pct, **k
         )
         return pos_info
     except Exception as e:
-        olog(f"⚠ gate_open_position {symbol}: {e}")
-        _send_alert(f"🚨 <b>{symbol}</b> — ошибка открытия позиции:\n{e}")
+        olog(f"⚠ gate_open_position {symbol}: {_explain_error(e)}")
+        _send_alert(f"🚨 <b>{symbol}</b> — ошибка открытия позиции:\n{_explain_error(e)}")
         return None
 
 def _load_gate_cfg():
@@ -1656,7 +1669,7 @@ def _save_gate_cfg():
         with open(GATE_CFG_PATH, "w") as f:
             json.dump({"gate_key": GATE_KEY, "gate_secret": GATE_SECRET}, f)
     except Exception as e:
-        olog(f"⚠ Не удалось сохранить gate cfg: {e}")
+        olog(f"⚠ Не удалось сохранить gate cfg: {_explain_error(e)}")
 
 def _ts():
     return time.strftime("[%H:%M:%S]")
@@ -1667,6 +1680,42 @@ def olog(msg):
         if len(opt_state["logs"]) > 500:
             opt_state["logs"] = opt_state["logs"][-300:]
             opt_state["logs_dropped"] = opt_state.get("logs_dropped",0) + 200
+
+def _explain_error(e):
+    """v0.30.0: по прямому запросу — раньше в логах текст самого исключения
+    вставлялся как есть (просто {e} в f-строке), а Python формирует его на английском
+    (ConnectionError, Timeout, JSONDecodeError...), даже когда весь
+    остальной текст лога уже на русском — непонятно, в чём проблема, не
+    зная английских терминов. Переводит частые типы ошибок в понятную
+    причину на русском, но НЕ теряет техническую деталь — она остаётся в
+    скобках, пригодится, если понадобится показать мне для разбора."""
+    name = type(e).__name__
+    text = str(e).strip()
+    low = (name + " " + text).lower()
+    if "connect" in low or "resolve" in low or "dns" in low:
+        hint = "нет связи с интернетом или сервер недоступен"
+    elif "timeout" in low or "timed out" in low:
+        hint = "сервер не ответил вовремя (медленная/нестабильная связь)"
+    elif "jsondecodeerror" in low or "expecting value" in low:
+        hint = "получен нечитаемый ответ вместо данных (не JSON — часто бывает при обрыве связи)"
+    elif isinstance(e, KeyError):
+        hint = "в ответе от биржи не хватает ожидаемого поля"
+    elif isinstance(e, IndexError):
+        hint = "данных пришло меньше, чем ожидалось"
+    elif isinstance(e, TypeError):
+        hint = "получено пустое значение там, где ожидалось число"
+    elif isinstance(e, ValueError):
+        hint = "не удалось распознать полученное значение"
+    elif isinstance(e, FileNotFoundError):
+        hint = "файл не найден на устройстве"
+    elif isinstance(e, PermissionError):
+        hint = "нет прав на чтение/запись файла"
+    elif isinstance(e, OSError):
+        hint = "ошибка сети или системы"
+    else:
+        hint = "непредвиденная ошибка"
+    detail = f"{name}: {text[:150]}" if text else name
+    return f"{hint} ({detail})"
 
 # ─── Gate.io fetch ──────────────────────────────────────────────────────────
 MAX_SPREAD_PCT = 0.15
@@ -1712,7 +1761,7 @@ def _fetch_all_symbols():
                  f"{', '.join(skipped_volume[:15])}" + (" ..." if len(skipped_volume) > 15 else ""))
         return top50
     except Exception as e:
-        olog(f"fetch_all_symbols error: {e}")
+        olog(f"fetch_all_symbols error: {_explain_error(e)}")
         return []
 
 def _fetch_candles(symbol, tf, days, _stop_event=None, offset_days=0):
@@ -1766,7 +1815,7 @@ def _fetch_candles(symbol, tf, days, _stop_event=None, offset_days=0):
                 time.sleep(0.12)
         except Exception as e:
             fail_count += 1
-            olog(f"fetch error: {e}")
+            olog(f"fetch error: {_explain_error(e)}")
             if fail_count >= MAX_FAILS:
                 olog(f"❌ {symbol}: {fail_count} ошибок подряд, прерываю загрузку")
                 break
@@ -2116,7 +2165,7 @@ def _save_ema_dossier_state(state):
     try:
         with open(EMA_DOSSIER_FILE, "w") as f: json.dump(state, f)
     except Exception as e:
-        olog(f"ema_dossier save error: {e}")
+        olog(f"ema_dossier save error: {_explain_error(e)}")
 
 def _run_ema_dossier_scan(top_n=50):
     symbols = _fetch_all_symbols()[:top_n]
@@ -2179,7 +2228,7 @@ def _save_ema_history(state):
             json.dump(state, f)
         os.replace(tmp_path, EMA_HISTORY_FILE)
     except Exception as e:
-        olog(f"[ema_history] ошибка сохранения: {e}")
+        olog(f"[ema_history] ошибка сохранения: {_explain_error(e)}")
 
 def _ema_history_add(sig):
     key = f"{sig['symbol']}|{sig['tf']}|{sig['ema_period']}|{sig['bar_t']}"
@@ -2211,14 +2260,14 @@ def _ema_reconcile_live_positions():
         try:
             still_open = _gate_get_position(contract)
         except Exception as e:
-            olog(f"[ema_reconcile] {item['symbol']}: не смог проверить биржу ({e}) — пропуск")
+            olog(f"[ema_reconcile] {item['symbol']}: не смог проверить биржу ({_explain_error(e)}) — пропуск")
             continue
         if still_open:
             continue
         try:
             _gate_cancel_orders(contract)
         except Exception as e:
-            olog(f"[ema_reconcile] {item['symbol']}: не смог снять старые ордера ({e})")
+            olog(f"[ema_reconcile] {item['symbol']}: не смог снять старые ордера ({_explain_error(e)})")
         pnl_info = _gate_get_last_pnl(item["symbol"], fallback_since_ts=item["opened_at"])
         close_p  = (pnl_info["close_price"] if pnl_info and pnl_info.get("close_price") is not None
                     else item.get("sl"))
@@ -2285,7 +2334,7 @@ def _ema_history_update_open():
                     try:
                         pnl_info = _gate_get_last_pnl(item["symbol"], fallback_since_ts=item["opened_at"])
                     except Exception as e:
-                        olog(f"[ema_history] {item['symbol']}: не смог получить live_pnl ({e})")
+                        olog(f"[ema_history] {item['symbol']}: не смог получить live_pnl ({_explain_error(e)})")
                         pnl_info = None
                     if pnl_info:
                         item["live_pnl"]       = pnl_info["pnl"]
@@ -2295,7 +2344,7 @@ def _ema_history_update_open():
                         item["live_pnl_price"] = pnl_info.get("pnl_price")
                 updated[key] = item
         except Exception as e:
-            olog(f"[ema_history] статус {item.get('symbol')} ошибка: {e}")
+            olog(f"[ema_history] статус {item.get('symbol')} ошибка: {_explain_error(e)}")
     if updated:
         with _ema_history_lock:
             state2 = _load_ema_history()
@@ -2338,7 +2387,7 @@ def _save_ema_auto_trade_cfg():
         with open(EMA_AUTO_TRADE_CFG_FILE, "w") as f:
             json.dump(snapshot, f)
     except Exception as e:
-        olog(f"[ema_auto_trade] ошибка сохранения настроек: {e}")
+        olog(f"[ema_auto_trade] ошибка сохранения настроек: {_explain_error(e)}")
 
 def _ema_maybe_open_live_trade(symbol, sig, hist_key):
     with ema_auto_trade_lock:
@@ -2362,7 +2411,7 @@ def _ema_maybe_open_live_trade(symbol, sig, hist_key):
     try:
         existing = _gate_get_position(contract)
     except Exception as e:
-        olog(f"[ema_auto_trade] {symbol}: не смог проверить биржу перед входом ({e}) — пропуск на этот раз")
+        olog(f"[ema_auto_trade] {symbol}: не смог проверить биржу перед входом ({_explain_error(e)}) — пропуск на этот раз")
         return
     if existing:
         olog(f"[ema_auto_trade] {symbol}: на бирже уже есть позиция вне нашего учёта — пропуск")
@@ -2391,7 +2440,7 @@ def _ema_finalize_live_position(item):
     try:
         still_open = _gate_get_position(contract)
     except Exception as e:
-        olog(f"[ema_auto_trade] {symbol}: не смог проверить биржу после закрытия сигнала: {e}")
+        olog(f"[ema_auto_trade] {symbol}: не смог проверить биржу после закрытия сигнала: {_explain_error(e)}")
         return
     if not still_open:
         return
@@ -2402,9 +2451,9 @@ def _ema_finalize_live_position(item):
         _send_alert(f"⚠️ <b>{symbol} EMA INVERT</b> — TP/SL-ордер не сработал вовремя, "
                      f"позиция закрыта маркетом принудительно")
     except Exception as e:
-        olog(f"[ema_auto_trade] {symbol}: ошибка принудительного закрытия: {e}")
+        olog(f"[ema_auto_trade] {symbol}: ошибка принудительного закрытия: {_explain_error(e)}")
         _send_alert(f"🚨 <b>{symbol} EMA INVERT</b> — не удалось закрыть позицию "
-                     f"принудительно: {e}. ЗАКРОЙ ВРУЧНУЮ!")
+                     f"принудительно: {_explain_error(e)}. ЗАКРОЙ ВРУЧНУЮ!")
 
 
 EMA_DIAG_FILE          = os.path.expanduser("~/pumpradar_signal_diagnostics.jsonl")
@@ -2418,7 +2467,7 @@ def _ema_diag_log_write(record):
             with open(EMA_DIAG_FILE, "a") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception as e:
-        olog(f"[ema_diag] ошибка записи лога: {e}")
+        olog(f"[ema_diag] ошибка записи лога: {_explain_error(e)}")
 
 EMA_EVENTS_FILE = os.path.expanduser("~/pumpradar_events_diagnostics.jsonl")
 _ema_events_lock = threading.Lock()
@@ -2431,7 +2480,7 @@ def _ema_event_log_write(event_type, **fields):
             with open(EMA_EVENTS_FILE, "a") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception as e:
-        olog(f"[ema_events] ⚠ ошибка записи в {EMA_EVENTS_FILE}: {e}")
+        olog(f"[ema_events] ⚠ ошибка записи в {EMA_EVENTS_FILE}: {_explain_error(e)}")
 
 def _ema_diagnose_one(item):
     symbol, tf, ema_period = item["symbol"], item["tf"], item["ema_period"]
@@ -2527,7 +2576,7 @@ def _ema_run_diagnostics():
         try:
             record = _ema_diagnose_one(item)
         except Exception as e:
-            olog(f"[ema_diag] {item.get('symbol')} ошибка разбора: {e}")
+            olog(f"[ema_diag] {item.get('symbol')} ошибка разбора: {_explain_error(e)}")
             continue
         if record is None:
             continue
@@ -2803,7 +2852,7 @@ def _ema_signal_loop():
             _ema_history_update_open()
             _ema_invert_run_diagnostics()
         except Exception as e:
-            olog(f"[ema_live] ошибка цикла: {e}")
+            olog(f"[ema_live] ошибка цикла: {_explain_error(e)}")
         _iter += 1
         if _iter % 120 == 0:
             _rss = _rss_mb()
@@ -3671,9 +3720,9 @@ def _send_alert(msg):
                         olog(f"⚠ TG алерт HTTP {r.status_code} (попытка {attempt}/3)")
                 except (requests.exceptions.ConnectionError,
                         requests.exceptions.Timeout) as e:
-                    olog(f"⚠ TG алерт сеть (попытка {attempt}/3): {e}")
+                    olog(f"⚠ TG алерт сеть (попытка {attempt}/3): {_explain_error(e)}")
                 except Exception as e:
-                    olog(f"⚠ TG алерт: {e}")
+                    olog(f"⚠ TG алерт: {_explain_error(e)}")
                     break
             if NTFY_URL:
                 try:
@@ -3681,9 +3730,9 @@ def _send_alert(msg):
                     sent = True
                 except (requests.exceptions.ConnectionError,
                         requests.exceptions.Timeout) as e:
-                    olog(f"⚠ ntfy алерт сеть (попытка {attempt}/3): {e}")
+                    olog(f"⚠ ntfy алерт сеть (попытка {attempt}/3): {_explain_error(e)}")
                 except Exception as e:
-                    olog(f"⚠ ntfy алерт: {e}")
+                    olog(f"⚠ ntfy алерт: {_explain_error(e)}")
                     break
             if sent or attempt == 3:
                 break
@@ -3777,7 +3826,7 @@ def _render_signal_chart_png(candles, sig, sym, tf):
         img.save(buf, format="PNG")
         return buf.getvalue()
     except Exception as e:
-        olog(f"⚠ Рендер скриншота сигнала: {e}")
+        olog(f"⚠ Рендер скриншота сигнала: {_explain_error(e)}")
         return None
 
 def _send_alert_photo(png_bytes, caption):
@@ -3798,7 +3847,7 @@ def _send_alert_photo(png_bytes, caption):
                     olog(f"⚠ TG фото HTTP {r.status_code} — шлю текстом")
                     _send_alert(caption)
             except Exception as e:
-                olog(f"⚠ TG фото: {e} — шлю текстом")
+                olog(f"⚠ TG фото: {_explain_error(e)} — шлю текстом")
                 _send_alert(caption)
         else:
             _send_alert(caption)
@@ -3853,7 +3902,7 @@ def _load_scan_settings():
                     _scan_settings["top_n"] = max(1, min(500, int(saved["top_n"])))
             olog(f"[scan_settings] загружено: {_scan_settings}")
     except Exception as e:
-        olog(f"[scan_settings] ⚠ не смог загрузить: {e}")
+        olog(f"[scan_settings] ⚠ не смог загрузить: {_explain_error(e)}")
 
 
 def _save_scan_settings(top_n):
@@ -3866,7 +3915,7 @@ def _save_scan_settings(top_n):
             json.dump(snapshot, f)
         olog(f"[scan_settings] сохранено и применено: {snapshot}")
     except Exception as e:
-        olog(f"[scan_settings] ⚠ не смог сохранить: {e}")
+        olog(f"[scan_settings] ⚠ не смог сохранить: {_explain_error(e)}")
 
 
 def _get_scan_top_n():
@@ -3982,7 +4031,7 @@ def _pump_fetch_tickers_snapshot():
             out[contract] = {"price": px, "vol24": vol}
         return out
     except Exception as e:
-        olog(f"[pump_detect] ошибка запроса tickers: {e}")
+        olog(f"[pump_detect] ошибка запроса tickers: {_explain_error(e)}")
         return {}
 
 
@@ -4117,7 +4166,7 @@ def _pump_or_dump_maybe_trigger_ema_signal(symbol, expected_bias, confidence_not
         try:
             touches = _ema_touch_check_symbol(symbol, tf)
         except Exception as e:
-            olog(f"[ema_trigger] {symbol} {tf}: ошибка проверки: {e}")
+            olog(f"[ema_trigger] {symbol} {tf}: ошибка проверки: {_explain_error(e)}")
             continue
         for touch in touches:
             if touch["classic_bias"] != expected_bias:
@@ -4198,7 +4247,7 @@ def _save_pump_render_params(params):
             json.dump(_pump_render_params, f)
         olog(f"[pump_match] новые параметры рендера сохранены и применены: {_pump_render_params}")
     except Exception as e:
-        olog(f"[pump_match] ⚠ не смог сохранить параметры рендера: {e}")
+        olog(f"[pump_match] ⚠ не смог сохранить параметры рендера: {_explain_error(e)}")
 
 
 def _pm_smooth(arr, period, method="ema"):
@@ -4621,7 +4670,7 @@ def _pump_dump_history_append(file_path, rec):
                 json.dump(hist, f)
             os.replace(tmp_path, file_path)
         except Exception as e:
-            olog(f"[pump_dump_track] ⚠ не смог записать {file_path}: {e}")
+            olog(f"[pump_dump_track] ⚠ не смог записать {file_path}: {_explain_error(e)}")
 
 
 def _pump_dump_history_save_all(file_path, hist):
@@ -4631,7 +4680,7 @@ def _pump_dump_history_save_all(file_path, hist):
             json.dump(hist, f)
         os.replace(tmp_path, file_path)
     except Exception as e:
-        olog(f"[pump_dump_track] ⚠ не смог сохранить {file_path}: {e}")
+        olog(f"[pump_dump_track] ⚠ не смог сохранить {file_path}: {_explain_error(e)}")
 
 
 def _pump_dump_track_loop():
@@ -4655,7 +4704,7 @@ def _pump_dump_track_loop():
                         with open(file_path) as f:
                             hist = json.load(f)
                     except Exception as e:
-                        olog(f"[pump_dump_track] {file_path}: не смог прочитать: {e}")
+                        olog(f"[pump_dump_track] {file_path}: не смог прочитать: {_explain_error(e)}")
                         continue
                     now = time.time()
                     price_cache = {}
@@ -4669,7 +4718,7 @@ def _pump_dump_track_loop():
                                 try:
                                     price_cache[sym] = _gate_get_price(sym)
                                 except Exception as e:
-                                    olog(f"[pump_dump_track] {sym}: ошибка получения цены: {e}")
+                                    olog(f"[pump_dump_track] {sym}: ошибка получения цены: {_explain_error(e)}")
                                     price_cache[sym] = None
                             price = price_cache[sym]
                             if price and rec.get("last_price"):
@@ -4689,12 +4738,12 @@ def _pump_dump_track_loop():
                                 changed = True
                         except Exception as e:
                             olog(f"[pump_dump_track] ⚠ пропущена битая запись "
-                                 f"({rec.get('symbol','?')}): {e}")
+                                 f"({rec.get('symbol','?')}): {_explain_error(e)}")
                             continue
                     if changed:
                         _pump_dump_history_save_all(file_path, hist)
         except Exception as e:
-            olog(f"[pump_dump_track] ошибка цикла: {e}")
+            olog(f"[pump_dump_track] ошибка цикла: {_explain_error(e)}")
         time.sleep(PUMP_TRACK_POLL_SEC)
 
 
@@ -4714,13 +4763,13 @@ def _pump_fire_alert(symbol, res):
         cutoff = time.time() - PUMP_CHART_WINDOW_MIN * 60
         candles = [c for c in raw if c["t"] >= cutoff]
     except Exception as e:
-        olog(f"[pump_detect] {symbol}: не смог получить свечи для графика: {e}")
+        olog(f"[pump_detect] {symbol}: не смог получить свечи для графика: {_explain_error(e)}")
 
     png = None
     try:
         png = _render_pump_chart_png(candles, res["base_price"])
     except Exception as e:
-        olog(f"[pump_detect] {symbol}: ошибка рендера графика: {e}")
+        olog(f"[pump_detect] {symbol}: ошибка рендера графика: {_explain_error(e)}")
 
     caption = (f"<b>{symbol}</b>\n"
                f"Pump: {res['pct']}% (окно {res.get('window_min','?')}м)\n"
@@ -4752,7 +4801,7 @@ def _pump_fire_alert(symbol, res):
                                 "пользу шорта против ~85% у резких пампов) — ниже уверенность")
         _pump_or_dump_maybe_trigger_ema_signal(symbol, expected_bias="short", confidence_note=confidence_note)
     except Exception as e:
-        olog(f"[pump_detect] {symbol}: ошибка проверки EMA-триггера: {e}")
+        olog(f"[pump_detect] {symbol}: ошибка проверки EMA-триггера: {_explain_error(e)}")
 
 
 def _dump_fire_alert(symbol, res):
@@ -4769,13 +4818,13 @@ def _dump_fire_alert(symbol, res):
         cutoff = time.time() - PUMP_CHART_WINDOW_MIN * 60
         candles = [c for c in raw if c["t"] >= cutoff]
     except Exception as e:
-        olog(f"[dump_detect] {symbol}: не смог получить свечи для графика: {e}")
+        olog(f"[dump_detect] {symbol}: не смог получить свечи для графика: {_explain_error(e)}")
 
     png = None
     try:
         png = _render_pump_chart_png(candles, res["base_price"])
     except Exception as e:
-        olog(f"[dump_detect] {symbol}: ошибка рендера графика: {e}")
+        olog(f"[dump_detect] {symbol}: ошибка рендера графика: {_explain_error(e)}")
 
     caption = (f"<b>{symbol}</b>\n"
                f"Dump: -{res['pct']}% (окно {res.get('window_min','?')}м)\n"
@@ -4796,7 +4845,7 @@ def _dump_fire_alert(symbol, res):
     try:
         _pump_or_dump_maybe_trigger_ema_signal(symbol, expected_bias="long")
     except Exception as e:
-        olog(f"[dump_detect] {symbol}: ошибка проверки EMA-триггера: {e}")
+        olog(f"[dump_detect] {symbol}: ошибка проверки EMA-триггера: {_explain_error(e)}")
 
 
 def _pump_detect_loop():
@@ -4861,10 +4910,10 @@ def _pump_detect_loop():
                                 with _pump_detect_lock:
                                     _dump_detect_state[sym] = {"last_alert_ts": now, "last_pct": dump_res["pct"]}
                     except Exception as e:
-                        olog(f"[pump_detect] {sym}: ошибка обработки, пропускаем монету, продолжаем со следующей: {e}")
+                        olog(f"[pump_detect] {sym}: ошибка обработки, пропускаем монету, продолжаем со следующей: {_explain_error(e)}")
                         continue
         except Exception as e:
-            olog(f"[pump_detect] ошибка цикла: {e}")
+            olog(f"[pump_detect] ошибка цикла: {_explain_error(e)}")
         time.sleep(PUMP_DETECT_POLL_SEC)
 # ─── конец Live Pump/Dump Detector ──────────────────────────────────────────
 
@@ -4961,7 +5010,7 @@ def _save_vol_peak_watchlist():
             json.dump(snapshot, f)
         os.replace(tmp_path, VOL_PEAK_WATCHLIST_FILE)
     except Exception as e:
-        olog(f"[vol_peak] ⚠ не смог сохранить watchlist: {e}")
+        olog(f"[vol_peak] ⚠ не смог сохранить watchlist: {_explain_error(e)}")
 
 
 def _load_vol_peak_watchlist():
@@ -5021,7 +5070,7 @@ def _load_vol_peak_watchlist():
                 olog(f"[vol_peak] watchlist подхвачен с диска: {total} пиков по {len(revalidated)} монетам"
                      + (f" ({'; '.join(extra)})" if extra else ""))
     except Exception as e:
-        olog(f"[vol_peak] ⚠ не смог подхватить watchlist с диска: {e}")
+        olog(f"[vol_peak] ⚠ не смог подхватить watchlist с диска: {_explain_error(e)}")
 
 
 def _vol_peak_fire_alert(symbol, watch_item, current_price, pct_move):
@@ -5041,7 +5090,7 @@ def _vol_peak_fire_alert(symbol, watch_item, current_price, pct_move):
         cutoff = watch_item["spike_ts"] - 20 * 60
         candles = [c for c in raw if c["t"] >= cutoff]
     except Exception as e:
-        olog(f"[vol_peak] {symbol}: не смог получить свечи для графика: {e}")
+        olog(f"[vol_peak] {symbol}: не смог получить свечи для графика: {_explain_error(e)}")
 
     png = None
     try:
@@ -5049,7 +5098,7 @@ def _vol_peak_fire_alert(symbol, watch_item, current_price, pct_move):
                                              anomaly_t=watch_item["spike_ts"],
                                              signal_price=current_price)
     except Exception as e:
-        olog(f"[vol_peak] {symbol}: ошибка рендера графика: {e}")
+        olog(f"[vol_peak] {symbol}: ошибка рендера графика: {_explain_error(e)}")
 
     spike_ago_min = round((time.time() - watch_item["spike_ts"]) / 60)
     caption = (
@@ -5085,7 +5134,7 @@ def _vol_peak_fire_alert(symbol, watch_item, current_price, pct_move):
     try:
         _pump_or_dump_maybe_trigger_ema_signal(symbol, expected_bias="short", triggered_by=source_id)
     except Exception as e:
-        olog(f"[vol_peak] {symbol}: ошибка проверки EMA-триггера: {e}")
+        olog(f"[vol_peak] {symbol}: ошибка проверки EMA-триггера: {_explain_error(e)}")
 
 
 def _vol_peak_get_fired_keys():
@@ -5130,7 +5179,7 @@ def _vol_peak_find_loop():
                 try:
                     new_spikes = _find_volume_peaks(symbol)
                 except Exception as e:
-                    olog(f"[vol_peak] {symbol}: ошибка поиска всплесков: {e}")
+                    olog(f"[vol_peak] {symbol}: ошибка поиска всплесков: {_explain_error(e)}")
                     new_spikes = []
                 with _vol_peak_lock:
                     existing = _vol_peak_watchlist.get(symbol, [])
@@ -5185,7 +5234,7 @@ def _vol_peak_find_loop():
             if changed:
                 _save_vol_peak_watchlist()
         except Exception as e:
-            olog(f"[vol_peak] ошибка цикла поиска всплесков: {e}")
+            olog(f"[vol_peak] ошибка цикла поиска всплесков: {_explain_error(e)}")
         time.sleep(VOL_PEAK_SCAN_POLL_SEC)
 
 
@@ -5205,7 +5254,7 @@ def _vol_peak_verify_at_peak(symbol, price, spike_ts, lookback_min=None):
         days = max(1, math.ceil(lookback_min * 60 / 86400) + 1)
         candles = _fetch_candles(symbol, "1m", days)
     except Exception as e:
-        olog(f"[vol_peak_watch] {symbol}: не смог проверить пик свежими свечами: {e}")
+        olog(f"[vol_peak_watch] {symbol}: не смог проверить пик свежими свечами: {_explain_error(e)}")
         return True
     cutoff = max(spike_ts, time.time() - lookback_min * 60)
     recent = [c["close"] for c in candles if c["t"] >= cutoff]
@@ -5249,7 +5298,7 @@ def _vol_peak_watch_loop():
                 try:
                     price = _gate_get_price(symbol)
                 except Exception as e:
-                    olog(f"[vol_peak_watch] {symbol}: ошибка получения цены: {e}")
+                    olog(f"[vol_peak_watch] {symbol}: ошибка получения цены: {_explain_error(e)}")
                     price = None
                 if not price:
                     continue
@@ -5284,7 +5333,7 @@ def _vol_peak_watch_loop():
             if changed:
                 _save_vol_peak_watchlist()
         except Exception as e:
-            olog(f"[vol_peak_watch] ошибка цикла: {e}")
+            olog(f"[vol_peak_watch] ошибка цикла: {_explain_error(e)}")
         time.sleep(VOL_PEAK_WATCH_POLL_SEC)
 
 
@@ -5307,7 +5356,7 @@ def _vol_anomaly_track_loop():
                     with open(VOL_ANOMALY_HISTORY_FILE) as f:
                         hist = json.load(f)
                 except Exception as e:
-                    olog(f"[vol_anomaly_track] не смог прочитать историю: {e}")
+                    olog(f"[vol_anomaly_track] не смог прочитать историю: {_explain_error(e)}")
                     time.sleep(VOL_PEAK_SCAN_POLL_SEC)
                     continue
                 now = time.time()
@@ -5322,7 +5371,7 @@ def _vol_anomaly_track_loop():
                             try:
                                 price_cache[sym] = _gate_get_price(sym)
                             except Exception as e:
-                                olog(f"[vol_anomaly_track] {sym}: ошибка получения цены: {e}")
+                                olog(f"[vol_anomaly_track] {sym}: ошибка получения цены: {_explain_error(e)}")
                                 price_cache[sym] = None
                         price = price_cache[sym]
                         if price and rec.get("price"):
@@ -5349,12 +5398,12 @@ def _vol_anomaly_track_loop():
                             changed = True
                     except Exception as e:
                         olog(f"[vol_anomaly_track] ⚠ пропущена битая запись "
-                             f"({rec.get('symbol','?')}): {e}")
+                             f"({rec.get('symbol','?')}): {_explain_error(e)}")
                         continue
                 if changed:
                     _pump_dump_history_save_all(VOL_ANOMALY_HISTORY_FILE, hist)
         except Exception as e:
-            olog(f"[vol_anomaly_track] ошибка цикла: {e}")
+            olog(f"[vol_anomaly_track] ошибка цикла: {_explain_error(e)}")
         time.sleep(VOL_PEAK_SCAN_POLL_SEC)
 # ─── конец Volume Peak Level Watcher ─────────────────────────────────────────
 
@@ -5413,7 +5462,7 @@ def _save_weekly_ema_history():
             json.dump(_weekly_ema_recent, f)
         os.replace(tmp_path, WEEKLY_EMA_HISTORY_FILE)
     except Exception as e:
-        olog(f"[weekly_ema] ⚠ не смог сохранить историю: {e}")
+        olog(f"[weekly_ema] ⚠ не смог сохранить историю: {_explain_error(e)}")
 
 
 def _load_weekly_ema_history():
@@ -5436,7 +5485,7 @@ def _load_weekly_ema_history():
                 olog(f"[weekly_ema] история подхвачена с диска: {len(loaded)} записей, "
                      f"из них ещё открыто {still_open}")
     except Exception as e:
-        olog(f"[weekly_ema] ⚠ не смог подхватить историю с диска: {e} "
+        olog(f"[weekly_ema] ⚠ не смог подхватить историю с диска: {_explain_error(e)} "
              f"(файл мог повредиться при аварийном завершении — начинаем с пустой истории)")
 
 
@@ -5770,7 +5819,7 @@ def _weekly_ema_fire_alert(touch, confidence_note=None, triggered_by=None):
     try:
         png = _render_ema_touch_chart_png(touch)
     except Exception as e:
-        olog(f"[weekly_ema] {touch['symbol']}: ошибка рендера графика: {e}")
+        olog(f"[weekly_ema] {touch['symbol']}: ошибка рендера графика: {_explain_error(e)}")
     _send_alert_photo(png, msg)
     olog(f"[weekly_ema] {touch['symbol']}: касание EMA{touch['period']} на {touch['tf']} "
          f"(dist={touch['dist_atr']} ATR, side={touch['side']}) — алерт отправлен"
@@ -5822,7 +5871,7 @@ def _weekly_ema_resolve_loop():
                             try:
                                 price_cache[sym] = _gate_get_price(sym)
                             except Exception as e:
-                                olog(f"[weekly_ema_resolve] {sym}: ошибка получения цены: {e}")
+                                olog(f"[weekly_ema_resolve] {sym}: ошибка получения цены: {_explain_error(e)}")
                                 price_cache[sym] = None
                         price = price_cache[sym]
                         if not price:
@@ -5853,13 +5902,13 @@ def _weekly_ema_resolve_loop():
                         # одна повреждённая/неполная запись не должна срывать
                         # проверку ОСТАЛЬНЫХ открытых сигналов в этом же проходе
                         olog(f"[weekly_ema_resolve] ⚠ пропущена битая запись "
-                             f"({rec.get('symbol','?')}): {e}")
+                             f"({rec.get('symbol','?')}): {_explain_error(e)}")
                         continue
                 if changed:
                     with _weekly_ema_touch_lock:
                         _save_weekly_ema_history()
         except Exception as e:
-            olog(f"[weekly_ema_resolve] ошибка цикла: {e}")
+            olog(f"[weekly_ema_resolve] ошибка цикла: {_explain_error(e)}")
         time.sleep(WEEKLY_EMA_RESOLVE_POLL_SEC)
 
 
@@ -5878,7 +5927,7 @@ def _weekly_ema_touch_loop():
                     try:
                         touches = _ema_touch_check_symbol(symbol, tf)
                     except Exception as e:
-                        olog(f"[weekly_ema] {symbol} {tf}: ошибка проверки: {e}")
+                        olog(f"[weekly_ema] {symbol} {tf}: ошибка проверки: {_explain_error(e)}")
                         continue
                     cooldown = WEEKLY_EMA_TOUCH_COOLDOWN_SEC if tf == "1w" else DAILY_EMA_TOUCH_COOLDOWN_SEC
                     for touch in touches:
@@ -5893,7 +5942,7 @@ def _weekly_ema_touch_loop():
                         with _weekly_ema_touch_lock:
                             _weekly_ema_touch_state[key] = now
         except Exception as e:
-            olog(f"[weekly_ema] ошибка цикла: {e}")
+            olog(f"[weekly_ema] ошибка цикла: {_explain_error(e)}")
         time.sleep(WEEKLY_EMA_SCAN_POLL_SEC)
 # ─── конец Weekly/Daily EMA Touch Watcher ───────────────────────────────────
 
@@ -6024,7 +6073,7 @@ def _weekly_ema_backtest_symbol(symbol, tf="1w", days=WEEKLY_EMA_BACKTEST_DAYS,
         try:
             s["intraday"] = _weekly_ema_evaluate_intraday(s, symbol, window_min, thresholds)
         except Exception as e:
-            olog(f"[weekly_ema_backtest] {symbol}: intraday оценка упала: {e}")
+            olog(f"[weekly_ema_backtest] {symbol}: intraday оценка упала: {_explain_error(e)}")
             s["intraday"] = None
     return signals
 
@@ -6072,7 +6121,7 @@ def _weekly_ema_backtest_run(symbols, tf="1w", days=WEEKLY_EMA_BACKTEST_DAYS,
             if signals:
                 results[symbol] = _weekly_ema_aggregate_symbol(signals, thresholds)
         except Exception as e:
-            olog(f"[weekly_ema_backtest] {symbol}: ошибка: {e}")
+            olog(f"[weekly_ema_backtest] {symbol}: ошибка: {_explain_error(e)}")
         if progress_cb:
             progress_cb(idx + 1, total)
     return results
@@ -6115,17 +6164,17 @@ def _weekly_ema_backtest_run_background(job_id, symbols, tf, days, window_min, t
             with open(_weekly_ema_backtest_file(tf), "w") as f:
                 json.dump(payload, f)
         except Exception as e:
-            olog(f"[weekly_ema_backtest] ⚠ не смог сохранить результат: {e}")
+            olog(f"[weekly_ema_backtest] ⚠ не смог сохранить результат: {_explain_error(e)}")
         with _weekly_ema_backtest_jobs_lock:
             if job_id in _weekly_ema_backtest_jobs:
                 _weekly_ema_backtest_jobs[job_id]["status"] = "done"
                 _weekly_ema_backtest_jobs[job_id]["result"] = payload
     except Exception as e:
-        olog(f"[weekly_ema_backtest] задача {job_id} упала: {e}")
+        olog(f"[weekly_ema_backtest] задача {job_id} упала: {_explain_error(e)}")
         with _weekly_ema_backtest_jobs_lock:
             if job_id in _weekly_ema_backtest_jobs:
                 _weekly_ema_backtest_jobs[job_id]["status"] = "error"
-                _weekly_ema_backtest_jobs[job_id]["result"] = {"ok": False, "msg": f"Внутренняя ошибка: {e}"}
+                _weekly_ema_backtest_jobs[job_id]["result"] = {"ok": False, "msg": f"Внутренняя ошибка: {_explain_error(e)}"}
 # ─── конец Weekly EMA Backtest ──────────────────────────────────────────────
 
 # ─── EMA Diagnostics: система сбора данных для анализа алгоритма ───────────
@@ -6317,7 +6366,7 @@ def _diag_save():
             json.dump(trimmed, f)
         os.replace(tmp_path, DIAG_FILE)
     except Exception as e:
-        olog(f"[ema_diag] ⚠ не смог сохранить {DIAG_FILE}: {e}")
+        olog(f"[ema_diag] ⚠ не смог сохранить {DIAG_FILE}: {_explain_error(e)}")
 
 
 def _diag_load():
@@ -6336,7 +6385,7 @@ def _diag_load():
                 olog(f"[ema_diag] история подхвачена с диска: {len(loaded)} записей, "
                      f"из них ещё отслеживается {still_open}")
     except Exception as e:
-        olog(f"[ema_diag] ⚠ не смог подхватить историю с диска: {e}")
+        olog(f"[ema_diag] ⚠ не смог подхватить историю с диска: {_explain_error(e)}")
 
 
 def _diag_scan_loop():
@@ -6356,7 +6405,7 @@ def _diag_scan_loop():
                     try:
                         new_records = _diag_check_symbol(symbol, tf)
                     except Exception as e:
-                        olog(f"[ema_diag] {symbol} {tf}: ошибка проверки: {e}")
+                        olog(f"[ema_diag] {symbol} {tf}: ошибка проверки: {_explain_error(e)}")
                         continue
                     if not new_records:
                         continue
@@ -6375,7 +6424,7 @@ def _diag_scan_loop():
                 olog(f"[ema_diag] скан завершён: +{added} новых записей "
                      f"(всего в истории {len(_diag_records)})")
         except Exception as e:
-            olog(f"[ema_diag] ошибка цикла сканирования: {e}")
+            olog(f"[ema_diag] ошибка цикла сканирования: {_explain_error(e)}")
         time.sleep(DIAG_SCAN_POLL_SEC)
 
 
@@ -6405,7 +6454,7 @@ def _diag_track_loop():
                             try:
                                 price_cache[sym] = _gate_get_price(sym)
                             except Exception as e:
-                                olog(f"[ema_diag_track] {sym}: ошибка получения цены: {e}")
+                                olog(f"[ema_diag_track] {sym}: ошибка получения цены: {_explain_error(e)}")
                                 price_cache[sym] = None
                         price = price_cache[sym]
                         if not price or not rec.get("price"):
@@ -6432,12 +6481,12 @@ def _diag_track_loop():
                             rec["track_done"] = True
                     except Exception as e:
                         olog(f"[ema_diag_track] ⚠ пропущена битая запись "
-                             f"({rec.get('symbol','?')}): {e}")
+                             f"({rec.get('symbol','?')}): {_explain_error(e)}")
                         continue
                 if changed:
                     _diag_save()
         except Exception as e:
-            olog(f"[ema_diag_track] ошибка цикла: {e}")
+            olog(f"[ema_diag_track] ошибка цикла: {_explain_error(e)}")
         time.sleep(DIAG_TRACK_POLL_SEC)
 DIAG_BOUNCE_THRESHOLD_PCT = 1.0   # от какого MFE считаем, что реально "отскочило", а не шум
 
@@ -6526,7 +6575,7 @@ def _load_alert_cfg():
     except FileNotFoundError:
         pass
     except Exception as e:
-        olog(f"⚠ Не удалось прочитать {ALERT_CFG_PATH}: {e}")
+        olog(f"⚠ Не удалось прочитать {ALERT_CFG_PATH}: {_explain_error(e)}")
 
 def _save_alert_cfg():
     try:
@@ -6536,7 +6585,7 @@ def _save_alert_cfg():
                        "watchdog_enabled": WATCHDOG_ENABLED,
                        "watchdog_timeout_min": WATCHDOG_TIMEOUT_MIN}, f)
     except Exception as e:
-        olog(f"⚠ Не удалось сохранить {ALERT_CFG_PATH}: {e}")
+        olog(f"⚠ Не удалось сохранить {ALERT_CFG_PATH}: {_explain_error(e)}")
 
 def _test_alert():
     """Шлёт тестовое уведомление и честно проверяет, дошло ли оно."""
@@ -6554,7 +6603,7 @@ def _test_alert():
             else:
                 errs.append("Telegram: " + j.get("description","неизвестная ошибка"))
         except Exception as e:
-            errs.append(f"Telegram: {e}")
+            errs.append(f"Telegram: {_explain_error(e)}")
     if NTFY_URL:
         try:
             r = requests.post(NTFY_URL, data=msg.encode(), timeout=8)
@@ -6563,7 +6612,7 @@ def _test_alert():
             else:
                 errs.append(f"ntfy: HTTP {r.status_code}")
         except Exception as e:
-            errs.append(f"ntfy: {e}")
+            errs.append(f"ntfy: {_explain_error(e)}")
     return ok_any, ("; ".join(errs) if errs else None)
 
 # ─── Watchdog пропажи интернета ──────────────────────────────────────────────
@@ -6617,7 +6666,7 @@ def _watchdog_loop():
             # поток watchdog навсегда, без единой строчки в лог — мониторинг
             # связи с интернетом просто переставал бы работать до
             # следующего перезапуска, и никто бы не узнал почему.
-            olog(f"[watchdog] ошибка цикла: {e}")
+            olog(f"[watchdog] ошибка цикла: {_explain_error(e)}")
 
 # ─── Heartbeat healthchecks.io ────────────────────────────────────────────────
 HEARTBEAT_INTERVAL_SEC = 300
@@ -6653,7 +6702,7 @@ def _shutdown_pool_safely(pool):
     try:
         pool.shutdown(wait=True, cancel_futures=True)
     except Exception as e:
-        olog(f"⚠ pool.shutdown: {e}")
+        olog(f"⚠ pool.shutdown: {_explain_error(e)}")
     if _POOL_TYPE == "process":
         try:
             for proc in (getattr(pool, "_processes", {}) or {}).values():
@@ -6662,7 +6711,7 @@ def _shutdown_pool_safely(pool):
                     proc.terminate()
                     proc.join(timeout=3)
         except Exception as e:
-            olog(f"⚠ pool cleanup: {e}")
+            olog(f"⚠ pool cleanup: {_explain_error(e)}")
     import gc
     gc.collect()
 
@@ -6996,7 +7045,7 @@ def _pm_fetch_candles_window(symbol, start_ts, end_ts, interval="1m"):
             time.sleep(0.1)
         except Exception as e:
             fail_count += 1
-            olog(f"[pump_match] fetch ошибка: {e}")
+            olog(f"[pump_match] fetch ошибка: {_explain_error(e)}")
             if fail_count >= 5:
                 break
             time.sleep(1)
@@ -7106,7 +7155,7 @@ def _pm_try_variant(candles, base_price, ref_g, ref_r, ref_balance, vm, src, src
         balance_score = 1.0 - abs(ref_balance - cand_balance)
     except Exception as e:
         olog(f"[pump_match] вариант vm={vm} src={src}/{src_slow} method={method} "
-             f"ep={ep}/{ep_slow} ff={ff} упал: {e}")
+             f"ep={ep}/{ep_slow} ff={ff} упал: {_explain_error(e)}")
         return []
     position_score = (sg + sr) / 2
     # v0.3.0: приоритет явно сдвинут на форму волны (по прямому запросу) —
@@ -7144,7 +7193,7 @@ def _pump_match_run(image_bytes, symbol, search_start_ts, search_end_ts,
     try:
         ref_img = Image.open(io.BytesIO(image_bytes))
     except Exception as e:
-        return {"ok": False, "msg": f"Не смог открыть картинку: {e}"}
+        return {"ok": False, "msg": f"Не смог открыть картинку: {_explain_error(e)}"}
 
     cropped = _pm_autocrop_chart(ref_img) or ref_img.convert("RGB")
     ref_g, ref_r = _pm_color_profile(cropped)
@@ -7287,11 +7336,11 @@ def _pump_match_run_background(job_id, image_bytes, symbol, search_start_ts, sea
                 _pump_match_jobs[job_id]["status"] = "done"
                 _pump_match_jobs[job_id]["result"] = result
     except Exception as e:
-        olog(f"[pump_match] задача {job_id} упала: {e}")
+        olog(f"[pump_match] задача {job_id} упала: {_explain_error(e)}")
         with _pump_match_jobs_lock:
             if job_id in _pump_match_jobs:
                 _pump_match_jobs[job_id]["status"] = "error"
-                _pump_match_jobs[job_id]["result"] = {"ok": False, "msg": f"Внутренняя ошибка: {e}"}
+                _pump_match_jobs[job_id]["result"] = {"ok": False, "msg": f"Внутренняя ошибка: {_explain_error(e)}"}
 
 
 EMA_DIAG_HTML_PAGE = """<!DOCTYPE html>
@@ -8102,7 +8151,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length",0))
             body   = json.loads(self.rfile.read(length)) if length else {}
         except Exception as e:
-            self._json({"ok":False,"msg":f"bad request: {e}"}); return
+            self._json({"ok":False,"msg":f"bad request: {_explain_error(e)}"}); return
 
         if self.path == "/alert_cfg":
             global TG_TOKEN, TG_CHAT, NTFY_URL, WATCHDOG_ENABLED, WATCHDOG_TIMEOUT_MIN, HC_URL
@@ -8127,7 +8176,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if not (1 <= top_n <= 500):
                     raise ValueError("вне диапазона 1-500")
             except (TypeError, ValueError) as e:
-                self._json({"ok": False, "msg": f"Некорректное значение top_n: {e}"}); return
+                self._json({"ok": False, "msg": f"Некорректное значение top_n: {_explain_error(e)}"}); return
             _save_scan_settings(top_n)
             self._json({"ok": True, "top_n": _get_scan_top_n()})
 
@@ -8231,7 +8280,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     with ema_auto_trade_lock:
                         ema_auto_trade_state["forced_size_max_multiple"] = fsm
             except Exception as e:
-                self._json({"ok": False, "msg": f"Некорректные параметры: {e}"}); return
+                self._json({"ok": False, "msg": f"Некорректные параметры: {_explain_error(e)}"}); return
             _save_ema_auto_trade_cfg()
             with ema_auto_trade_lock:
                 olog(f"[ema_auto_trade] настройки обновлены: {dict(ema_auto_trade_state)}")
@@ -8260,7 +8309,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 thresholds = sorted(float(t) for t in thresholds_raw)
                 custom_symbols = body.get("symbols")  # необязательный явный список вместо топ-N
             except (TypeError, ValueError) as e:
-                self._json({"ok": False, "msg": f"Некорректные параметры: {e}"}); return
+                self._json({"ok": False, "msg": f"Некорректные параметры: {_explain_error(e)}"}); return
             if custom_symbols and isinstance(custom_symbols, list):
                 symbols = [s.strip().upper() for s in custom_symbols if s.strip()]
             else:
@@ -8320,7 +8369,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 search_start_ts = time.mktime(search_start_dt.timetuple())
                 search_end_ts = time.mktime(search_end_dt.timetuple())
             except Exception as e:
-                self._json({"ok": False, "msg": f"Не смог разобрать дату/диапазон поиска: {e}"}); return
+                self._json({"ok": False, "msg": f"Не смог разобрать дату/диапазон поиска: {_explain_error(e)}"}); return
             if search_end_ts <= search_start_ts:
                 self._json({"ok": False, "msg": "Конец диапазона поиска должен быть позже начала"}); return
 
@@ -8340,9 +8389,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ).start()
             self._json({"ok": True, "job_id": job_id})
         except Exception as e:
-            olog(f"[pump_match] ⚠ ошибка обработки запроса: {e}")
+            olog(f"[pump_match] ⚠ ошибка обработки запроса: {_explain_error(e)}")
             try:
-                self._json({"ok": False, "msg": f"Внутренняя ошибка: {e}"})
+                self._json({"ok": False, "msg": f"Внутренняя ошибка: {_explain_error(e)}"})
             except Exception:
                 pass
 
@@ -8401,7 +8450,7 @@ def main():
         # неожиданная ошибка в serve_forever() убивала процесс без единой
         # строчки лога о причине. Теперь хотя бы напечатаем и пробросим
         # дальше — внешний while-цикл ниже перезапустит main() сам.
-        print(f"{_C_RED}main() упал: {e}{_C_RST}", flush=True)
+        print(f"{_C_RED}main() упал: {_explain_error(e)}{_C_RST}", flush=True)
         try:
             server.shutdown()
         except Exception:
@@ -8427,6 +8476,6 @@ if __name__ == "__main__":
             break  # server.serve_forever() вышел штатно (KeyboardInterrupt) — не перезапускаем
         except Exception as e:
             _restart_count += 1
-            print(f"{_C_RED}Процесс упал ({_restart_count}-й раз): {e} — "
+            print(f"{_C_RED}Процесс упал ({_restart_count}-й раз): {_explain_error(e)} — "
                   f"перезапуск через 10с{_C_RST}", flush=True)
             time.sleep(10)
