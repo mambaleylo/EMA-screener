@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.1 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.2 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.2: по прямому вопросу — "недостаточно истории" (новый листинг)
+  кэшируется на 3 дня (EMA_TOUCH_INSUFFICIENT_HISTORY_RECHECK_SEC), чтобы
+  не дёргать биржу зря на заведомо молодых монетах — само перепроверяется
+  через 3 дня, без участия пользователя. Но если ждать не хочется (монета
+  только что перевалила за нужный возраст) — новый /recheck_history
+  (POST, symbol=XXX или пусто для всех) сбрасывает кэш "недостаточно" для
+  конкретной монеты или сразу для всех — следующий скан перепроверит
+  заново. Кнопка на главной странице рядом с настройками отбора. Не
+  трогает монеты, для которых история УЖЕ подтверждена достаточной —
+  только записи именно "insufficient". Проверено тестом.
 - v0.30.1: ПОЛНАЯ ПЕРЕРАБОТКА логики отбора монет по прямому запросу.
   Найдена настоящая причина, почему настройка top_n "непонятно что
   делает": в _fetch_all_symbols() было ДВА отдельных, зашитых прямо в код
@@ -864,7 +874,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.1"
+APP_VERSION  = "0.30.2"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2967,7 +2977,12 @@ details[open] summary:before{content:"▾ "}
       <span id="scanSettingsMsg" style="font-size:12px;color:#8b949e"></span>
     </div>
   </div>
-  <p style="font-size:11px;color:#6e7681;margin:10px 0 0">Монеты без достаточной недельной/дневной истории (новые листинги) автоматически пропускаются при поиске EMA-сигналов, даже если прошли порог ликвидности.</p>
+  <p style="font-size:11px;color:#6e7681;margin:10px 0 0">Монеты без достаточной недельной/дневной истории (новые листинги) автоматически пропускаются при поиске EMA-сигналов, даже если прошли порог ликвидности — перепроверяется само раз в 3 дня.</p>
+  <div style="display:flex;gap:8px;margin-top:8px;align-items:center;flex-wrap:wrap">
+    <input type="text" id="recheckSymbolInput" placeholder="SYMBOL_USDT (пусто = все)" style="width:170px;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:8px;font-size:13px">
+    <button onclick="recheckHistory()" style="margin:0;background:#21262d;border:1px solid #30363d">Перепроверить сейчас</button>
+    <span id="recheckMsg" style="font-size:12px;color:#8b949e"></span>
+  </div>
 </div>
 <div id="status"></div>
 
@@ -3108,6 +3123,18 @@ async function saveScanSettings(){
   }catch(e){ msg.style.color = '#f85149'; msg.innerText = 'Ошибка запроса'; }
 }
 loadScanSettings();
+
+async function recheckHistory(){
+  const msg = document.getElementById('recheckMsg');
+  const symbol = document.getElementById('recheckSymbolInput').value.trim();
+  try{
+    const r = await fetch('/recheck_history', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(symbol ? {symbol} : {})});
+    const d = await r.json();
+    msg.style.color = d.ok ? '#3fb950' : '#f85149';
+    msg.innerText = d.ok ? `Сброшено записей: ${d.reset} — перепроверится на следующем скане` : (d.msg || 'Ошибка');
+  }catch(e){ msg.style.color = '#f85149'; msg.innerText = 'Ошибка запроса'; }
+}
 
 let _wakeLock = null;
 function _requestFullscreenCompat(el){
@@ -8303,6 +8330,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 _save_weekly_ema_history()
             olog("[weekly_ema] история EMA-сигналов очищена вручную")
             self._json({"ok": True})
+
+        elif self.path == "/recheck_history":
+            # v0.30.2: по прямому вопросу — "недостаточно истории" кэшируется
+            # на 3 дня (EMA_TOUCH_INSUFFICIENT_HISTORY_RECHECK_SEC), чтобы не
+            # дёргать биржу зря на заведомо молодых монетах. Если монета
+            # только что перевалила за нужный возраст, а ждать до 3 дней не
+            # хочется — сбрасываем кэш здесь, следующий скан перепроверит
+            # заново. symbol=XXX — конкретная монета; без параметра — все
+            # записи с insufficient=True разом.
+            symbol = body.get("symbol") if isinstance(body, dict) else None
+            with _ema_touch_ctx_lock:
+                if symbol:
+                    removed = 0
+                    for tf in ("1d", "1w"):
+                        key = f"{symbol}|{tf}"
+                        if key in _ema_touch_ctx_cache and _ema_touch_ctx_cache[key].get("insufficient"):
+                            del _ema_touch_ctx_cache[key]
+                            removed += 1
+                else:
+                    stale_keys = [k for k, v in _ema_touch_ctx_cache.items() if v.get("insufficient")]
+                    for k in stale_keys:
+                        del _ema_touch_ctx_cache[k]
+                    removed = len(stale_keys)
+            olog(f"[weekly_ema] перепроверка истории запрошена вручную "
+                 f"({'монета ' + symbol if symbol else 'все монеты'}) — сброшено записей: {removed}")
+            self._json({"ok": True, "reset": removed})
 
         elif self.path == "/pump_history_clear":
             with _get_history_file_lock(PUMP_DETECT_HISTORY_FILE):
