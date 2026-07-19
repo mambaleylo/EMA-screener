@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.2 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.3 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.3: реальная находка на вопрос "а не часто ли 60 секунд" — v0.30.1
+  случайно удвоила сетевые запросы в _pump_detect_loop: и
+  _pump_fetch_tickers_snapshot(), и добавленный тогда _fetch_all_symbols()
+  оба дёргают один и тот же /tickers каждый цикл — при нестабильном
+  интернете лишний риск обрыва на пустом месте, хотя докстринг функции
+  прямо обещал "один запрос". Починено: _pump_fetch_tickers_snapshot()
+  теперь захватывает ещё и bid/ask (не только price/volume), и новая
+  _filter_liquid_symbols_from_snapshot() считает фильтр ликвидности на
+  ТОМ ЖЕ снапшоте — без второго похода в сеть. Снова ровно один запрос за
+  цикл, как и было изначально задумано. Проверено тестом — ровно один
+  вызов requests.get() за цикл.
 - v0.30.2: по прямому вопросу — "недостаточно истории" (новый листинг)
   кэшируется на 3 дня (EMA_TOUCH_INSUFFICIENT_HISTORY_RECHECK_SEC), чтобы
   не дёргать биржу зря на заведомо молодых монетах — само перепроверяется
@@ -874,7 +885,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.2"
+APP_VERSION  = "0.30.3"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4114,10 +4125,16 @@ _pump_detect_state  = {}   # symbol -> {"last_alert_ts": float, "last_pct": floa
 
 
 def _pump_fetch_tickers_snapshot():
-    """Один запрос ко всем тикерам Gate.io Futures USDT — даёт last price
-    и 24h-объём разом по всем контрактам. Так же дёшево, как один вызов
-    _fetch_all_symbols, но нам тут нужна ещё и сама цена (last), которую
-    _fetch_all_symbols не возвращает наружу."""
+    """Один запрос ко всем тикерам Gate.io Futures USDT — даёт last price,
+    24h-объём И bid/ask (для фильтра ликвидности) разом по всем контрактам.
+    v0.30.3: реальная находка на вопрос "а не часто ли 60 секунд" — раньше
+    (с v0.30.1) _pump_detect_loop ДОПОЛНИТЕЛЬНО вызывал _fetch_all_symbols(),
+    который делает СВОЙ ЖЕ отдельный запрос на тот же самый /tickers —
+    получалось два сетевых похода за цикл вместо одного, при нестабильном
+    интернете лишний риск на пустом месте. Теперь bid/ask тоже здесь, и
+    фильтр ликвидности считается по этому ЖЕ снапшоту (см.
+    _filter_liquid_symbols_from_snapshot) — снова ровно один запрос за
+    цикл, как и было изначально задумано."""
     try:
         r = requests.get(f"{GATE_API}/futures/usdt/tickers", timeout=15)
         if r.status_code != 200:
@@ -4136,15 +4153,36 @@ def _pump_fetch_tickers_snapshot():
                 px = float(t.get("last") or t.get("mark_price") or 0)
                 vol = float(t.get("volume_24h_usd") or t.get("volume_24h_quote")
                              or t.get("volume_24h") or 0)
+                bid = float(t.get("highest_bid") or 0)
+                ask = float(t.get("lowest_ask") or 0)
             except (TypeError, ValueError):
                 continue
             if px <= 0:
                 continue
-            out[contract] = {"price": px, "vol24": vol}
+            out[contract] = {"price": px, "vol24": vol, "bid": bid, "ask": ask}
         return out
     except Exception as e:
         olog(f"[pump_detect] ошибка запроса tickers: {_explain_error(e)}")
         return {}
+
+
+def _filter_liquid_symbols_from_snapshot(snapshot):
+    """Тот же фильтр по ликвидности (объём/спред), что в _fetch_all_symbols,
+    но работает на уже готовом снапшоте — не делает свой отдельный сетевой
+    запрос. Используется _pump_detect_loop, чтобы не дублировать один и
+    тот же /tickers дважды за цикл."""
+    min_volume_usd, max_spread_pct = _get_liquidity_thresholds()
+    qualifying = []
+    for contract, t in snapshot.items():
+        if t.get("vol24", 0) < min_volume_usd:
+            continue
+        bid, ask = t.get("bid", 0), t.get("ask", 0)
+        if bid <= 0 or ask <= 0 or ask < bid:
+            continue
+        spread_pct = (ask - bid) / ((ask + bid) / 2) * 100
+        if spread_pct <= max_spread_pct:
+            qualifying.append(contract)
+    return qualifying
 
 
 def _pump_update_history(snapshot, top_symbols):
@@ -4978,16 +5016,16 @@ def _pump_detect_loop():
         try:
             snapshot = _pump_fetch_tickers_snapshot()
             if snapshot:
-                # v0.30.1: раньше здесь была ОТДЕЛЬНАЯ, дублирующая логика
-                # отбора (сортировка по объёму + свой пул с запасом x3) —
-                # своя интерпретация "топ-N", не связанная с настоящим
-                # порогом ликвидности (спред тут вообще не проверялся).
-                # Теперь используем ОДИН источник истины — _fetch_all_symbols()
-                # (порог объёма/спреда, настраиваемый, без ранговой обрезки) —
-                # и просто пересекаем с тем, что реально есть в снапшоте цен.
-                liquid = set(_fetch_all_symbols())
+                # v0.30.3: реальная находка — v0.30.1 добавила здесь вызов
+                # _fetch_all_symbols(), который делает СВОЙ отдельный запрос
+                # на тот же /tickers — получалось два сетевых похода за
+                # цикл вместо одного (замечено на вопрос "а не часто ли 60
+                # секунд" — при нестабильном интернете лишний риск на
+                # пустом месте). Теперь фильтр ликвидности считается на ТОМ
+                # ЖЕ снапшоте, что уже получили — снова один запрос за цикл.
+                liquid = set(_filter_liquid_symbols_from_snapshot(snapshot))
                 qualifying = [s for s in snapshot.keys() if s in liquid and _has_sufficient_ema_history(s)]
-                top_symbols = sorted(qualifying, key=lambda s: snapshot[s]["vol24"], reverse=True)
+                top_symbols = sorted(qualifying, key=lambda s: snapshot[s]["vol24"], reverse=True)[:_get_scan_top_n()]
                 _pump_update_history(snapshot, top_symbols)
                 now = time.time()
                 for sym in top_symbols:
