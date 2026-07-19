@@ -1,7 +1,23 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.29.13 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.29.14 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.29.14: по запросу — нестабильный интернет, частые обрывы, нужна
+  "бесшовность" (не стартовать проход заново из-за одного сбоя). Аудит
+  всех фоновых циклов на предмет "обрыв на одной монете валит весь
+  оставшийся проход": _vol_peak_find_loop, _vol_peak_watch_loop,
+  _diag_scan_loop, _diag_track_loop, _pump_dump_track_loop,
+  _vol_anomaly_track_loop — уже все были с защитой на каждую монету/запись
+  отдельно (внутренние try/except в задействованных функциях или прямо в
+  цикле). Единственный реальный пробел — _pump_detect_loop: обход монет
+  шёл БЕЗ своей защиты на каждую; если сеть оборвётся именно во время
+  _pump_fire_alert/_dump_fire_alert (свечи для картинки + отправка в
+  Telegram — оба сетевые), исключение улетало во внешний try/except и
+  обрывало ВЕСЬ оставшийся проход — монеты дальше по списку в этом цикле
+  просто пропускались, не только та, что вызвала сбой. Добавлена защита
+  на каждую монету отдельно — сосед по списку больше не страдает из-за
+  чужого сбоя. Проверено тестом: имитация обрыва сети на одной из пяти
+  монет — обработка доходит до всех пяти, не останавливается на второй.
 - v0.29.13: реальная находка (AKE_USDT) — "утром был сигнал где пик более
   большой появился, но как ориентир не применился". Причина: проверка
   "обнаружено задним числом" (v0.28.1) полностью ОТБРАСЫВАЛА кандидата
@@ -812,7 +828,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.29.13"
+APP_VERSION  = "0.29.14"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4817,22 +4833,36 @@ def _pump_detect_loop():
                 _pump_update_history(snapshot, top_symbols)
                 now = time.time()
                 for sym in top_symbols:
-                    pump_res = _pump_detect_check(sym)
-                    if pump_res:
-                        with _pump_detect_lock:
-                            last_alert = _pump_detect_state.get(sym, {}).get("last_alert_ts", 0)
-                        if now - last_alert >= PUMP_DETECT_COOLDOWN_SEC:
-                            _pump_fire_alert(sym, pump_res)
+                    try:
+                        # v0.29.14: по запросу — нестабильный интернет,
+                        # частые обрывы. Раньше на каждую монету не было
+                        # своей защиты: если сеть оборвётся именно во время
+                        # _pump_fire_alert/_dump_fire_alert (свечи для
+                        # картинки + отправка в Telegram — оба сетевые), это
+                        # исключение улетало во ВНЕШНИЙ try/except и обрывало
+                        # ВЕСЬ оставшийся проход — монеты дальше по списку в
+                        # этом цикле просто пропускались, а не только та,
+                        # что вызвала ошибку. Теперь одна монета — своя
+                        # защита, соседи по списку не страдают из-за неё.
+                        pump_res = _pump_detect_check(sym)
+                        if pump_res:
                             with _pump_detect_lock:
-                                _pump_detect_state[sym] = {"last_alert_ts": now, "last_pct": pump_res["pct"]}
-                    dump_res = _dump_detect_check(sym)
-                    if dump_res:
-                        with _pump_detect_lock:
-                            last_alert = _dump_detect_state.get(sym, {}).get("last_alert_ts", 0)
-                        if now - last_alert >= DUMP_DETECT_COOLDOWN_SEC:
-                            _dump_fire_alert(sym, dump_res)
+                                last_alert = _pump_detect_state.get(sym, {}).get("last_alert_ts", 0)
+                            if now - last_alert >= PUMP_DETECT_COOLDOWN_SEC:
+                                _pump_fire_alert(sym, pump_res)
+                                with _pump_detect_lock:
+                                    _pump_detect_state[sym] = {"last_alert_ts": now, "last_pct": pump_res["pct"]}
+                        dump_res = _dump_detect_check(sym)
+                        if dump_res:
                             with _pump_detect_lock:
-                                _dump_detect_state[sym] = {"last_alert_ts": now, "last_pct": dump_res["pct"]}
+                                last_alert = _dump_detect_state.get(sym, {}).get("last_alert_ts", 0)
+                            if now - last_alert >= DUMP_DETECT_COOLDOWN_SEC:
+                                _dump_fire_alert(sym, dump_res)
+                                with _pump_detect_lock:
+                                    _dump_detect_state[sym] = {"last_alert_ts": now, "last_pct": dump_res["pct"]}
+                    except Exception as e:
+                        olog(f"[pump_detect] {sym}: ошибка обработки, пропускаем монету, продолжаем со следующей: {e}")
+                        continue
         except Exception as e:
             olog(f"[pump_detect] ошибка цикла: {e}")
         time.sleep(PUMP_DETECT_POLL_SEC)
