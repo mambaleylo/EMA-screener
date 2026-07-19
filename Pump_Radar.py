@@ -1,7 +1,20 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.3 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.4 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.4: ещё один проход аудита по запросу — на этот раз в основном
+  подтверждение, что всё в порядке, а не новые баги. Проверено и НЕ
+  подтвердилось проблемой: порядок захвата блокировок в replace-логике
+  Volume Peak Watcher (_vol_peak_lock снаружи, _log_lock внутри через
+  olog — везде в одном порядке, дедлок невозможен), устойчивость
+  _has_sufficient_ema_history к временным сетевым сбоям (fail-open — не
+  выкидывает монету из отбора зря), парсинг JSON в POST-запросах (битое
+  тело корректно ловится, сервер не падает), корректность
+  _pump_update_history с новым источником монет (v0.30.1). Единственная
+  находка — не баг, а лишний код: в _weekly_ema_touch_loop (спящая,
+  сейчас не запускается) и _diag_scan_loop список монет обрезался
+  повторно тем же потолком, который _fetch_all_symbols() уже применяет
+  внутри себя — безвредно, но лишне, убрано для ясности.
 - v0.30.3: реальная находка на вопрос "а не часто ли 60 секунд" — v0.30.1
   случайно удвоила сетевые запросы в _pump_detect_loop: и
   _pump_fetch_tickers_snapshot(), и добавленный тогда _fetch_all_symbols()
@@ -885,7 +898,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.3"
+APP_VERSION  = "0.30.4"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -6067,7 +6080,7 @@ def _weekly_ema_touch_loop():
     _load_weekly_ema_history()
     while True:
         try:
-            symbols = _fetch_all_symbols()[:_get_scan_top_n()]
+            symbols = _fetch_all_symbols()  # v0.30.4: потолок уже применён внутри, повторная обрезка была лишней
             now = time.time()
             for symbol in symbols:
                 for tf in EMA_TOUCH_TIMEFRAMES:
@@ -6545,7 +6558,7 @@ def _diag_scan_loop():
     time.sleep(60)
     while True:
         try:
-            symbols = _fetch_all_symbols()[:_get_scan_top_n()]
+            symbols = _fetch_all_symbols()  # v0.30.4: потолок уже применён внутри, повторная обрезка была лишней
             added = 0
             for symbol in symbols:
                 for tf in DIAG_TIMEFRAMES:
