@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.19 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.20 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.20: по запросу — таймаут на запросы к Gate.io (тикеры/свечи, 4
+  места) увеличен с 15 до 20 секунд. Не про надёжность (обрывы и так уже
+  не валят весь скан, см. v0.29.14) — просто меньше ложных таймаутов в
+  логах при нестабильной, но рабочей сети. ntfy/Telegram не тронуты —
+  это была жалоба конкретно про Gate.io.
 - v0.30.19: реальная находка — v0.29.5 намеренно рисовала зелёный маркер
   по ТОЧНОЙ цене сигнала (signal_price), а не по последней свече из
   отдельного, чуть более раннего запроса свечей для картинки — это
@@ -1082,7 +1087,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.19"
+APP_VERSION  = "0.30.20"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -1984,7 +1989,7 @@ def _fetch_all_symbols():
     крайняя защита от перегрузки (дефолт 800, заведомо выше размера всей
     биржи, обычно не срабатывает вообще)."""
     try:
-        r = requests.get(f"{GATE_API}/futures/usdt/tickers", timeout=15)
+        r = requests.get(f"{GATE_API}/futures/usdt/tickers", timeout=20)
         if r.status_code != 200: return []
         data = r.json()
         if not isinstance(data, list): return []
@@ -2048,7 +2053,7 @@ def _fetch_candles(symbol, tf, days, _stop_event=None, offset_days=0):
         try:
             r = requests.get(f"{GATE_API}/futures/usdt/candlesticks",
                 params={"contract":symbol,"interval":tf,"from":current_from,"limit":LIMIT},
-                timeout=15)
+                timeout=20)
             if r.status_code != 200:
                 fail_count += 1
                 olog(f"⚠ Gate.io {r.status_code} для {symbol}: {r.text[:200]}")
@@ -4413,7 +4418,7 @@ def _pump_fetch_tickers_snapshot():
     _filter_liquid_symbols_from_snapshot) — снова ровно один запрос за
     цикл, как и было изначально задумано."""
     try:
-        r = requests.get(f"{GATE_API}/futures/usdt/tickers", timeout=15)
+        r = requests.get(f"{GATE_API}/futures/usdt/tickers", timeout=20)
         if r.status_code != 200:
             return {}
         data = r.json()
@@ -7775,7 +7780,7 @@ def _pm_fetch_candles_window(symbol, start_ts, end_ts, interval="1m"):
                 f"{GATE_API}/futures/usdt/candlesticks",
                 params={"contract": symbol, "interval": interval,
                         "from": current_from, "limit": 999},
-                timeout=15,
+                timeout=20,
             )
             if r.status_code != 200:
                 fail_count += 1
