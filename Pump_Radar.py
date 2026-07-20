@@ -1,7 +1,22 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.7 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.8 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.8: по запросу — фильтр по объёму в момент касания EMA, на
+  основании диагностики (5000 записей, разбор с пользователем): при
+  vol_ratio > 1.2 отскок случается заметно чаще (SHORT 45.5% против
+  27.7%, n=995/1893; LONG 43.6% против 24.7%, n=599/1454) — эффект
+  держится симметрично в обе стороны, самый чёткий из всех проверенных
+  факторов (структура тренда "лесенка" при повторной проверке оказалась
+  контринтуитивной — не используется как фильтр). _ema_touch_check_symbol
+  теперь считает vol_ratio для КАЖДОГО касания (переиспользует уже
+  существующую _vol_ratio, ту же, что в диагностике — методология
+  идентична), _weekly_ema_fire_alert добавляет предупреждение в текст
+  сигнала, если объём в моменте не подтверждён порогом. Не блокирует
+  сигнал полностью (обычный объём даёт ~27%, не ноль) — явно помечает.
+  vol_ratio сохраняется в саму запись сигнала для дальнейшего анализа.
+  Проверено тестом: пометка появляется при vol_ratio≤1.2, отсутствует
+  при vol_ratio>1.2.
 - v0.30.7: по запросу — уведомления о голых пампах/дампах отключены по
   умолчанию (PUMP_DUMP_ALERTS_ENABLED=False), "пока", легко включить
   обратно (переключатель на главной странице + через /alert_cfg). Сам
@@ -937,7 +952,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.7"
+APP_VERSION  = "0.30.8"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -5710,6 +5725,7 @@ WEEKLY_EMA_TOUCH_ATR = 0.25       # тот же допуск касания на
 # конкретную волатильность монеты вместо фиксированного % для всех.
 EMA_TOUCH_STOP_ATR_MULT = 1.5     # стоп = цена входа ± 1.5×ATR(14) этого ТФ
 EMA_TOUCH_RR = 1.5                # тейк = стоп-дистанция × RR в прибыльную сторону
+VOL_RATIO_CONFIDENCE_THRESHOLD = 1.2   # v0.30.8: порог из диагностики (5000 записей) — выше него отскок заметно надёжнее
 # v0.11.0: раньше опрос был раз в 30 минут — по прямому фидбеку со скрина
 # ("сигнал приходит не тогда, когда надо, цена уже упала") это было СЛИШКОМ
 # редко: между проверками цена может уйти далеко от EMA. Причина 30 минут
@@ -5924,7 +5940,7 @@ def _ema_touch_check_symbol(symbol, tf="1w"):
                 "ladder": ladder, "side": side, "classic_bias": classic_bias,
                 "entry": _round_price(entry), "stop": _round_price(stop),
                 "take": _round_price(take), "rr": EMA_TOUCH_RR, "levels": levels,
-                "week_t": candles[i]["t"],
+                "week_t": candles[i]["t"], "vol_ratio": _vol_ratio(candles, i),
                 "candles": candles, "ema_arrays": ema_arrays, "bar_i": i,
                 "live_ema_values": live_ema_values, "live_t": int(time.time()),
             })
@@ -6103,6 +6119,18 @@ def _vol_peak_historical_winrate(tf, period):
 
 
 def _weekly_ema_fire_alert(touch, confidence_note=None, triggered_by=None):
+    # v0.30.8: по запросу — фильтр по объёму в момент касания, на
+    # реальных данных диагностики (5000 записей): при vol_ratio > 1.2
+    # отскок случается заметно чаще (SHORT 45.5% против 27.7% на обычном
+    # объёме, n=995/1893; LONG 43.6% против 24.7%, n=599/1454) — эффект
+    # держится симметрично в обе стороны. Не блокируем сигнал полностью
+    # (даже на обычном объёме отскок не редкость, ~27%), но чётко
+    # помечаем, когда объём в моменте не подтверждён.
+    if touch.get("vol_ratio") is not None and touch["vol_ratio"] <= VOL_RATIO_CONFIDENCE_THRESHOLD:
+        vol_note = (f"объём в момент касания не повышен (vol_ratio={touch['vol_ratio']}) — "
+                    f"на диагностике касания с обычным объёмом отскакивали заметно реже "
+                    f"(~27% против ~45% при повышенном объёме)")
+        confidence_note = f"{confidence_note}; {vol_note}" if confidence_note else vol_note
     # v0.30.6: если сигнал пришёл от Volume Peak Watcher, добавляем
     # реальную статистику по этой же связке (ТФ/период), если данных
     # накопилось достаточно — иначе молчим, не гадаем на 2-3 сделках.
@@ -6151,6 +6179,7 @@ def _weekly_ema_fire_alert(touch, confidence_note=None, triggered_by=None):
            "side": touch["side"], "classic_bias": touch["classic_bias"],
            "entry": touch["entry"], "stop": touch["stop"], "take": touch["take"],
            "rr": touch["rr"], "confidence_note": confidence_note, "triggered_by": triggered_by,
+           "vol_ratio": touch.get("vol_ratio"),
            "outcome": "open", "resolved_at": None, "resolved_price": None}
     global _weekly_ema_recent
     # v0.29.12: аудит — единственное место, где этот список менялся БЕЗ
