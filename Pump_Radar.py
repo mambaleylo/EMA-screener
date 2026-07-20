@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.23 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.24 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.24: по прямому замечанию — "сигнал в 3 ночи, тикер ввёл в 9 утра,
+  за первые 6 часов не будет данных по объёму?" Именно так и было бы:
+  тикер Gate.io всегда даёт ТЕКУЩЕЕ скользящее 24ч окно (на момент запроса,
+  9 утра), а не окно, заканчивающееся в указанный at_ts (3 ночи) — окна
+  реально смещены на разницу во времени. Добавлена
+  _manual_scan_historical_volume_24h — считает объём честно по 1h-свечам
+  за 24 часа ДО указанного at_ts, не по текущему тикеру. При указанной
+  дате результат теперь содержит оба значения:
+  contract.volume_24h_usd (текущее, помечено live_only) и
+  contract.volume_24h_historical (за нужное окно). Проверено тестом —
+  корректно исключает свечи ПОСЛЕ at_ts из суммы.
 - v0.30.23: по прямому вопросу — "если сигнал был ночью, а тикет загружаю
   в обед, какие свечи скачаются?" (раньше всегда "последние к текущему
   моменту", не "на момент сигнала"). Добавлено необязательное поле
@@ -1124,7 +1135,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.23"
+APP_VERSION  = "0.30.24"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -5563,6 +5574,27 @@ def _manual_scan_tf_snapshot(symbol, tf, at_ts=None):
     return _manual_scan_compute_from_candles(candles)
 
 
+def _manual_scan_historical_volume_24h(symbol, at_ts):
+    """v0.30.24: по прямому замечанию — тикер Gate.io всегда даёт ТЕКУЩЕЕ
+    скользящее 24ч окно объёма, не окно, заканчивающееся в указанный
+    at_ts (сигнал в 3 ночи, тикер ввели в 9 утра — "живое" окно захватит
+    9 утра вчера -> 9 утра сегодня, а не 3 ночи вчера -> 3 ночи сегодня,
+    первые 6 часов после сигнала останутся за кадром теми, что реально
+    нужны). Считаем честно по 1h-свечам за 24 часа ДО at_ts — сумма по
+    свечам может чуть отличаться от истинного $-объёма (формат "vol" в
+    свечах не всегда 1-в-1 с settle-валютой тикера), но куда точнее, чем
+    брать текущий тикер для прошлой даты."""
+    try:
+        offset_days = max(0.0, (time.time() - at_ts) / 86400)
+        candles = _fetch_candles(symbol, "1h", 2, offset_days=offset_days)
+    except Exception as e:
+        return {"error": _explain_error(e)}
+    window = [c for c in candles if at_ts - 24 * 3600 <= c["t"] <= at_ts]
+    if not window:
+        return None
+    return round(sum(c.get("vol", 0) or 0 for c in window), 2)
+
+
 def _manual_scan_get_contract_extras(symbol):
     """v0.30.22: прямой, не долго кэшируемый запрос — funding rate и
     объём за 24ч (оба часто меняются, отдельно от статичных
@@ -5601,7 +5633,8 @@ def _manual_symbol_scan(symbol, at_ts=None):
     result["weekly"] = _manual_scan_tf_snapshot(symbol, "1w", at_ts=at_ts)
     result["contract"] = _manual_scan_get_contract_extras(symbol)
     if at_ts:
-        result["contract"]["live_only"] = True   # объём/funding тут всегда ТЕКУЩИЕ, не на at_ts
+        result["contract"]["live_only"] = True   # volume_24h_usd/funding_rate тут всегда ТЕКУЩИЕ, не на at_ts
+        result["contract"]["volume_24h_historical"] = _manual_scan_historical_volume_24h(symbol, at_ts)
     for tf in MANUAL_SCAN_TIMEFRAMES:
         try:
             result["anomalies"][tf] = _manual_scan_find_anomalies(
