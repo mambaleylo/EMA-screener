@@ -1,7 +1,25 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.15 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.16 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.16: по прямому вопросу — "можно ли для старых ема проверок
+  посмотреть, где оказалась цена по новым 12-часовым ожиданиям". Обычный
+  трек-луп старые, уже завершённые записи не трогает — их отслеживание
+  закончилось на старом 4-часовом окне, "продолжить" живой ценой нельзя
+  (пропущенный кусок времени потерян для live-данных). Но есть
+  исторические свечи — новая _diag_backfill_extended_checkpoints()
+  честно восстанавливает, что РЕАЛЬНО было в момент каждой новой отметки
+  (360/480/600/720 мин), используя _fetch_candles с offset_days (запрос
+  "на тот момент", не "сейчас"), плюс честно продлевает MFE/MAE по всему
+  восстановленному диапазону, не только по отдельным точкам-чекпоинтам.
+  Отметки, которые ещё не наступили даже сейчас, корректно пропускаются
+  (не выдумываются). Новый эндпоинт /ema_diag_backfill_extended (POST,
+  фоновый поток) + кнопка "Досчитать 12ч для старых" на странице
+  диагностики. Ограничение — глубина истории на бирже (не бесконечная);
+  для совсем старых записей данных может не быть, это не ошибка. Проверено
+  тестом: отметки в пределах прошедшего времени досчитываются по реальным
+  историческим ценам, ещё не наступившие — корректно не трогаются, MFE/MAE
+  продлеваются по всему диапазону.
 - v0.30.15: по запросу — окно чекпоинтов EMA Diagnostics расширено с 240
   минут (4ч) до 720 минут (12ч), добавлены промежуточные точки на 360/480/
   600 мин. Раньше при симуляции стоп/тейк большинство сделок (в прошлый
@@ -1039,7 +1057,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.15"
+APP_VERSION  = "0.30.16"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -7055,6 +7073,81 @@ def _diag_scan_loop():
         time.sleep(DIAG_SCAN_POLL_SEC)
 
 
+def _diag_backfill_extended_checkpoints():
+    """v0.30.16: по прямому вопросу — "можно ли для старых записей
+    досчитать по новым 12-часовым ожиданиям". Обычный трек-луп СТАРЫЕ,
+    уже завершённые (track_done=True) записи больше не трогает —
+    отслеживание закончилось на их СТАРОМ окне (было 4ч), и просто
+    "продолжить" с текущей живой ценой нельзя: пропущенный кусок времени
+    (от старого track_until до сейчас) навсегда потерян для live-цены.
+    Но у нас есть исторические свечи — можно честно восстановить, что
+    РЕАЛЬНО было в момент каждой новой отметки (360/480/600/720 мин),
+    не что происходит сейчас. Ограничение — глубина истории на бирже
+    (обычно порядка пары недель для 1m); для совсем старых записей данных
+    может не быть, это НЕ ошибка, просто пропускаем."""
+    now = time.time()
+    with _diag_lock:
+        records_snapshot = list(_diag_records)
+    updated = 0
+    skipped_no_gap = 0
+    skipped_no_data = 0
+    for rec in records_snapshot:
+        if not rec.get("track_done"):
+            continue
+        cps = rec.get("checkpoints", {})
+        missing = sorted(m for m in DIAG_CHECKPOINTS_MIN if m > 240 and cps.get(str(m)) is None)
+        missing = [m for m in missing if rec["ts"] + m * 60 <= now]   # ещё не наступило -- не считаем вообще
+        if not missing:
+            skipped_no_gap += 1
+            continue
+        try:
+            needed_until = rec["ts"] + max(missing) * 60
+            span_days = max(1, math.ceil((needed_until - rec["ts"]) / 86400) + 1)
+            offset_days = max(0.0, (now - needed_until) / 86400)
+            candles = _fetch_candles(rec["symbol"], "1m", span_days, offset_days=offset_days)
+        except Exception as e:
+            olog(f"[ema_diag] backfill {rec['symbol']}: {_explain_error(e)}")
+            skipped_no_data += 1
+            continue
+        if not candles:
+            skipped_no_data += 1
+            continue
+        entry_price = rec["price"]
+        changed_this = False
+        for m in missing:
+            target_t = rec["ts"] + m * 60
+            closest = min(candles, key=lambda c: abs(c["t"] - target_t))
+            if abs(closest["t"] - target_t) > 300:   # ближайшая свеча слишком далеко -- нет данных на этот момент
+                continue
+            pct = (closest["close"] - entry_price) / entry_price * 100.0
+            rec["checkpoints"][str(m)] = {"price": closest["close"], "pct": round(pct, 2)}
+            changed_this = True
+        # заодно честно продлеваем mfe/mae на весь восстановленный исторический диапазон,
+        # не только на отдельные точки-чекпоинты
+        if changed_this:
+            for c in candles:
+                if c["t"] < rec["ts"] or c["t"] > needed_until:
+                    continue
+                pct = (c["close"] - entry_price) / entry_price * 100.0
+                if rec["classic_bias"] == "long":
+                    fav, adv = pct, -pct
+                else:
+                    fav, adv = -pct, pct
+                if fav > rec["mfe_pct"]:
+                    rec["mfe_pct"] = round(fav, 2)
+                if adv > rec["mae_pct"]:
+                    rec["mae_pct"] = round(adv, 2)
+            rec["backfilled_extended"] = True
+            updated += 1
+    if updated:
+        with _diag_lock:
+            pass  # rec — те же объекты, что в _diag_records (список общий), мутация уже применилась
+        _diag_save()
+    olog(f"[ema_diag] backfill 12ч чекпоинтов: обновлено {updated}, "
+         f"без нового окна (уже было всё) {skipped_no_gap}, без данных на бирже {skipped_no_data}")
+    return {"updated": updated, "skipped_no_gap": skipped_no_gap, "skipped_no_data": skipped_no_data}
+
+
 def _diag_track_loop():
     """Раз в DIAG_TRACK_POLL_SEC проверяет живую цену всех ещё
     отслеживаемых записей: обновляет MFE/MAE (максимум за и против
@@ -8034,6 +8127,8 @@ select,input{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-ra
         <option value="">Все версии схемы</option>
       </select>
       <a href="/ema_diag_export" style="text-decoration:none"><button>&#128190; Скачать JSON</button></a>
+      <button onclick="backfillDiag()" style="background:#21262d;border:1px solid #30363d">Досчитать 12ч для старых</button>
+      <span id="backfillMsg" style="font-size:12px;color:#8b949e"></span>
       <button onclick="clearDiag()" class="btn-danger-sm">Очистить всё</button>
     </div>
   </div>
@@ -8144,6 +8239,17 @@ async function clearDiag(){
   if(!confirm('Точно очистить ВСЮ диагностическую историю? Отменить нельзя.')) return;
   await fetch('/ema_diag_clear', {method:'POST'});
   loadSummary(); loadRaw();
+}
+async function backfillDiag(){
+  const msg = document.getElementById('backfillMsg');
+  msg.style.color = '#8b949e';
+  msg.innerText = 'Запущено в фоне...';
+  try{
+    const r = await fetch('/ema_diag_backfill_extended', {method:'POST'});
+    const d = await r.json();
+    msg.style.color = d.ok ? '#3fb950' : '#f85149';
+    msg.innerText = d.msg || (d.ok ? 'Запущено' : 'Ошибка');
+  }catch(e){ msg.style.color = '#f85149'; msg.innerText = 'Ошибка запроса'; }
 }
 
 loadSummary();
@@ -8866,6 +8972,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 _save_weekly_ema_history()
             olog("[weekly_ema] история EMA-сигналов очищена вручную")
             self._json({"ok": True})
+
+        elif self.path == "/ema_diag_backfill_extended":
+            # v0.30.16: по прямому вопросу — досчитать 12-часовые чекпоинты
+            # (v0.30.15) для СТАРЫХ, уже завершённых записей диагностики
+            # задним числом, по историческим свечам. Может занять время
+            # (сетевой запрос на каждую монету) — запускаем в фоне, не
+            # блокируя ответ; итог смотреть в логах ([ema_diag] backfill...).
+            threading.Thread(target=_diag_backfill_extended_checkpoints, daemon=True).start()
+            olog("[ema_diag] backfill 12ч чекпоинтов запущен вручную — итог появится в логах")
+            self._json({"ok": True, "msg": "Запущено в фоне, итог смотри в логах через пару минут"})
 
         elif self.path == "/recheck_history":
             # v0.30.2: по прямому вопросу — "недостаточно истории" кэшируется
