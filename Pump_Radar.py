@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.21 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.22 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.22: по запросу — расширен /manual_scan (v0.30.21), на всякий
+  случай, пока не знаем, что реально важно для сравнения с внешним
+  референс-ботом. Теперь на КАЖДЫЙ таймфрейм (день и неделя, было только
+  неделя) собирается: EMA7/14/28, SMA7/14/28 (вдруг у них не EMA, а
+  просто похоже названо), ATR + перцентиль (насколько сейчас волатильно
+  относительно последних 100 баров), лесенка (структура тренда), моментум
+  (изменение цены за 1/3/7 последних баров), положение относительно
+  хая/лоя за 30 баров. Плюс объём за 24ч и funding rate (общий контекст
+  монеты, не по конкретному ТФ). Все новые метрики берутся из УЖЕ
+  выполняемых, кэшируемых запросов свечей — доп. сетевых вызовов почти не
+  добавляет (один лёгкий запрос на funding/объём). Проверено тестом на
+  реалистичных многодневных/часовых данных — все поля собираются верно.
 - v0.30.21: по прямому запросу — ручной инструмент сравнения с внешним
   референс-ботом. Вместо разбора видимой части скринов (внутренняя
   математика чужого бота всё равно не видна на скрине) — вводишь тикер
@@ -1100,7 +1112,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.21"
+APP_VERSION  = "0.30.22"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2130,6 +2142,15 @@ def _ema(arr, period):
     for i in range(period, len(arr)):
         s = arr[i]*k + s*(1-k)
         result[i] = s
+    return result
+
+def _sma(arr, period):
+    """v0.30.22: по запросу — простое скользящее среднее, для сравнения с
+    EMA у внешнего референс-бота (вдруг у него на самом деле не EMA)."""
+    result = [None]*len(arr)
+    if len(arr) < period: return result
+    for i in range(period-1, len(arr)):
+        result[i] = sum(arr[i-period+1:i+1]) / period
     return result
 
 def _atr(candles, period=14):
@@ -5451,31 +5472,88 @@ def _manual_scan_find_anomalies(symbol, tf, lookback_days):
     return anomalies[:10]   # топ-10 самых заметных, не заваливать лог
 
 
-def _manual_symbol_scan(symbol):
-    """v0.30.21: по прямому запросу — вводишь тикер, бот сам качает свечи
-    (несколько ТФ) и ищет всплески + смотрит статус недельных EMA7/14/28
-    (единственные уровни, которые реально используются для отскока, по
-    прямому уточнению) — не даёт сигнал, просто копит данные для
-    последующего сравнения с внешним референс-ботом. Не влияет на живые
-    алерты вообще."""
-    now = time.time()
-    result = {"ts": int(now), "symbol": symbol, "weekly_ema": None, "anomalies": {}}
+def _manual_scan_tf_snapshot(symbol, tf):
+    """v0.30.22: по запросу — единый, богатый снимок по одному ТФ (день
+    или неделя), из ОДНОГО фетча свечей (через уже кэширующий
+    _ema_touch_get_closed_ctx, доп. сетевых запросов не добавляет):
+    EMA7/14/28, SMA7/14/28 (вдруг у референс-бота на самом деле не EMA, а
+    просто похоже названо), ATR + перцентиль (насколько сейчас волатильно
+    относительно последних 100 баров), лесенка (структура тренда по
+    EMA7/14/28), моментум (изменение цены за 1/3/7 последних баров этого
+    ТФ) и положение относительно хая/лоя за последние 30 баров — всё,
+    что может помочь опознать, что у них значит "сильный импульс"."""
     try:
-        ctx = _ema_touch_get_closed_ctx(symbol, "1w")
-        if ctx:
-            price = ctx["closes"][ctx["i"]]
-            atr_v = ctx["atr_v"]
-            e7, e14, e28 = (ctx["ema_arrays"][p][ctx["i"]] for p in (7, 14, 28))
-            result["weekly_ema"] = {
-                "price": price, "ema7": e7, "ema14": e14, "ema28": e28, "atr": atr_v,
-                "dist_atr_7": round(abs(price - e7) / atr_v, 3) if atr_v else None,
-                "dist_atr_14": round(abs(price - e14) / atr_v, 3) if atr_v else None,
-                "dist_atr_28": round(abs(price - e28) / atr_v, 3) if atr_v else None,
-            }
-        else:
-            result["weekly_ema"] = {"insufficient_history": True}
+        ctx = _ema_touch_get_closed_ctx(symbol, tf)
     except Exception as e:
-        result["weekly_ema"] = {"error": _explain_error(e)}
+        return {"error": _explain_error(e)}
+    if not ctx:
+        return {"insufficient_history": True}
+    closes = ctx["closes"]
+    i = ctx["i"]
+    price = closes[i]
+    atr_v = ctx["atr_v"]
+    ema_vals = {p: ctx["ema_arrays"][p][i] for p in (7, 14, 28)}
+    sma_vals = {p: _sma(closes, p)[i] for p in (7, 14, 28)}
+    try:
+        atr_arr = _atr(ctx["candles"], 14)
+        atr_pctl = _atr_percentile(atr_arr, i)
+    except Exception:
+        atr_pctl = None
+    ladder = _ladder_order([ema_vals[7], ema_vals[14], ema_vals[28]])
+    lookback = min(30, i)
+    recent = closes[max(0, i - lookback):i + 1]
+    high_30, low_30 = (max(recent), min(recent)) if recent else (None, None)
+
+    def chg(n):
+        if i - n < 0 or not closes[i - n]:
+            return None
+        return round((price - closes[i - n]) / closes[i - n] * 100, 2)
+
+    return {
+        "price": price, "atr": atr_v, "atr_percentile": atr_pctl, "ladder": ladder,
+        "ema7": ema_vals[7], "ema14": ema_vals[14], "ema28": ema_vals[28],
+        "sma7": sma_vals[7], "sma14": sma_vals[14], "sma28": sma_vals[28],
+        "dist_atr_7": round(abs(price - ema_vals[7]) / atr_v, 3) if atr_v else None,
+        "dist_atr_14": round(abs(price - ema_vals[14]) / atr_v, 3) if atr_v else None,
+        "dist_atr_28": round(abs(price - ema_vals[28]) / atr_v, 3) if atr_v else None,
+        "chg_1bar_pct": chg(1), "chg_3bar_pct": chg(min(3, i)), "chg_7bar_pct": chg(min(7, i)),
+        "dist_from_30bar_high_pct": round((price - high_30) / high_30 * 100, 2) if high_30 else None,
+        "dist_from_30bar_low_pct": round((price - low_30) / low_30 * 100, 2) if low_30 else None,
+    }
+
+
+def _manual_scan_get_contract_extras(symbol):
+    """v0.30.22: прямой, не долго кэшируемый запрос — funding rate и
+    объём за 24ч (оба часто меняются, отдельно от статичных
+    quanto_multiplier/order_price_round в _gate_get_contract_info)."""
+    try:
+        contract = symbol.replace("/", "_").upper()
+        r = requests.get(f"{GATE_API}/futures/usdt/contracts/{contract}", timeout=8)
+        if r.status_code != 200:
+            return {}
+        data = r.json()
+        vol24 = data.get("volume_24h_settle") or data.get("volume_24h_base") or data.get("volume_24h")
+        return {
+            "funding_rate": float(data["funding_rate"]) if data.get("funding_rate") is not None else None,
+            "volume_24h_usd": float(vol24) if vol24 is not None else None,
+        }
+    except Exception as e:
+        return {"error": _explain_error(e)}
+
+
+def _manual_symbol_scan(symbol):
+    """v0.30.21/22: по прямому запросу — вводишь тикер, бот сам качает
+    свечи и собирает широкий набор данных (не только EMA — на всякий
+    случай, пока не знаем, что именно важно для сравнения с внешним
+    референс-ботом): EMA/SMA/ATR/лесенка/моментум по дню И неделе, объём
+    (24ч + всплески на 1h/4h), funding rate. Не даёт сигнал сам по себе,
+    просто копит данные. Не влияет на живые алерты вообще."""
+    now = time.time()
+    result = {"ts": int(now), "symbol": symbol, "daily": None, "weekly": None,
+               "contract": None, "anomalies": {}}
+    result["daily"] = _manual_scan_tf_snapshot(symbol, "1d")
+    result["weekly"] = _manual_scan_tf_snapshot(symbol, "1w")
+    result["contract"] = _manual_scan_get_contract_extras(symbol)
     for tf in MANUAL_SCAN_TIMEFRAMES:
         try:
             result["anomalies"][tf] = _manual_scan_find_anomalies(
@@ -8215,7 +8293,7 @@ th,td{padding:6px 8px;text-align:left;border-bottom:1px solid #21262d}
 </div>
 <div class="card">
   <h3 style="margin-top:0">Накопленные сканы <a href="/manual_scan_export" style="float:right;font-size:13px">&#128190; Скачать JSON</a></h3>
-  <div id="historyBox"><table><thead><tr><th>Монета</th><th>Когда</th><th>EMA7(W)</th><th>EMA14(W)</th><th>EMA28(W)</th><th>Всплесков 1h/4h</th></tr></thead><tbody id="historyBody"></tbody></table></div>
+  <div id="historyBox"><table><thead><tr><th>Монета</th><th>Когда</th><th>EMA7(W)</th><th>EMA14(W)</th><th>EMA28(W)</th><th>Лесенка(W)</th><th>Vol24ч,$</th><th>Funding</th><th>Всплесков 1h/4h</th></tr></thead><tbody id="historyBody"></tbody></table></div>
 </div>
 <script>
 async function doScan(){
@@ -8237,11 +8315,14 @@ async function loadHistory(){
     const r = await fetch('/manual_scan_status'); const d = await r.json();
     const tbody = document.getElementById('historyBody');
     tbody.innerHTML = (d.records||[]).slice().reverse().map(rec=>{
-      const we = rec.weekly_ema || {};
+      const we = rec.weekly || {};
+      const ct = rec.contract || {};
       const a1 = (rec.anomalies && rec.anomalies['1h'] && rec.anomalies['1h'].length) || 0;
       const a4 = (rec.anomalies && rec.anomalies['4h'] && rec.anomalies['4h'].length) || 0;
       const when = new Date(rec.ts*1000).toLocaleString();
-      return `<tr><td>${rec.symbol}</td><td>${when}</td><td>${we.ema7?we.ema7.toPrecision(6):'-'}</td><td>${we.ema14?we.ema14.toPrecision(6):'-'}</td><td>${we.ema28?we.ema28.toPrecision(6):'-'}</td><td>${a1}/${a4}</td></tr>`;
+      const vol = ct.volume_24h_usd ? Number(ct.volume_24h_usd).toLocaleString() : '-';
+      const fr = ct.funding_rate!=null ? (ct.funding_rate*100).toFixed(3)+'%' : '-';
+      return `<tr><td>${rec.symbol}</td><td>${when}</td><td>${we.ema7?we.ema7.toPrecision(6):'-'}</td><td>${we.ema14?we.ema14.toPrecision(6):'-'}</td><td>${we.ema28?we.ema28.toPrecision(6):'-'}</td><td>${we.ladder||'-'}</td><td>${vol}</td><td>${fr}</td><td>${a1}/${a4}</td></tr>`;
     }).join('');
   }catch(e){}
 }
