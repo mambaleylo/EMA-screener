@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.6 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.7 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.7: по запросу — уведомления о голых пампах/дампах отключены по
+  умолчанию (PUMP_DUMP_ALERTS_ENABLED=False), "пока", легко включить
+  обратно (переключатель на главной странице + через /alert_cfg). Сам
+  детект, запись в историю и проверка EMA-триггера продолжают работать в
+  фоне без изменений — они нужны и для сигналов, приходящих от аномалии
+  объёма, и для накопления статистики. Меняется только сама отправка
+  текста "Pump: X%"/"Dump: X%" в Telegram — она пропускается, если
+  выключено. Проверено тестом: при выключенном флаге в Telegram ничего
+  не уходит, но EMA-проверка всё равно вызывается; включение обратно
+  восстанавливает отправку немедленно.
 - v0.30.6: четыре улучшения Volume Peak Watcher по запросу.
   (1, функционально) Более длинный горизонт для z-score:
   VOL_PEAK_BASELINE_LOOKBACK_MIN=24ч — среднее/std теперь считаются по
@@ -927,7 +937,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.6"
+APP_VERSION  = "0.30.7"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -960,6 +970,7 @@ TG_TOKEN     = os.environ.get("TG_TOKEN", "")
 TG_CHAT      = os.environ.get("TG_CHAT", "")
 NTFY_URL     = os.environ.get("NTFY_URL", "")
 WATCHDOG_ENABLED      = True   # увед. в TG/ntfy, если пропал интернет
+PUMP_DUMP_ALERTS_ENABLED = False   # v0.30.7: по запросу — по умолчанию ВЫКЛЮЧЕНО, "пока" (легко включить обратно). Детект и трекинг пампов/дампов продолжают работать в фоне (нужны для EMA-триггера), просто без отправки текста в Telegram
 WATCHDOG_TIMEOUT_MIN  = 60     # порог простоя (мин) до первого алерта
 HC_URL       = os.environ.get("HC_URL", "")  # heartbeat healthchecks.io
 ALERT_CFG_PATH   = os.path.expanduser("~/.smc_alert_cfg.json")
@@ -3037,6 +3048,15 @@ details[open] summary:before{content:"▾ "}
     <span id="recheckMsg" style="font-size:12px;color:#8b949e"></span>
   </div>
 </div>
+
+<div class="section-card" style="max-width:420px">
+  <label style="display:flex;gap:8px;align-items:center;font-size:13px;color:#c9d1d9;cursor:pointer">
+    <input type="checkbox" id="pumpDumpAlertsToggle" onchange="togglePumpDumpAlerts()" style="width:16px;height:16px">
+    Уведомления о голых пампах/дампах в Telegram
+  </label>
+  <p style="font-size:11px;color:#6e7681;margin:6px 0 0">Детект и проверка EMA-сигнала продолжают работать в фоне в любом случае (нужны для сигналов от аномалии объёма и для истории) — переключатель влияет только на отправку самого текста "Pump: X%"/"Dump: X%" в Telegram.</p>
+  <span id="pumpDumpAlertsMsg" style="font-size:12px;color:#8b949e"></span>
+</div>
 <div id="status"></div>
 
 <div id="alertModal">
@@ -3176,6 +3196,25 @@ async function saveScanSettings(){
   }catch(e){ msg.style.color = '#f85149'; msg.innerText = 'Ошибка запроса'; }
 }
 loadScanSettings();
+
+async function loadPumpDumpToggle(){
+  try{
+    const r = await fetch('/alert_cfg'); const d = await r.json();
+    document.getElementById('pumpDumpAlertsToggle').checked = !!d.pump_dump_alerts_enabled;
+  }catch(e){}
+}
+async function togglePumpDumpAlerts(){
+  const msg = document.getElementById('pumpDumpAlertsMsg');
+  const checked = document.getElementById('pumpDumpAlertsToggle').checked;
+  try{
+    const r = await fetch('/alert_cfg', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({pump_dump_alerts_enabled: checked})});
+    const d = await r.json();
+    msg.style.color = d.ok ? '#3fb950' : '#f85149';
+    msg.innerText = d.ok ? (checked ? 'Включено' : 'Отключено — детект и EMA-проверка продолжают работать в фоне') : 'Ошибка';
+  }catch(e){ msg.style.color = '#f85149'; msg.innerText = 'Ошибка запроса'; }
+}
+loadPumpDumpToggle();
 
 async function recheckHistory(){
   const msg = document.getElementById('recheckMsg');
@@ -4966,9 +5005,14 @@ def _pump_fire_alert(symbol, res):
     caption = (f"<b>{symbol}</b>\n"
                f"Pump: {res['pct']}% (окно {res.get('window_min','?')}м)\n"
                f"{_fmt_px(res['base_price'])} -> {_fmt_px(res['last_price'])}")
-    _send_alert_photo(png, caption)
-    olog(f"[pump_detect] 🔥 {symbol}: памп {res['pct']}% "
-         f"({res['base_price']:.6g} → {res['last_price']:.6g}) — алерт отправлен")
+    if PUMP_DUMP_ALERTS_ENABLED:
+        _send_alert_photo(png, caption)
+        olog(f"[pump_detect] 🔥 {symbol}: памп {res['pct']}% "
+             f"({res['base_price']:.6g} → {res['last_price']:.6g}) — алерт отправлен")
+    else:
+        olog(f"[pump_detect] 🔥 {symbol}: памп {res['pct']}% "
+             f"({res['base_price']:.6g} → {res['last_price']:.6g}) — уведомление отключено "
+             f"(PUMP_DUMP_ALERTS_ENABLED=False), детект и EMA-проверка продолжаются")
 
     now = time.time()
     rec = {"ts": int(now), "symbol": symbol, "pct": res["pct"],
@@ -5021,9 +5065,14 @@ def _dump_fire_alert(symbol, res):
     caption = (f"<b>{symbol}</b>\n"
                f"Dump: -{res['pct']}% (окно {res.get('window_min','?')}м)\n"
                f"{_fmt_px(res['base_price'])} -> {_fmt_px(res['last_price'])}")
-    _send_alert_photo(png, caption)
-    olog(f"[dump_detect] 💧 {symbol}: дамп -{res['pct']}% "
-         f"({res['base_price']:.6g} → {res['last_price']:.6g}) — алерт отправлен")
+    if PUMP_DUMP_ALERTS_ENABLED:
+        _send_alert_photo(png, caption)
+        olog(f"[dump_detect] 💧 {symbol}: дамп -{res['pct']}% "
+             f"({res['base_price']:.6g} → {res['last_price']:.6g}) — алерт отправлен")
+    else:
+        olog(f"[dump_detect] 💧 {symbol}: дамп -{res['pct']}% "
+             f"({res['base_price']:.6g} → {res['last_price']:.6g}) — уведомление отключено "
+             f"(PUMP_DUMP_ALERTS_ENABLED=False), детект и EMA-проверка продолжаются")
 
     now = time.time()
     rec = {"ts": int(now), "symbol": symbol, "pct": res["pct"],
@@ -6829,6 +6878,7 @@ def _diag_summary(min_touches=3):
 def _load_alert_cfg():
     """Подхватывает сохранённые TG/ntfy настройки из файла (приоритет над env)."""
     global TG_TOKEN, TG_CHAT, NTFY_URL, WATCHDOG_ENABLED, WATCHDOG_TIMEOUT_MIN, HC_URL
+    global PUMP_DUMP_ALERTS_ENABLED
     try:
         with open(ALERT_CFG_PATH, "r") as f:
             cfg = json.load(f)
@@ -6843,6 +6893,8 @@ def _load_alert_cfg():
                 WATCHDOG_TIMEOUT_MIN = max(5, min(1440, int(cfg.get("watchdog_timeout_min"))))
             except (TypeError, ValueError):
                 pass
+        if "pump_dump_alerts_enabled" in cfg:
+            PUMP_DUMP_ALERTS_ENABLED = bool(cfg.get("pump_dump_alerts_enabled"))
     except FileNotFoundError:
         pass
     except Exception as e:
@@ -6854,7 +6906,8 @@ def _save_alert_cfg():
             json.dump({"tg_token": TG_TOKEN, "tg_chat": TG_CHAT, "ntfy_url": NTFY_URL,
                        "hc_url": HC_URL,
                        "watchdog_enabled": WATCHDOG_ENABLED,
-                       "watchdog_timeout_min": WATCHDOG_TIMEOUT_MIN}, f)
+                       "watchdog_timeout_min": WATCHDOG_TIMEOUT_MIN,
+                       "pump_dump_alerts_enabled": PUMP_DUMP_ALERTS_ENABLED}, f)
     except Exception as e:
         olog(f"⚠ Не удалось сохранить {ALERT_CFG_PATH}: {_explain_error(e)}")
 
@@ -8309,7 +8362,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json({"tg_token": TG_TOKEN, "tg_chat": TG_CHAT, "ntfy_url": NTFY_URL,
                         "hc_url": HC_URL,
                         "watchdog_enabled": WATCHDOG_ENABLED,
-                        "watchdog_timeout_min": WATCHDOG_TIMEOUT_MIN})
+                        "watchdog_timeout_min": WATCHDOG_TIMEOUT_MIN,
+                        "pump_dump_alerts_enabled": PUMP_DUMP_ALERTS_ENABLED})
         elif self.path == "/scan_settings":
             with _scan_settings_lock:
                 self._json(dict(_scan_settings))
@@ -8427,6 +8481,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if self.path == "/alert_cfg":
             global TG_TOKEN, TG_CHAT, NTFY_URL, WATCHDOG_ENABLED, WATCHDOG_TIMEOUT_MIN, HC_URL
+            global PUMP_DUMP_ALERTS_ENABLED
             TG_TOKEN = (body.get("tg_token") or "").strip()
             TG_CHAT  = (body.get("tg_chat")  or "").strip()
             NTFY_URL = (body.get("ntfy_url") or "").strip()
@@ -8439,6 +8494,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     WATCHDOG_TIMEOUT_MIN = max(5, min(1440, int(body.get("watchdog_timeout_min"))))
                 except (TypeError, ValueError):
                     pass
+            if "pump_dump_alerts_enabled" in body:
+                PUMP_DUMP_ALERTS_ENABLED = bool(body.get("pump_dump_alerts_enabled"))
             _save_alert_cfg()
             self._json({"ok": True})
 
