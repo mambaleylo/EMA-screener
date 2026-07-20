@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.26 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.27 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.27: по запросу — на страницу /manual_scan добавлены необязательные
+  поля со скрина ИХ бота: сторона (LONG/SHORT), вход, стоп, тейк.
+  Записываются и в полный результат скана, и в простую хронологию
+  (v0.30.25) — теперь можно будет проверить, коррелирует ли направление
+  ИХ сигнала с нашими данными (ладдер, дистанция до EMA, момент), не
+  только "какая монета была близко к уровню". Поле "Сторона" добавлено и
+  в таблицу накопленных сканов на странице. Поля очищаются после каждого
+  успешного скана — удобнее заносить следующую монету. Проверено тестом
+  end-to-end.
 - v0.30.26: реальный баг, найден по свежим логам — volume_24h_usd был
   null абсолютно во всех записях, хотя funding_rate из того же вызова
   получался нормально. Причина: /futures/usdt/contracts/{contract}
@@ -1153,7 +1162,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.26"
+APP_VERSION  = "0.30.27"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -5645,18 +5654,19 @@ def _manual_scan_get_contract_extras(symbol):
         return {"error": _explain_error(e)}
 
 
-def _manual_symbol_scan(symbol, at_ts=None):
-    """v0.30.21/22/23: по прямому запросу — вводишь тикер (и, по желанию,
-    дату/время сигнала — "если сигнал был ночью, а тикет загружаю в
-    обед") — бот качает свечи НА ТОТ МОМЕНТ (не всегда "сейчас") и
-    собирает широкий набор данных (не только EMA — на всякий случай, пока
-    не знаем, что именно важно для сравнения с внешним референс-ботом):
-    EMA/SMA/ATR/лесенка/моментум по дню И неделе, объём (24ч + всплески
-    на 1h/4h), funding rate. at_ts=None — обычное "сейчас". Не даёт
-    сигнал сам по себе, просто копит данные. Не влияет на живые алерты
-    вообще. Оговорка: объём/funding у Gate.io доступны только ТЕКУЩИМИ —
-    исторических значений на конкретный момент отсюда не достать, при
-    at_ts помечается явно (see contract.live_only)."""
+def _manual_symbol_scan(symbol, at_ts=None, side=None, ref_entry=None, ref_stop=None, ref_take=None):
+    """v0.30.21/22/23/26: по прямому запросу — вводишь тикер (и, по
+    желанию, дату/время сигнала — "если сигнал был ночью, а тикет
+    загружаю в обед") — бот качает свечи НА ТОТ МОМЕНТ (не всегда
+    "сейчас") и собирает широкий набор данных (не только EMA — на всякий
+    случай, пока не знаем, что именно важно для сравнения с внешним
+    референс-ботом): EMA/SMA/ATR/лесенка/моментум по дню И неделе, объём
+    (24ч + всплески на 1h/4h), funding rate. at_ts=None — обычное
+    "сейчас". Не даёт сигнал сам по себе, просто копит данные. Не влияет
+    на живые алерты вообще. v0.30.27: side/ref_entry/ref_stop/ref_take —
+    необязательные, из скрина ИХ бота, чтобы потом можно было проверить,
+    коррелирует ли направление ИХ сигнала с нашими данными (ладдер,
+    дистанция, момент), а не только "какая монета была близко к EMA"."""
     now = time.time()
     # v0.30.25: по прямому запросу — простой, независимый лог "тикер +
     # время сигнала", отдельно от полного расчёта ниже. Пишется ПЕРВЫМ,
@@ -5669,11 +5679,13 @@ def _manual_symbol_scan(symbol, at_ts=None):
     try:
         _pump_dump_history_append(MANUAL_SCAN_CHRONOLOGY_FILE, {
             "symbol": symbol, "signal_ts": int(at_ts) if at_ts else None,
-            "recorded_at": int(now),
+            "recorded_at": int(now), "side": side,
+            "ref_entry": ref_entry, "ref_stop": ref_stop, "ref_take": ref_take,
         })
     except Exception as e:
         olog(f"[manual_scan] ⚠ не смог записать хронологию для {symbol}: {_explain_error(e)}")
     result = {"ts": int(now), "symbol": symbol, "at_ts": int(at_ts) if at_ts else None,
+               "side": side, "ref_entry": ref_entry, "ref_stop": ref_stop, "ref_take": ref_take,
                "daily": None, "weekly": None, "contract": None, "anomalies": {}}
     result["daily"] = _manual_scan_tf_snapshot(symbol, "1d", at_ts=at_ts)
     result["weekly"] = _manual_scan_tf_snapshot(symbol, "1w", at_ts=at_ts)
@@ -8421,6 +8433,17 @@ th,td{padding:6px 8px;text-align:left;border-bottom:1px solid #21262d}
     <input type="time" id="scanTimeInput" style="width:110px">
     <button class="secondary" onclick="clearDateTime()" style="font-size:12px;padding:6px 10px">Очистить (сейчас)</button>
   </div>
+  <div style="margin-bottom:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+    <label style="font-size:12px;color:#8b949e">Со скрина их бота (всё необязательно):</label>
+    <select id="scanSideInput" style="background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:10px">
+      <option value="">Сторона: -</option>
+      <option value="LONG">LONG</option>
+      <option value="SHORT">SHORT</option>
+    </select>
+    <input id="scanEntryInput" placeholder="Вход" style="width:100px">
+    <input id="scanStopInput" placeholder="Стоп" style="width:100px">
+    <input id="scanTakeInput" placeholder="Тейк" style="width:100px">
+  </div>
   <button onclick="doScan()">Сканировать</button>
   <span id="scanMsg" style="font-size:12px;color:#8b949e;margin-left:8px"></span>
   <div id="resultBox" style="margin-top:12px"></div>
@@ -8428,7 +8451,7 @@ th,td{padding:6px 8px;text-align:left;border-bottom:1px solid #21262d}
 <div class="card">
   <h3 style="margin-top:0">Накопленные сканы <a href="/manual_scan_export" style="float:right;font-size:13px">&#128190; Скачать JSON</a></h3>
   <p style="font-size:12px;color:#8b949e;margin-top:-6px">Отдельный простой лог "тикер + время сигнала" (независимо от расчётов, на случай если логику пересчёта потом улучшим): <a href="/manual_scan_chronology_export" style="font-size:12px">&#128190; Скачать хронологию</a></p>
-  <div id="historyBox"><table><thead><tr><th>Монета</th><th>Когда</th><th>EMA7(W)</th><th>EMA14(W)</th><th>EMA28(W)</th><th>Лесенка(W)</th><th>Vol24ч,$</th><th>Funding</th><th>Всплесков 1h/4h</th></tr></thead><tbody id="historyBody"></tbody></table></div>
+  <div id="historyBox"><table><thead><tr><th>Монета</th><th>Сторона</th><th>Когда</th><th>EMA7(W)</th><th>EMA14(W)</th><th>EMA28(W)</th><th>Лесенка(W)</th><th>Vol24ч,$</th><th>Funding</th><th>Всплесков 1h/4h</th></tr></thead><tbody id="historyBody"></tbody></table></div>
 </div>
 <script>
 async function doScan(){
@@ -8443,15 +8466,28 @@ async function doScan(){
     if(isNaN(dt.getTime())){ msg.style.color='#f85149'; msg.innerText='Некорректная дата/время'; return; }
     at_ts = Math.floor(dt.getTime()/1000);
   }
+  const side = document.getElementById('scanSideInput').value;
+  const refEntry = document.getElementById('scanEntryInput').value.trim();
+  const refStop = document.getElementById('scanStopInput').value.trim();
+  const refTake = document.getElementById('scanTakeInput').value.trim();
   msg.style.color='#8b949e'; msg.innerText='Сканирую...';
   try{
     const payload = {symbol};
     if(at_ts) payload.at_ts = at_ts;
+    if(side) payload.side = side;
+    if(refEntry) payload.ref_entry = refEntry;
+    if(refStop) payload.ref_stop = refStop;
+    if(refTake) payload.ref_take = refTake;
     const r = await fetch('/manual_scan', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
     const d = await r.json();
     if(!d.ok){ msg.style.color='#f85149'; msg.innerText = d.msg || 'Ошибка'; return; }
     msg.style.color='#3fb950'; msg.innerText = at_ts ? 'Готово (на указанный момент)' : 'Готово (сейчас)';
     document.getElementById('resultBox').innerHTML = '<pre>'+JSON.stringify(d.result, null, 2)+'</pre>';
+    document.getElementById('symbolInput').value = '';
+    document.getElementById('scanSideInput').value = '';
+    document.getElementById('scanEntryInput').value = '';
+    document.getElementById('scanStopInput').value = '';
+    document.getElementById('scanTakeInput').value = '';
     loadHistory();
   }catch(e){ msg.style.color='#f85149'; msg.innerText='Ошибка запроса'; }
 }
@@ -8473,7 +8509,7 @@ async function loadHistory(){
         : new Date(rec.ts*1000).toLocaleString();
       const vol = ct.volume_24h_usd ? Number(ct.volume_24h_usd).toLocaleString() : '-';
       const fr = ct.funding_rate!=null ? (ct.funding_rate*100).toFixed(3)+'%' : '-';
-      return `<tr><td>${rec.symbol}</td><td>${when}</td><td>${we.ema7?we.ema7.toPrecision(6):'-'}</td><td>${we.ema14?we.ema14.toPrecision(6):'-'}</td><td>${we.ema28?we.ema28.toPrecision(6):'-'}</td><td>${we.ladder||'-'}</td><td>${vol}</td><td>${fr}</td><td>${a1}/${a4}</td></tr>`;
+      return `<tr><td>${rec.symbol}</td><td>${rec.side||'-'}</td><td>${when}</td><td>${we.ema7?we.ema7.toPrecision(6):'-'}</td><td>${we.ema14?we.ema14.toPrecision(6):'-'}</td><td>${we.ema28?we.ema28.toPrecision(6):'-'}</td><td>${we.ladder||'-'}</td><td>${vol}</td><td>${fr}</td><td>${a1}/${a4}</td></tr>`;
     }).join('');
   }catch(e){}
 }
@@ -9450,8 +9486,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         self._json({"ok": False, "msg": "Дата/время в будущем — так не получится"}); return
                 except (TypeError, ValueError) as e:
                     self._json({"ok": False, "msg": f"Некорректная дата/время: {_explain_error(e)}"}); return
+            side = None
+            if isinstance(body, dict) and body.get("side") in ("LONG", "SHORT"):
+                side = body["side"]
+            ref_entry = ref_stop = ref_take = None
             try:
-                result = _manual_symbol_scan(symbol, at_ts=at_ts)
+                if isinstance(body, dict):
+                    ref_entry = float(body["ref_entry"]) if body.get("ref_entry") not in (None, "") else None
+                    ref_stop = float(body["ref_stop"]) if body.get("ref_stop") not in (None, "") else None
+                    ref_take = float(body["ref_take"]) if body.get("ref_take") not in (None, "") else None
+            except (TypeError, ValueError) as e:
+                self._json({"ok": False, "msg": f"Некорректный вход/стоп/тейк: {_explain_error(e)}"}); return
+            try:
+                result = _manual_symbol_scan(symbol, at_ts=at_ts, side=side,
+                                              ref_entry=ref_entry, ref_stop=ref_stop, ref_take=ref_take)
                 self._json({"ok": True, "result": result})
             except Exception as e:
                 self._json({"ok": False, "msg": _explain_error(e)})
