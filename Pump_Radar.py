@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.13 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.14 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.14: по прямому вопросу — "есть ли разница памп/дамп/аномалия
+  объёма, может после аномалии шанс на отскок вниз ещё выше". Сейчас
+  ответить нечем — событие "цена подошла к EMA28(W)" (v0.30.13) просто
+  слалось и забывалось, без отслеживания дальнейшей цены и без метки
+  источника. Теперь при каждом срабатывании создаётся отдельная
+  отслеживаемая запись (со своим source — pump/dump/vol_anomaly) в новом
+  EMA28W_TOUCH_HISTORY_FILE, свой трек-луп (_ema28w_touch_track_loop)
+  следит за ней ещё 4 часа (max_follow/max_reverse + чекпоинты, тот же
+  принцип, что у остальных). Плюс новый эндпоинт /ema28w_touch_export.
+  Как накопится достаточно данных по каждому источнику — можно будет
+  честно посчитать разницу, не гадая. Проверено тестом: все три источника
+  корректно создают отдельные, помеченные записи.
 - v0.30.13: два изменения по прямому запросу. (1) Реальный баг —
   многострочный текст алерта в HTTP-заголовке Message ломал весь запрос
   к ntfy (InvalidHeader, HTTP-заголовки не поддерживают переносы строк) —
@@ -1021,7 +1033,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.13"
+APP_VERSION  = "0.30.14"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -5315,6 +5327,8 @@ VOL_PEAK_ZSCORE_THRESHOLD    = 4.0     # доминирующие всплеск
 VOL_PEAK_EXPIRY_SEC          = 6 * 3600     # расширено обратно с 90 минут — по прямому запросу: не каждый памп успевает подтвердиться за 90 минут, а нормальную защиту от протухания теперь даёт _vol_peak_verify_at_peak (v0.29.2, проверяет ВЕСЬ путь цены с момента всплеска, не полагается на таймер) + постоянный реестр сработавших (v0.28.3) + один активный на монету (v0.28.6)
 VOL_PEAK_CONFIRM_PCT         = 5.0     # насколько цена должна вырасти от цены всплеска, чтобы сразу сработал алерт (без ожидания отката) — подтверждено верно на реальном примере ESP0RTS
 VOL_ANOMALY_SCHEMA_VERSION   = 1       # v0.29.7: версия логики срабатывания (не формата файла) — поднимать при изменении порога/выбора пика/подтверждения, чтобы будущий анализ мог явно отсеять записи от старой логики, а не вычислять это вручную по возрасту/дублям
+EMA28W_TOUCH_HISTORY_FILE = os.path.expanduser("~/pumpradar_ema28w_touch_history.json")
+EMA28W_TOUCH_TRACK_WINDOW_SEC = 4 * 3600   # v0.30.14: то же окно, что у пампа/дампа/аномалии — для сравнимости
 VOL_PEAK_MAX_TOLERANCE_PCT   = 0.3     # алерт шлётся, только если текущая цена в пределах этого % от бегущего максимума — не после отката от него
 VOL_PEAK_TRACK_WINDOW_SEC    = 4 * 3600    # трекинг исхода после срабатывания — по запросу расширено с 2ч до 4ч
 VOL_ANOMALY_HISTORY_FILE     = os.path.expanduser("~/pumpradar_vol_anomaly_history.json")  # тот же файл, что и раньше
@@ -5818,7 +5832,7 @@ def _vol_anomaly_track_loop():
                             path = rec.get("path", [])
                             path.append({"ts": int(now), "price": price})
                             rec["path"] = path
-                            _maybe_fire_ema28w_reversal_alert(rec, sym, price, "аномалия объёма")
+                            _maybe_fire_ema28w_reversal_alert(rec, sym, price, "vol_anomaly")
                             changed = True
                         if now >= rec.get("track_until", 0):
                             rec["track_done"] = True
@@ -5833,6 +5847,68 @@ def _vol_anomaly_track_loop():
             olog(f"[vol_anomaly_track] ошибка цикла: {_explain_error(e)}")
         time.sleep(VOL_PEAK_SCAN_POLL_SEC)
 # ─── конец Volume Peak Level Watcher ─────────────────────────────────────────
+
+
+def _ema28w_touch_track_loop():
+    """v0.30.14: следит за исходом ПОСЛЕ срабатывания
+    _maybe_fire_ema28w_reversal_alert — у каждой записи уже есть source
+    (pump/dump/vol_anomaly), так что как накопится достаточно данных,
+    можно будет сравнить: реально ли отскок вниз после аномалии объёма
+    надёжнее, чем после голого пампа/дампа, а не гадать. Тот же принцип
+    знаков, что у аномалии объёма — follow = цена продолжила расти
+    (плохо для ожидаемого отскока вниз), reverse = цена пошла вниз
+    (собственно тот самый отскок, которого ждём)."""
+    time.sleep(110)
+    while True:
+        try:
+            lock = _get_history_file_lock(EMA28W_TOUCH_HISTORY_FILE)
+            with lock:
+                if not os.path.exists(EMA28W_TOUCH_HISTORY_FILE):
+                    time.sleep(VOL_PEAK_SCAN_POLL_SEC)
+                    continue
+                try:
+                    with open(EMA28W_TOUCH_HISTORY_FILE) as f:
+                        hist = json.load(f)
+                except Exception as e:
+                    olog(f"[ema28w_track] не смог прочитать историю: {_explain_error(e)}")
+                    time.sleep(VOL_PEAK_SCAN_POLL_SEC)
+                    continue
+                now = time.time()
+                price_cache = {}
+                changed = False
+                for rec in hist:
+                    if rec.get("track_done", True):
+                        continue
+                    try:
+                        sym = rec["symbol"]
+                        if sym not in price_cache:
+                            try:
+                                price_cache[sym] = _gate_get_price(sym)
+                            except Exception as e:
+                                olog(f"[ema28w_track] {sym}: ошибка получения цены: {_explain_error(e)}")
+                                price_cache[sym] = None
+                        price = price_cache[sym]
+                        if price and rec.get("price"):
+                            pct = (price - rec["price"]) / rec["price"] * 100.0
+                            follow, reverse = pct, -pct
+                            rec["max_follow_pct"] = round(max(rec.get("max_follow_pct", 0.0), follow), 2)
+                            rec["max_reverse_pct"] = round(max(rec.get("max_reverse_pct", 0.0), reverse), 2)
+                            rec["last_tracked_price"] = price
+                            rec["last_tracked_ts"] = int(now)
+                            _track_record_checkpoint(rec, now, follow)
+                            changed = True
+                        if now >= rec.get("track_until", 0):
+                            rec["track_done"] = True
+                            changed = True
+                    except Exception as e:
+                        olog(f"[ema28w_track] ⚠ пропущена битая запись "
+                             f"({rec.get('symbol','?')}): {_explain_error(e)}")
+                        continue
+                if changed:
+                    _pump_dump_history_save_all(EMA28W_TOUCH_HISTORY_FILE, hist)
+        except Exception as e:
+            olog(f"[ema28w_track] ошибка цикла: {_explain_error(e)}")
+        time.sleep(VOL_PEAK_SCAN_POLL_SEC)
 
 
 # ─── Weekly/Daily EMA Touch Watcher ─────────────────────────────────────────
@@ -6005,20 +6081,40 @@ def _maybe_fire_ema28w_reversal_alert(rec, symbol, price, source_label):
     если запись ещё не помечена (ema28w_alerted), проверяет близость к
     EMA28(W) и, если найдена, шлёт ОТДЕЛЬНОЕ уведомление и помечает
     запись, чтобы не спамить повторно на каждом опросе. Возвращает True,
-    если запись изменилась (нужно сохранить)."""
+    если запись изменилась (нужно сохранить).
+    v0.30.14: по прямому вопросу — "есть ли разница памп/дамп/аномалия
+    объёма, может после аномалии шанс на отскок вниз ещё выше" — сейчас
+    ответить нечем, потому что событие просто слалось и забывалось, без
+    отслеживания дальнейшей цены и источника. Теперь при каждом
+    срабатывании создаётся ОТДЕЛЬНАЯ отслеживаемая запись (со своим
+    source — pump/dump/vol_anomaly) в EMA28W_TOUCH_HISTORY_FILE — свой
+    трек-луп (_ema28w_touch_track_loop) следит за ней ещё
+    EMA28W_TOUCH_TRACK_WINDOW_SEC часов, считая max_follow/max_reverse. Как
+    накопится достаточно — можно будет честно сравнить винрейт по
+    источнику, не гадая."""
     if rec.get("ema28w_alerted"):
         return False
     prox = _check_ema28w_proximity(symbol, price)
     if not prox:
         return False
     rec["ema28w_alerted"] = True
-    msg = (f"📍 <b>{symbol}</b> — цена после сигнала ({source_label}) подошла к EMA28(W)\n"
+    source_display = {"pump": "памп", "dump": "дамп", "vol_anomaly": "аномалия объёма"}.get(source_label, source_label)
+    msg = (f"📍 <b>{symbol}</b> — цена после сигнала ({source_display}) подошла к EMA28(W)\n"
            f"Уровень: {_fmt_px(prox['ema_value'])} | текущая цена: {_fmt_px(price)} | "
            f"расстояние: {prox['dist_atr']} ATR\n"
            f"По диагностике — самый заметный уровень из проверенных (60.5% отскок для шорта на n=76)")
     _send_alert(msg)
-    olog(f"[ema28w] {symbol}: цена подошла к EMA28(W) во время отслеживания {source_label} "
+    olog(f"[ema28w] {symbol}: цена подошла к EMA28(W) во время отслеживания {source_display} "
          f"({price:.6g} рядом с {prox['ema_value']:.6g}, {prox['dist_atr']} ATR)")
+    now = time.time()
+    touch_rec = {
+        "ts": int(now), "symbol": symbol, "source": source_label,
+        "price": price, "ema_value": prox["ema_value"], "dist_atr": prox["dist_atr"],
+        "track_until": now + EMA28W_TOUCH_TRACK_WINDOW_SEC, "track_done": False,
+        "max_follow_pct": 0.0, "max_reverse_pct": 0.0,
+        "last_tracked_price": price, "last_tracked_ts": int(now),
+    }
+    _pump_dump_history_append(EMA28W_TOUCH_HISTORY_FILE, touch_rec)
     return True
 
 
@@ -8558,6 +8654,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 recent = []
             self._json_download({"exported_at": int(time.time()), "count": len(recent),
                                  "records": recent}, "vol_anomaly_history")
+        elif self.path == "/ema28w_touch_export":
+            recent = []
+            try:
+                if os.path.exists(EMA28W_TOUCH_HISTORY_FILE):
+                    with open(EMA28W_TOUCH_HISTORY_FILE) as f:
+                        recent = json.load(f)
+            except Exception:
+                recent = []
+            self._json_download({"exported_at": int(time.time()), "count": len(recent),
+                                 "records": recent}, "ema28w_touch_history")
         elif self.path == "/weekly_ema_export":
             with _weekly_ema_touch_lock:
                 recent = list(_weekly_ema_recent)
@@ -9014,6 +9120,7 @@ def main():
     threading.Thread(target=_vol_peak_find_loop, daemon=True).start()
     threading.Thread(target=_vol_peak_watch_loop, daemon=True).start()
     threading.Thread(target=_vol_anomaly_track_loop, daemon=True).start()
+    threading.Thread(target=_ema28w_touch_track_loop, daemon=True).start()
     # v0.13.0: полностью заменено на триггер от пампа/дампа (см.
     # _pump_or_dump_maybe_trigger_ema_signal, вызывается изнутри
     # _pump_fire_alert/_dump_fire_alert) — постоянный опрос топ-100 монет
