@@ -1,7 +1,20 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.10 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.11 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.11: по прямому вопросу "а в ntfy нет картинки, это нормально?" —
+  нет, не специально. v0.30.9 чинила только "ntfy вообще молчит", отправляя
+  туда голый текст caption — сама картинка не доходила. Теперь ntfy
+  получает настоящее вложение (через заголовок Filename — так ntfy
+  понимает, что тело запроса это файл, не текст), с текстом в заголовке
+  Message. Заодно почищен HTML — наши тексты рассчитаны на Telegram
+  (parse_mode=HTML, теги <b>), а ntfy такую разметку не понимает и
+  показывал бы теги буквально; новая _strip_html_for_ntfy убирает их
+  перед отправкой в оба канала (текстовый _send_alert и фото). Отправка в
+  ntfy теперь полностью самостоятельный блок (не через _send_alert) —
+  меньше риска задеть чужую логику дублей при следующей правке. Проверено
+  тестом: HTML корректно убирается; ntfy получает именно байты картинки в
+  теле запроса с верными заголовками Filename/Message.
 - v0.30.10: реальная, ПОВТОРЯЮЩАЯСЯ путаница (уже несколько раз за
   разговор) — объём и цена делили ОДНУ И ТУ ЖЕ высоту графика, поэтому
   высокий по объёму столбик и высокая по цене точка визуально оказывались
@@ -962,7 +975,7 @@ EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
   резать/переделывать/выключать, ничего в оригинальном EMA_Invert_
   Experiment.py от этого не пострадает.
 """
-import os, sys, json, time, math, random, threading, base64, hashlib, subprocess, io, gc, uuid, statistics
+import os, sys, json, time, math, random, threading, base64, hashlib, subprocess, io, gc, uuid, statistics, re
 import multiprocessing
 import http.server, urllib.request, urllib.parse
 from functools import lru_cache
@@ -982,7 +995,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.10"
+APP_VERSION  = "0.30.11"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -1858,6 +1871,13 @@ def _explain_error(e):
         hint = "непредвиденная ошибка"
     detail = f"{name}: {text[:150]}" if text else name
     return f"{hint} ({detail})"
+
+def _strip_html_for_ntfy(text):
+    """v0.30.11: наши тексты алертов сделаны под Telegram (parse_mode=HTML,
+    теги <b>...</b> для жирного) — ntfy такую разметку не понимает и
+    просто показывает теги буквально ("<b>SYMBOL</b>"). Убирает базовые
+    теги перед отправкой в ntfy, чтобы текст читался нормально."""
+    return re.sub(r"</?(?:b|i|u|s|code|pre|a)(?:\s[^>]*)?>", "", text)
 
 # ─── Gate.io fetch ──────────────────────────────────────────────────────────
 # v0.30.1: MAX_SPREAD_PCT/MIN_VOLUME_24H_USD как захардкоженные константы
@@ -3958,7 +3978,7 @@ def _send_alert(msg):
                     tg_done = True   # не ретраим не-сетевую ошибку, но и не блокируем ntfy
             if not ntfy_done:
                 try:
-                    requests.post(NTFY_URL, data=msg.encode(), timeout=8)
+                    requests.post(NTFY_URL, data=_strip_html_for_ntfy(msg).encode(), timeout=8)
                     ntfy_done = True
                 except (requests.exceptions.ConnectionError,
                         requests.exceptions.Timeout) as e:
@@ -4065,14 +4085,16 @@ def _send_alert_photo(png_bytes, caption):
     """Как _send_alert, но с картинкой (Telegram sendPhoto). Если png_bytes
     нет — тихо откатывается на обычный текстовый _send_alert.
     v0.30.9: реальный баг — раньше ntfy получал уведомление ТОЛЬКО если
-    Telegram не настроен или отправка фото не удалась (через
-    _send_alert(caption) как fallback внутри except/if not r.ok). Пока
-    Telegram работал нормально — ntfy молчал по ВСЕМ картиночным алертам
-    (а это почти все наши — памп/дамп, аномалия объёма, EMA-сигналы),
-    отсюда и расхождение между каналами. Теперь при УСПЕШНОЙ отправке в
-    TG ntfy получает текст отдельным вызовом (раньше не получал вообще);
-    при неудаче TG ntfy по-прежнему получает уведомление через
-    _send_alert(caption) — оба пути ведут туда ровно один раз, не дважды."""
+    Telegram не настроен или отправка фото не удалась. Пока Telegram
+    работал нормально — ntfy молчал по ВСЕМ картиночным алертам (а это
+    почти все наши — памп/дамп, аномалия объёма, EMA-сигналы).
+    v0.30.11: по прямому вопросу "а в ntfy нет картинки, это нормально?" —
+    нет, не специально: раньше в ntfy уходил только текст (сам факт
+    получения хоть чего-то был важнее на тот момент). Теперь ntfy тоже
+    получает настоящую картинку (через Filename-заголовок — так ntfy
+    понимает, что тело запроса это файл-вложение, не текст) — и делает
+    это ПОЛНОСТЬЮ НЕЗАВИСИМО от исхода Telegram (свой блок, не через
+    _send_alert), чтобы не пересобирать риск дублей заново."""
     if not png_bytes:
         _send_alert(caption)
         return
@@ -4084,20 +4106,32 @@ def _send_alert_photo(png_bytes, caption):
                     data={"chat_id": TG_CHAT, "caption": caption, "parse_mode": "HTML"},
                     files={"photo": ("signal.png", png_bytes, "image/png")},
                     timeout=20)
-                if r.ok:
-                    if NTFY_URL:
-                        try:
-                            requests.post(NTFY_URL, data=caption.encode(), timeout=8)
-                        except Exception as e:
-                            olog(f"⚠ ntfy алерт: {_explain_error(e)}")
-                else:
-                    olog(f"⚠ TG фото HTTP {r.status_code} — шлю текстом (в оба канала)")
-                    _send_alert(caption)
+                if not r.ok:
+                    olog(f"⚠ TG фото HTTP {r.status_code} — пробую текстом в TG")
+                    try:
+                        requests.post(
+                            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                            json={"chat_id": TG_CHAT, "text": caption, "parse_mode": "HTML"},
+                            timeout=8)
+                    except Exception as e2:
+                        olog(f"⚠ TG текст (запасной вариант): {_explain_error(e2)}")
             except Exception as e:
-                olog(f"⚠ TG фото: {_explain_error(e)} — шлю текстом (в оба канала)")
-                _send_alert(caption)
-        else:
-            _send_alert(caption)
+                olog(f"⚠ TG фото: {_explain_error(e)} — пробую текстом в TG")
+                try:
+                    requests.post(
+                        f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                        json={"chat_id": TG_CHAT, "text": caption, "parse_mode": "HTML"},
+                        timeout=8)
+                except Exception as e2:
+                    olog(f"⚠ TG текст (запасной вариант): {_explain_error(e2)}")
+        if NTFY_URL:
+            try:
+                requests.post(NTFY_URL, data=png_bytes,
+                              headers={"Filename": "chart.png",
+                                       "Message": _strip_html_for_ntfy(caption)[:4096]},
+                              timeout=15)
+            except Exception as e:
+                olog(f"⚠ ntfy фото: {_explain_error(e)}")
     threading.Thread(target=_do_send, daemon=True).start()
 
 
