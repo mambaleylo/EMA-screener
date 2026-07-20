@@ -1,7 +1,20 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.20 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.21 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.21: по прямому запросу — ручной инструмент сравнения с внешним
+  референс-ботом. Вместо разбора видимой части скринов (внутренняя
+  математика чужого бота всё равно не видна на скрине) — вводишь тикер
+  на новой странице /manual_scan, бот сам качает свечи (1h и 4h,
+  разумный охват по каждому — 14 и 30 дней) и ищет ВСЕ доминирующие
+  всплески объёма в окне (не только самый крупный, как в живом детекторе
+  — тут это исследовательский скан, не алертинг), плюс смотрит статус
+  недельных EMA7/14/28 (по прямому уточнению — единственные уровни,
+  которые реально используются для отскока). Всё копится в отдельный
+  файл (/manual_scan_export), не влияет на живые алерты вообще. Простая
+  форма на странице + таблица накопленных сканов. Проверено тестом:
+  функция находит EMA-статус и всплески; все четыре HTTP-эндпоинта
+  работают end-to-end, включая нормализацию тикера (FF -> FF_USDT).
 - v0.30.20: по запросу — таймаут на запросы к Gate.io (тикеры/свечи, 4
   места) увеличен с 15 до 20 секунд. Не про надёжность (обрывы и так уже
   не валят весь скан, см. v0.29.14) — просто меньше ложных таймаутов в
@@ -1087,7 +1100,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.20"
+APP_VERSION  = "0.30.21"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -5405,6 +5418,75 @@ _vol_peak_watchlist = {}   # symbol -> [{"spike_ts","spike_vol","z","mean","std"
 _vol_peak_lock = threading.Lock()
 
 
+MANUAL_SCAN_HISTORY_FILE = os.path.expanduser("~/pumpradar_manual_scans.json")
+MANUAL_SCAN_TIMEFRAMES = ["1h", "4h"]
+MANUAL_SCAN_LOOKBACK_DAYS = {"1h": 14, "4h": 30}   # разумный охват на каждый ТФ
+
+
+def _manual_scan_find_anomalies(symbol, tf, lookback_days):
+    """v0.30.21: по запросу — ручное исследовательское сканирование монеты
+    (не живой алертинг). Ищет ВСЕ доминирующие всплески объёма в окне (не
+    только самый крупный, как в живом _find_volume_peaks) — чтобы видеть
+    полную картину при сравнении с внешним референс-ботом."""
+    try:
+        candles = _fetch_candles(symbol, tf, lookback_days)
+    except Exception as e:
+        return {"error": _explain_error(e)}
+    red_candles = [c for c in candles if c["close"] < c["open"]]
+    if len(red_candles) < 10:
+        return []
+    red_vols = [c.get("vol", 0) or 0 for c in red_candles]
+    mean_v = sum(red_vols) / len(red_vols)
+    var = sum((v - mean_v) ** 2 for v in red_vols) / len(red_vols)
+    std_v = var ** 0.5
+    if std_v <= 0:
+        return []
+    anomalies = []
+    for c in red_candles:
+        vol = c.get("vol", 0) or 0
+        z = (vol - mean_v) / std_v
+        if z >= VOL_PEAK_ZSCORE_THRESHOLD:
+            anomalies.append({"t": int(c["t"]), "price": c["close"], "vol": vol, "z": round(z, 2)})
+    anomalies.sort(key=lambda a: -a["z"])
+    return anomalies[:10]   # топ-10 самых заметных, не заваливать лог
+
+
+def _manual_symbol_scan(symbol):
+    """v0.30.21: по прямому запросу — вводишь тикер, бот сам качает свечи
+    (несколько ТФ) и ищет всплески + смотрит статус недельных EMA7/14/28
+    (единственные уровни, которые реально используются для отскока, по
+    прямому уточнению) — не даёт сигнал, просто копит данные для
+    последующего сравнения с внешним референс-ботом. Не влияет на живые
+    алерты вообще."""
+    now = time.time()
+    result = {"ts": int(now), "symbol": symbol, "weekly_ema": None, "anomalies": {}}
+    try:
+        ctx = _ema_touch_get_closed_ctx(symbol, "1w")
+        if ctx:
+            price = ctx["closes"][ctx["i"]]
+            atr_v = ctx["atr_v"]
+            e7, e14, e28 = (ctx["ema_arrays"][p][ctx["i"]] for p in (7, 14, 28))
+            result["weekly_ema"] = {
+                "price": price, "ema7": e7, "ema14": e14, "ema28": e28, "atr": atr_v,
+                "dist_atr_7": round(abs(price - e7) / atr_v, 3) if atr_v else None,
+                "dist_atr_14": round(abs(price - e14) / atr_v, 3) if atr_v else None,
+                "dist_atr_28": round(abs(price - e28) / atr_v, 3) if atr_v else None,
+            }
+        else:
+            result["weekly_ema"] = {"insufficient_history": True}
+    except Exception as e:
+        result["weekly_ema"] = {"error": _explain_error(e)}
+    for tf in MANUAL_SCAN_TIMEFRAMES:
+        try:
+            result["anomalies"][tf] = _manual_scan_find_anomalies(
+                symbol, tf, MANUAL_SCAN_LOOKBACK_DAYS.get(tf, 14))
+        except Exception as e:
+            result["anomalies"][tf] = {"error": _explain_error(e)}
+    _pump_dump_history_append(MANUAL_SCAN_HISTORY_FILE, result)
+    olog(f"[manual_scan] {symbol}: скан завершён, записан в {MANUAL_SCAN_HISTORY_FILE}")
+    return result
+
+
 def _find_volume_peaks(symbol):
     """Сканирует ВСЁ окно VOL_PEAK_LOOKBACK_MIN (не только последнюю
     свечу, как раньше) и находит red-свечу с САМЫМ БОЛЬШИМ объёмом во всём
@@ -8110,6 +8192,61 @@ def _pump_match_run_background(job_id, image_bytes, symbol, search_start_ts, sea
                 _pump_match_jobs[job_id]["result"] = {"ok": False, "msg": f"Внутренняя ошибка: {_explain_error(e)}"}
 
 
+MANUAL_SCAN_HTML_PAGE = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ручной скан монеты</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font-family:-apple-system,sans-serif;margin:0;padding:16px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:16px;margin-bottom:16px;max-width:640px}
+input{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:10px;font-size:16px;width:200px}
+button{background:#238636;color:#fff;border:none;border-radius:6px;padding:10px 16px;font-size:14px;margin-left:8px;cursor:pointer}
+button.secondary{background:#21262d;border:1px solid #30363d}
+pre{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px;overflow-x:auto;font-size:12px;white-space:pre-wrap;word-break:break-all}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{padding:6px 8px;text-align:left;border-bottom:1px solid #21262d}
+</style></head><body>
+<div class="card">
+  <h2 style="margin-top:0">Ручной скан монеты (для сравнения с внешним референс-ботом)</h2>
+  <p style="font-size:13px;color:#8b949e">Вводишь тикер — качаются свечи по нескольким ТФ, ищутся всплески объёма + смотрится статус недельных EMA7/14/28. Не влияет на живые алерты, только копит данные.</p>
+  <input id="symbolInput" placeholder="SYMBOL (например FF)">
+  <button onclick="doScan()">Сканировать</button>
+  <span id="scanMsg" style="font-size:12px;color:#8b949e;margin-left:8px"></span>
+  <div id="resultBox" style="margin-top:12px"></div>
+</div>
+<div class="card">
+  <h3 style="margin-top:0">Накопленные сканы <a href="/manual_scan_export" style="float:right;font-size:13px">&#128190; Скачать JSON</a></h3>
+  <div id="historyBox"><table><thead><tr><th>Монета</th><th>Когда</th><th>EMA7(W)</th><th>EMA14(W)</th><th>EMA28(W)</th><th>Всплесков 1h/4h</th></tr></thead><tbody id="historyBody"></tbody></table></div>
+</div>
+<script>
+async function doScan(){
+  const symbol = document.getElementById('symbolInput').value.trim();
+  const msg = document.getElementById('scanMsg');
+  if(!symbol){ msg.style.color='#f85149'; msg.innerText='Введи тикер'; return; }
+  msg.style.color='#8b949e'; msg.innerText='Сканирую...';
+  try{
+    const r = await fetch('/manual_scan', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({symbol})});
+    const d = await r.json();
+    if(!d.ok){ msg.style.color='#f85149'; msg.innerText = d.msg || 'Ошибка'; return; }
+    msg.style.color='#3fb950'; msg.innerText='Готово';
+    document.getElementById('resultBox').innerHTML = '<pre>'+JSON.stringify(d.result, null, 2)+'</pre>';
+    loadHistory();
+  }catch(e){ msg.style.color='#f85149'; msg.innerText='Ошибка запроса'; }
+}
+async function loadHistory(){
+  try{
+    const r = await fetch('/manual_scan_status'); const d = await r.json();
+    const tbody = document.getElementById('historyBody');
+    tbody.innerHTML = (d.records||[]).slice().reverse().map(rec=>{
+      const we = rec.weekly_ema || {};
+      const a1 = (rec.anomalies && rec.anomalies['1h'] && rec.anomalies['1h'].length) || 0;
+      const a4 = (rec.anomalies && rec.anomalies['4h'] && rec.anomalies['4h'].length) || 0;
+      const when = new Date(rec.ts*1000).toLocaleString();
+      return `<tr><td>${rec.symbol}</td><td>${when}</td><td>${we.ema7?we.ema7.toPrecision(6):'-'}</td><td>${we.ema14?we.ema14.toPrecision(6):'-'}</td><td>${we.ema28?we.ema28.toPrecision(6):'-'}</td><td>${a1}/${a4}</td></tr>`;
+    }).join('');
+  }catch(e){}
+}
+loadHistory();
+</script></body></html>"""
 EMA_DIAG_HTML_PAGE = """<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>EMA Diagnostics</title>
@@ -8920,6 +9057,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", len(body))
             self.end_headers()
             self.wfile.write(body)
+        elif self.path == "/manual_scan" or self.path == "/manual_scan.html":
+            body = MANUAL_SCAN_HTML_PAGE.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", len(body))
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif self.path == "/manual_scan_status":
+            recent = []
+            try:
+                if os.path.exists(MANUAL_SCAN_HISTORY_FILE):
+                    with open(MANUAL_SCAN_HISTORY_FILE) as f:
+                        recent = json.load(f)
+            except Exception:
+                recent = []
+            self._json({"count": len(recent), "records": recent})
+
+        elif self.path == "/manual_scan_export":
+            recent = []
+            try:
+                if os.path.exists(MANUAL_SCAN_HISTORY_FILE):
+                    with open(MANUAL_SCAN_HISTORY_FILE) as f:
+                        recent = json.load(f)
+            except Exception:
+                recent = []
+            self._json_download({"exported_at": int(time.time()), "count": len(recent),
+                                 "records": recent}, "manual_scans")
+
         elif self.path == "/ema_diag" or self.path == "/ema_diag.html":
             body = EMA_DIAG_HTML_PAGE.encode()
             self.send_response(200)
@@ -9025,6 +9192,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             threading.Thread(target=_diag_backfill_extended_checkpoints, daemon=True).start()
             olog("[ema_diag] backfill 12ч чекпоинтов запущен вручную — итог появится в логах")
             self._json({"ok": True, "msg": "Запущено в фоне, итог смотри в логах через пару минут"})
+
+        elif self.path == "/manual_scan":
+            symbol = (body.get("symbol") or "").strip().upper() if isinstance(body, dict) else ""
+            if not symbol:
+                self._json({"ok": False, "msg": "Не указан symbol"}); return
+            if not symbol.endswith("_USDT"):
+                symbol = symbol + "_USDT"
+            try:
+                result = _manual_symbol_scan(symbol)
+                self._json({"ok": True, "result": result})
+            except Exception as e:
+                self._json({"ok": False, "msg": _explain_error(e)})
 
         elif self.path == "/recheck_history":
             # v0.30.2: по прямому вопросу — "недостаточно истории" кэшируется
