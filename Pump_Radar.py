@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.16 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.17 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.17: реальный баг, найден сразу же на первом запуске нового
+  backfill'а (v0.30.16) — Gate.io 400 INVALID_PARAM_VALUE на дробный
+  `from`. Причина: в _fetch_candles int() применялся к time.time() ДО
+  вычитания offset_days*86400, а не после — если offset_days сам дробный
+  (наш backfill передаёт именно такой), результат снова становился float
+  и утекал в запрос к бирже как есть. Обёрнуто int() вокруг всего
+  выражения. Проверено тестом: дробный offset_days=3.456789 теперь даёт
+  целочисленный `from` в запросе.
 - v0.30.16: по прямому вопросу — "можно ли для старых ема проверок
   посмотреть, где оказалась цена по новым 12-часовым ожиданиям". Обычный
   трек-луп старые, уже завершённые записи не трогает — их отслеживание
@@ -1057,7 +1065,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.16"
+APP_VERSION  = "0.30.17"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2005,7 +2013,13 @@ def _fetch_all_symbols():
 
 def _fetch_candles(symbol, tf, days, _stop_event=None, offset_days=0):
     interval_sec = TF_SECONDS.get(tf, 3600)
-    now   = int(time.time()) - offset_days * 86400
+    # v0.30.17: реальный баг — int() применялся ДО вычитания offset_days,
+    # а не после. Если offset_days дробный (наш новый backfill передаёт
+    # именно такой — "на столько-то дней в прошлое, не ровно сутками"),
+    # результат снова становился float, и биржа отвечала 400
+    # INVALID_PARAM_VALUE на дробный `from`. int() теперь оборачивает всё
+    # выражение целиком.
+    now   = int(time.time() - offset_days * 86400)
     since = now - days * 86400
     LIMIT = 999
     all_candles = []
