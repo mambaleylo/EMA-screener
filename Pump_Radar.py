@@ -1,7 +1,21 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.27 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.28 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.28: НОВЫЙ, третий источник сигналов, по прямому запросу после
+  сравнения с внешним референс-ботом. Находка: 6 из 8 их сигналов НЕ
+  имели резкого пампа/дампа — движение было растянуто на недели (|chg 7
+  недельных баров| 18-109%), наш быстрый (20/60/120-минутный) детектор
+  физически не мог их поймать. Новый _slow_impulse_scan_loop — широкий
+  периодический скан (раз в 10 мин, тот же принцип, что EMA Diagnostics,
+  но с реальной отправкой) — недельная EMA touch (та же логика, что
+  везде, включая "вход=сам уровень EMA" — уже совпадала с их ботом ДО
+  этого сравнения) + фильтр на заметное накопленное недельное движение
+  (порог 15%, консервативно ниже диапазона их сигналов). Использует ТОТ
+  ЖЕ cooldown/state, что памп/дамп/аномалия объёма — не задублирует, если
+  та же связка уже сработала через другой источник. Только недельный ТФ,
+  по прямому уточнению. Проверено тестом: слабый импульс не проходит
+  фильтр, сильный проходит, повторный вызов той же связки не дублирует.
 - v0.30.27: по запросу — на страницу /manual_scan добавлены необязательные
   поля со скрина ИХ бота: сторона (LONG/SHORT), вход, стоп, тейк.
   Записываются и в полный результат скана, и в простую хронологию
@@ -1162,7 +1176,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.27"
+APP_VERSION  = "0.30.28"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -6835,6 +6849,86 @@ def _weekly_ema_fire_alert(touch, confidence_note=None, triggered_by=None):
 WEEKLY_EMA_RESOLVE_POLL_SEC = 120   # раз в 2 минуты — недельные/дневные уровни не убегают быстро
 
 
+SLOW_IMPULSE_MIN_WEEKLY_CHG_PCT = 15.0   # v0.30.28: по прямому сравнению с внешним референс-ботом — 6 из 8 их сигналов имели |изменение за 7 недельных баров| в диапазоне 18-109%, порог поставлен консервативно ниже этого диапазона
+SLOW_IMPULSE_SCAN_POLL_SEC = 600         # 10 минут — менее срочно, чем быстрые памп/дамп-детекторы, само накопленное движение никуда не убежит за 10 минут
+SLOW_IMPULSE_ENABLED = True              # лёгкий выключатель на будущее, по образцу PUMP_DUMP_ALERTS_ENABLED
+
+
+def _weekly_chg_7bar_pct(ctx):
+    """v0.30.28: изменение цены за последние 7 ЗАКРЫТЫХ баров ЭТОГО ТФ
+    (для 1w — 7 недель) — грубая мера НАКОПЛЕННОГО движения, в отличие от
+    резкого рывка за минуты, который ловят памп/дамп-детекторы."""
+    closes = ctx["closes"]
+    i = ctx["i"]
+    if i - 7 < 0 or not closes[i - 7]:
+        return None
+    return round((closes[i] - closes[i - 7]) / closes[i - 7] * 100, 2)
+
+
+def _slow_impulse_maybe_trigger_ema_signal(symbol):
+    """v0.30.28: по прямому запросу — сравнение с внешним референс-ботом
+    показало, что 6 из 8 их сигналов НЕ имели резкого пампа/дампа (наш
+    пампdetector физически не мог их поймать — движение растянуто на
+    недели, не минуты), а крупное НАКОПЛЕННОЕ движение за несколько
+    недель, из-за которого цена вернулась к недельной EMA. Отдельный,
+    независимый от пампа/дампа/аномалии объёма источник сигналов — та же
+    логика касания, что и везде (_ema_touch_check_symbol, включая
+    "вход=сам уровень EMA" — уже совпадала с их ботом ДО этого сравнения),
+    плюс новый фильтр: заметное накопленное недельное движение перед
+    касанием. Использует ТОТ ЖЕ _weekly_ema_touch_state/cooldown, что и
+    остальные источники — не задублирует алерт, если по этой же связке
+    (символ/период) уже сработал памп/дамп/аномалия объёма недавно.
+    Только 1w — по прямому уточнению, "точки для отскока только ема
+    7 14 и 28 на неделе"."""
+    try:
+        ctx = _ema_touch_get_closed_ctx(symbol, "1w")
+    except Exception as e:
+        olog(f"[slow_impulse] {symbol}: ошибка получения контекста: {_explain_error(e)}")
+        return
+    if not ctx:
+        return
+    weekly_chg = _weekly_chg_7bar_pct(ctx)
+    if weekly_chg is None or abs(weekly_chg) < SLOW_IMPULSE_MIN_WEEKLY_CHG_PCT:
+        return
+    try:
+        touches = _ema_touch_check_symbol(symbol, "1w")
+    except Exception as e:
+        olog(f"[slow_impulse] {symbol}: ошибка проверки касания: {_explain_error(e)}")
+        return
+    now = time.time()
+    for touch in touches:
+        key = f"{symbol}|1w|{touch['period']}"
+        with _weekly_ema_touch_lock:
+            last = _weekly_ema_touch_state.get(key, 0)
+        if now - last < WEEKLY_EMA_TOUCH_COOLDOWN_SEC:
+            continue
+        note = (f"накопленное движение за 7 недельных баров: {weekly_chg:+.1f}% "
+                f"(не резкий памп/дамп — источник: сравнение с внешним референс-ботом)")
+        source_id = f"slow_impulse|{symbol}|{int(now)}"
+        _weekly_ema_fire_alert(touch, confidence_note=note, triggered_by=source_id)
+        with _weekly_ema_touch_lock:
+            _weekly_ema_touch_state[key] = now
+        olog(f"[slow_impulse] {symbol}: недельная EMA{touch['period']} + накопленное "
+             f"движение {weekly_chg:+.1f}% — сигнал отправлен")
+
+
+def _slow_impulse_scan_loop():
+    time.sleep(90)
+    while True:
+        try:
+            if SLOW_IMPULSE_ENABLED:
+                symbols = _get_tradeable_symbols()
+                for symbol in symbols:
+                    try:
+                        _slow_impulse_maybe_trigger_ema_signal(symbol)
+                    except Exception as e:
+                        olog(f"[slow_impulse] {symbol}: ошибка обработки, пропускаем: {_explain_error(e)}")
+                        continue
+        except Exception as e:
+            olog(f"[slow_impulse] ошибка цикла: {_explain_error(e)}")
+        time.sleep(SLOW_IMPULSE_SCAN_POLL_SEC)
+
+
 def _weekly_ema_resolve_loop():
     """Фоновый цикл: раз в WEEKLY_EMA_RESOLVE_POLL_SEC проверяет все ещё
     ОТКРЫТЫЕ сигналы из истории на предмет тейка/стопа (простая гонка
@@ -9757,6 +9851,7 @@ def main():
     # threading.Thread(target=_ema_signal_loop, daemon=True).start()
     threading.Thread(target=_pump_detect_loop, daemon=True).start()
     threading.Thread(target=_weekly_ema_resolve_loop, daemon=True).start()
+    threading.Thread(target=_slow_impulse_scan_loop, daemon=True).start()
     threading.Thread(target=_pump_dump_track_loop, daemon=True).start()
     threading.Thread(target=_diag_scan_loop, daemon=True).start()
     threading.Thread(target=_diag_track_loop, daemon=True).start()
