@@ -1,7 +1,23 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.8 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.9 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.9: реальный баг по замечанию "разные уведомления в Telegram и
+  ntfy". ДВЕ причины разом. (1) _send_alert: не-сетевое исключение (напр.
+  битая HTML-разметка) на ОДНОМ канале делало `break`, выходящий из ВСЕГО
+  цикла попыток — включая ещё не выполненную отправку в ДРУГОЙ канал в
+  этой же попытке. (2) _send_alert_photo (используется почти ВСЕМИ
+  алертами — памп/дамп, аномалия объёма, EMA-сигналы): ntfy получал
+  уведомление ТОЛЬКО если Telegram не настроен или отправка фото не
+  удалась — пока Telegram работал нормально, ntfy молчал по всем
+  картиночным алертам вообще. Оба переписаны — каждый канал теперь
+  независим: сбой (сетевой или нет) одного больше не задевает другой;
+  _send_alert_photo при успехе TG теперь ОТДЕЛЬНО уведомляет ntfy (раньше
+  не уведомлял вообще), при неудаче TG — как и раньше, но без дублей.
+  Проверено тестом на трёх сценариях: не-сетевая ошибка TG не блокирует
+  ntfy в _send_alert; успех TG теперь доводит до ntfy в _send_alert_photo
+  (раньше не доводил); при сбое TG ntfy получает ровно одно уведомление,
+  не дубль.
 - v0.30.8: по запросу — фильтр по объёму в момент касания EMA, на
   основании диагностики (5000 записей, разбор с пользователем): при
   vol_ratio > 1.2 отскок случается заметно чаще (SHORT 45.5% против
@@ -952,7 +968,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.8"
+APP_VERSION  = "0.30.9"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3897,37 +3913,46 @@ refreshPumps(); setInterval(refreshPumps, 8000);
 # ─── Telegram / ntfy ────────────────────────────────────────────────────────
 def _send_alert(msg):
     """Отправка алерта в Telegram и/или ntfy. Запускается в фоновом потоке.
-    При сетевой ошибке — 3 попытки с паузой 5с."""
+    При сетевой ошибке — 3 попытки с паузой 5с.
+    v0.30.9: реальный баг — раньше generic-исключение (не сетевое, напр.
+    из-за некорректной HTML-разметки в тексте) на ОДНОМ канале делало
+    `break`, который выходил из ВСЕГО цикла попыток целиком — включая ещё
+    не выполненную отправку в ДРУГОЙ канал в этой же попытке. Из-за этого
+    ntfy мог вообще не получить конкретное уведомление, если именно на
+    нём споткнулся Telegram — отсюда расхождение между каналами. Теперь
+    каждый канал отслеживается и повторяется НЕЗАВИСИМО — сбой одного
+    (сетевой или нет) больше не задевает другой."""
     def _do_send():
+        tg_done = not (TG_TOKEN and TG_CHAT)      # если не настроен — считаем "уже готово"
+        ntfy_done = not NTFY_URL
         for attempt in range(1, 4):
-            sent = False
-            if TG_TOKEN and TG_CHAT:
+            if not tg_done:
                 try:
                     r = requests.post(
                         f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
                         json={"chat_id": TG_CHAT, "text": msg, "parse_mode": "HTML"},
                         timeout=8)
                     if r.ok:
-                        sent = True
+                        tg_done = True
                     else:
                         olog(f"⚠ TG алерт HTTP {r.status_code} (попытка {attempt}/3)")
                 except (requests.exceptions.ConnectionError,
                         requests.exceptions.Timeout) as e:
                     olog(f"⚠ TG алерт сеть (попытка {attempt}/3): {_explain_error(e)}")
                 except Exception as e:
-                    olog(f"⚠ TG алерт: {_explain_error(e)}")
-                    break
-            if NTFY_URL:
+                    olog(f"⚠ TG алерт: {_explain_error(e)} — не повторяю (не сетевая ошибка), но ntfy это не остановит")
+                    tg_done = True   # не ретраим не-сетевую ошибку, но и не блокируем ntfy
+            if not ntfy_done:
                 try:
                     requests.post(NTFY_URL, data=msg.encode(), timeout=8)
-                    sent = True
+                    ntfy_done = True
                 except (requests.exceptions.ConnectionError,
                         requests.exceptions.Timeout) as e:
                     olog(f"⚠ ntfy алерт сеть (попытка {attempt}/3): {_explain_error(e)}")
                 except Exception as e:
-                    olog(f"⚠ ntfy алерт: {_explain_error(e)}")
-                    break
-            if sent or attempt == 3:
+                    olog(f"⚠ ntfy алерт: {_explain_error(e)} — не повторяю (не сетевая ошибка)")
+                    ntfy_done = True
+            if (tg_done and ntfy_done) or attempt == 3:
                 break
             time.sleep(5)
     threading.Thread(target=_do_send, daemon=True).start()
@@ -4024,7 +4049,16 @@ def _render_signal_chart_png(candles, sig, sym, tf):
 
 def _send_alert_photo(png_bytes, caption):
     """Как _send_alert, но с картинкой (Telegram sendPhoto). Если png_bytes
-    нет — тихо откатывается на обычный текстовый _send_alert."""
+    нет — тихо откатывается на обычный текстовый _send_alert.
+    v0.30.9: реальный баг — раньше ntfy получал уведомление ТОЛЬКО если
+    Telegram не настроен или отправка фото не удалась (через
+    _send_alert(caption) как fallback внутри except/if not r.ok). Пока
+    Telegram работал нормально — ntfy молчал по ВСЕМ картиночным алертам
+    (а это почти все наши — памп/дамп, аномалия объёма, EMA-сигналы),
+    отсюда и расхождение между каналами. Теперь при УСПЕШНОЙ отправке в
+    TG ntfy получает текст отдельным вызовом (раньше не получал вообще);
+    при неудаче TG ntfy по-прежнему получает уведомление через
+    _send_alert(caption) — оба пути ведут туда ровно один раз, не дважды."""
     if not png_bytes:
         _send_alert(caption)
         return
@@ -4036,11 +4070,17 @@ def _send_alert_photo(png_bytes, caption):
                     data={"chat_id": TG_CHAT, "caption": caption, "parse_mode": "HTML"},
                     files={"photo": ("signal.png", png_bytes, "image/png")},
                     timeout=20)
-                if not r.ok:
-                    olog(f"⚠ TG фото HTTP {r.status_code} — шлю текстом")
+                if r.ok:
+                    if NTFY_URL:
+                        try:
+                            requests.post(NTFY_URL, data=caption.encode(), timeout=8)
+                        except Exception as e:
+                            olog(f"⚠ ntfy алерт: {_explain_error(e)}")
+                else:
+                    olog(f"⚠ TG фото HTTP {r.status_code} — шлю текстом (в оба канала)")
                     _send_alert(caption)
             except Exception as e:
-                olog(f"⚠ TG фото: {_explain_error(e)} — шлю текстом")
+                olog(f"⚠ TG фото: {_explain_error(e)} — шлю текстом (в оба канала)")
                 _send_alert(caption)
         else:
             _send_alert(caption)
