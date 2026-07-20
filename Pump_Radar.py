@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.25 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.26 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.26: реальный баг, найден по свежим логам — volume_24h_usd был
+  null абсолютно во всех записях, хотя funding_rate из того же вызова
+  получался нормально. Причина: /futures/usdt/contracts/{contract}
+  (эндпоинт, который дёргался) вообще не содержит полей объёма — по
+  официальной схеме Gate.io там только quanto_multiplier/funding_rate/
+  fee-параметры и т.п., volume_24h_* существуют ТОЛЬКО в
+  /futures/usdt/tickers. Переключено на правильный эндпоинт — заодно
+  funding_rate там тоже есть, двух запросов больше не нужно. Проверено
+  тестом на точном формате ответа из официальной документации Gate.io.
 - v0.30.25: по прямому запросу — отдельный, простой лог "тикер + время
   сигнала" (MANUAL_SCAN_CHRONOLOGY_FILE), независимый от полного расчёта.
   Смысл — даже если за неделю доступа к референс-боту не разгадаем логику
@@ -1144,7 +1153,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.25"
+APP_VERSION  = "0.30.26"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -5608,14 +5617,26 @@ def _manual_scan_historical_volume_24h(symbol, at_ts):
 def _manual_scan_get_contract_extras(symbol):
     """v0.30.22: прямой, не долго кэшируемый запрос — funding rate и
     объём за 24ч (оба часто меняются, отдельно от статичных
-    quanto_multiplier/order_price_round в _gate_get_contract_info)."""
+    quanto_multiplier/order_price_round в _gate_get_contract_info).
+    v0.30.26: реальный баг — раньше стучался в /futures/usdt/contracts/,
+    там funding_rate есть, а полей объёма НЕТ ВООБЩЕ (не в названии дело —
+    у самого эндпоинта нет такого поля, проверено по официальной схеме
+    Gate.io). volume_24h_* существуют только в /futures/usdt/tickers —
+    туда и переключено, заодно там же есть и funding_rate, двух запросов
+    не нужно."""
     try:
         contract = symbol.replace("/", "_").upper()
-        r = requests.get(f"{GATE_API}/futures/usdt/contracts/{contract}", timeout=8)
+        r = requests.get(f"{GATE_API}/futures/usdt/tickers",
+                          params={"contract": contract}, timeout=8)
         if r.status_code != 200:
             return {}
         data = r.json()
-        vol24 = data.get("volume_24h_settle") or data.get("volume_24h_base") or data.get("volume_24h")
+        if isinstance(data, list):
+            data = next((t for t in data if t.get("contract") == contract), {})
+        if not isinstance(data, dict):
+            return {}
+        vol24 = (data.get("volume_24h_usd") or data.get("volume_24h_settle")
+                 or data.get("volume_24h_quote") or data.get("volume_24h_base") or data.get("volume_24h"))
         return {
             "funding_rate": float(data["funding_rate"]) if data.get("funding_rate") is not None else None,
             "volume_24h_usd": float(vol24) if vol24 is not None else None,
