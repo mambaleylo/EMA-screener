@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.17 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.18 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.18: по прямому запросу — проверил попиксельно (не на глаз):
+  красный столбик (спайк на vmax) и зелёный маркер (сигнал на pmax) были
+  математически на одном уровне ПО ДАННЫМ, но зелёный маркер рисовался
+  кругом радиусом 7px — его верхний КРАЙ визуально выступал выше самой
+  точки данных, тогда как у столбика такого отступа не было. Уменьшил
+  радиус маркера (7 -> 4px) — разрыв между верхними краями сократился с
+  5px до 2px, практически незаметно на глаз.
 - v0.30.17: реальный баг, найден сразу же на первом запуске нового
   backfill'а (v0.30.16) — Gate.io 400 INVALID_PARAM_VALUE на дробный
   `from`. Причина: в _fetch_candles int() применялся к time.time() ДО
@@ -1065,7 +1072,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.17"
+APP_VERSION  = "0.30.18"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -5035,7 +5042,7 @@ def _render_vol_anomaly_chart_png(candles, base_price, anomaly_t=None, signal_pr
     # обводкой, чтобы не сравнивать текст алерта с осью на глаз
     sx = pts_price[-1][0]
     sy = y_price(signal_price) if signal_price else pts_price[-1][1]
-    d.ellipse([sx - 7, sy - 7, sx + 7, sy + 7], fill=signal_color, outline=(20, 60, 30), width=2)
+    d.ellipse([sx - 4, sy - 4, sx + 4, sy + 4], fill=signal_color, outline=(20, 60, 30), width=2)
     label = "СИГНАЛ"
     label_x = min(sx - 20, W - pad_r - 55)
     d.text((label_x, sy - 24 if sy > pad_t + 20 else sy + 12), label, fill=signal_color, font=font)
