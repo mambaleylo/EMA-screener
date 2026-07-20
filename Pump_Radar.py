@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.24 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.25 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.25: по прямому запросу — отдельный, простой лог "тикер + время
+  сигнала" (MANUAL_SCAN_CHRONOLOGY_FILE), независимый от полного расчёта.
+  Смысл — даже если за неделю доступа к референс-боту не разгадаем логику
+  отбора, останется чистый список наблюдений, по которому потом можно
+  прогнать уже УЛУЧШЕННЫЕ индикаторы задним числом, не теряя сами
+  наблюдения. Пишется ПЕРВЫМ в _manual_symbol_scan, до любых вычислений —
+  сохранится, даже если детальный скан ниже упадёт. Новый эндпоинт
+  /manual_scan_chronology_export + ссылка на странице. Проверено тестом:
+  корректно пишется и для "сейчас", и для указанной даты/времени.
 - v0.30.24: по прямому замечанию — "сигнал в 3 ночи, тикер ввёл в 9 утра,
   за первые 6 часов не будет данных по объёму?" Именно так и было бы:
   тикер Gate.io всегда даёт ТЕКУЩЕЕ скользящее 24ч окно (на момент запроса,
@@ -1135,7 +1144,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.24"
+APP_VERSION  = "0.30.25"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -5463,6 +5472,7 @@ _vol_peak_lock = threading.Lock()
 
 
 MANUAL_SCAN_HISTORY_FILE = os.path.expanduser("~/pumpradar_manual_scans.json")
+MANUAL_SCAN_CHRONOLOGY_FILE = os.path.expanduser("~/pumpradar_manual_scan_chronology.json")
 MANUAL_SCAN_TIMEFRAMES = ["1h", "4h"]
 MANUAL_SCAN_LOOKBACK_DAYS = {"1h": 14, "4h": 30}   # разумный охват на каждый ТФ
 
@@ -5627,6 +5637,21 @@ def _manual_symbol_scan(symbol, at_ts=None):
     исторических значений на конкретный момент отсюда не достать, при
     at_ts помечается явно (see contract.live_only)."""
     now = time.time()
+    # v0.30.25: по прямому запросу — простой, независимый лог "тикер +
+    # время сигнала", отдельно от полного расчёта ниже. Пишется ПЕРВЫМ,
+    # до любых вычислений — даже если детальный скан ниже упадёт по
+    # какой-то причине, хронология сигналов всё равно сохранится. Смысл —
+    # даже если за эту неделю логику отбора не разгадаем, останется чистый
+    # список "какая монета, когда был сигнал", по которому потом можно
+    # будет прогнать уже УЛУЧШЕННЫЕ индикаторы задним числом, не теряя сами
+    # наблюдения.
+    try:
+        _pump_dump_history_append(MANUAL_SCAN_CHRONOLOGY_FILE, {
+            "symbol": symbol, "signal_ts": int(at_ts) if at_ts else None,
+            "recorded_at": int(now),
+        })
+    except Exception as e:
+        olog(f"[manual_scan] ⚠ не смог записать хронологию для {symbol}: {_explain_error(e)}")
     result = {"ts": int(now), "symbol": symbol, "at_ts": int(at_ts) if at_ts else None,
                "daily": None, "weekly": None, "contract": None, "anomalies": {}}
     result["daily"] = _manual_scan_tf_snapshot(symbol, "1d", at_ts=at_ts)
@@ -8381,6 +8406,7 @@ th,td{padding:6px 8px;text-align:left;border-bottom:1px solid #21262d}
 </div>
 <div class="card">
   <h3 style="margin-top:0">Накопленные сканы <a href="/manual_scan_export" style="float:right;font-size:13px">&#128190; Скачать JSON</a></h3>
+  <p style="font-size:12px;color:#8b949e;margin-top:-6px">Отдельный простой лог "тикер + время сигнала" (независимо от расчётов, на случай если логику пересчёта потом улучшим): <a href="/manual_scan_chronology_export" style="font-size:12px">&#128190; Скачать хронологию</a></p>
   <div id="historyBox"><table><thead><tr><th>Монета</th><th>Когда</th><th>EMA7(W)</th><th>EMA14(W)</th><th>EMA28(W)</th><th>Лесенка(W)</th><th>Vol24ч,$</th><th>Funding</th><th>Всплесков 1h/4h</th></tr></thead><tbody id="historyBody"></tbody></table></div>
 </div>
 <script>
@@ -9271,6 +9297,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 recent = []
             self._json_download({"exported_at": int(time.time()), "count": len(recent),
                                  "records": recent}, "manual_scans")
+
+        elif self.path == "/manual_scan_chronology_export":
+            recent = []
+            try:
+                if os.path.exists(MANUAL_SCAN_CHRONOLOGY_FILE):
+                    with open(MANUAL_SCAN_CHRONOLOGY_FILE) as f:
+                        recent = json.load(f)
+            except Exception:
+                recent = []
+            self._json_download({"exported_at": int(time.time()), "count": len(recent),
+                                 "records": recent}, "manual_scan_chronology")
 
         elif self.path == "/ema_diag" or self.path == "/ema_diag.html":
             body = EMA_DIAG_HTML_PAGE.encode()
