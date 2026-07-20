@@ -1,7 +1,30 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.5 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.6 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.6: четыре улучшения Volume Peak Watcher по запросу.
+  (1, функционально) Более длинный горизонт для z-score:
+  VOL_PEAK_BASELINE_LOOKBACK_MIN=24ч — среднее/std теперь считаются по
+  суткам, не по тому же коротком 4-часовом окне поиска, где сам поиск
+  мог оказаться случайно тихим и завысить z-score на рядовом объёме.
+  Кандидат на "самый крупный" по-прежнему ищется только в свежем окне.
+  Проверено тестом: объём, аномальный для тихих последних 4ч, но обычный
+  для суток — больше не проходит порог.
+  (2, функционально) Скоростная пометка — та же логика, что подтвердилась
+  на обычных пампах (быстрое окно 20/60мин даёт 85% в пользу шорта,
+  медленное 120мин — только 44-57%): если движение от всплеска до
+  подтверждения заняло больше 60 минут, помечаем "медленный характер",
+  та же формулировка попадает и в текст, и в поле slow_move для анализа.
+  (3, функционально) Обратная связь по накопленной статистике —
+  _vol_peak_historical_winrate считает реальный винрейт по УЖЕ решённым
+  (take/stop) сигналам от аномалии объёма для ТОЙ ЖЕ связки ТФ/период
+  EMA, добавляет в текст, если сделок набралось от 10 — иначе молчит, не
+  гадает на 2-3 наблюдениях.
+  (4, только диагностика) Дивергенция объём/цена — классический признак
+  климакса (объём затухает, пока цена ещё растёт последним рывком).
+  Считается по уже имеющимся свечам (без доп. запроса), пишется в поле
+  divergence, НЕ влияет на отправку алерта — накопление данных для
+  будущего разбора. Проверено тестом на явном сценарии затухания.
 - v0.30.5: по запросу — отслеживание цены после сигнала расширено до 4
   часов для обоих (пампа/дампа — было 1ч, аномалии объёма — было 2ч),
   унифицировано. Чекпоинты (v0.29.8/9, для симуляции стоп/тейк задним
@@ -904,7 +927,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.5"
+APP_VERSION  = "0.30.6"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -5098,7 +5121,8 @@ def _pump_detect_loop():
 # пересечения порога, как было с прошлой версией).
 VOL_PEAK_SCAN_POLL_SEC       = 300     # раз в 5 минут — фетч реальных свечей дороже тикеров (только поиск новых всплесков)
 VOL_PEAK_WATCH_POLL_SEC      = 30      # раз в 30 секунд — только живая цена (дёшево), не пропустить момент пересечения порога
-VOL_PEAK_LOOKBACK_MIN        = 240     # ищем всплески объёма в пределах последних 4 часов
+VOL_PEAK_LOOKBACK_MIN        = 240     # ищем САМ всплеск (кандидата) в пределах последних 4 часов — свежий, релевантный сейчас
+VOL_PEAK_BASELINE_LOOKBACK_MIN = 24 * 60   # v0.30.6: но среднее/std для z-score считаем по более длинному окну (24ч) — надёжнее, чем по тому же короткому окну поиска
 VOL_PEAK_ZSCORE_THRESHOLD    = 4.0     # доминирующие всплески ("в самом верху графика"), не мелкая рябь — это подтверждено верно
 VOL_PEAK_EXPIRY_SEC          = 6 * 3600     # расширено обратно с 90 минут — по прямому запросу: не каждый памп успевает подтвердиться за 90 минут, а нормальную защиту от протухания теперь даёт _vol_peak_verify_at_peak (v0.29.2, проверяет ВЕСЬ путь цены с момента всплеска, не полагается на таймер) + постоянный реестр сработавших (v0.28.3) + один активный на монету (v0.28.6)
 VOL_PEAK_CONFIRM_PCT         = 5.0     # насколько цена должна вырасти от цены всплеска, чтобы сразу сработал алерт (без ожидания отката) — подтверждено верно на реальном примере ESP0RTS
@@ -5115,10 +5139,18 @@ _vol_peak_lock = threading.Lock()
 def _find_volume_peaks(symbol):
     """Сканирует ВСЁ окно VOL_PEAK_LOOKBACK_MIN (не только последнюю
     свечу, как раньше) и находит red-свечу с САМЫМ БОЛЬШИМ объёмом во всём
-    окне — если её z-score (относительно среднего/std всех red-свечей)
-    проходит порог. По прямому уточнению — ориентир только на САМЫЙ
-    крупный всплеск в отображаемом окне, не на любой, что просто
-    перевалил порог.
+    окне — если её z-score проходит порог. По прямому уточнению — ориентир
+    только на САМЫЙ крупный всплеск в отображаемом окне, не на любой, что
+    просто перевалил порог.
+    v0.30.6: по запросу — "более длинный горизонт сравнения для z-score".
+    Раньше среднее/std считались по тому же короткому окну
+    (VOL_PEAK_LOOKBACK_MIN=4ч), где искали и сам всплеск — если эти 4 часа
+    сами по себе оказывались необычно тихими, z-score мог получиться
+    завышенным на совершенно рядовом по факту объёме. Теперь среднее/std
+    считаются по ОТДЕЛЬНОМУ, более длинному окну (VOL_PEAK_BASELINE_LOOKBACK_MIN,
+    24 часа) — "нормальный" объём для этой монеты, а кандидат на "самый
+    крупный" по-прежнему ищется только в недавнем окне (свежий, релевантный
+    сейчас всплеск), просто оценивается против более надёжного ориентира.
     v0.28.1: реальный баг — монета часто попадает в топ-N по объёму ИЗ-ЗА
     того же пампа, который мы пытаемся поймать; когда мы её обнаруживаем,
     сам всплеск может быть давним, а цена уже успела дойти до истинного
@@ -5130,20 +5162,25 @@ def _find_volume_peaks(symbol):
     состоялось и отыграно назад до того, как мы его обнаружили — не
     свежий сигнал, отбрасываем."""
     try:
-        days = max(1, math.ceil(VOL_PEAK_LOOKBACK_MIN * 60 / 86400) + 1)
-        candles = _fetch_candles(symbol, "1m", days)
+        days = max(1, math.ceil(VOL_PEAK_BASELINE_LOOKBACK_MIN * 60 / 86400) + 1)
+        all_candles = _fetch_candles(symbol, "1m", days)
     except Exception:
         return []
-    cutoff = time.time() - VOL_PEAK_LOOKBACK_MIN * 60
-    candles = [c for c in candles if c["t"] >= cutoff]
-    red_candles = [c for c in candles if c["close"] < c["open"]]
-    if len(red_candles) < 10:
+    now = time.time()
+    baseline_cutoff = now - VOL_PEAK_BASELINE_LOOKBACK_MIN * 60
+    baseline_candles = [c for c in all_candles if c["t"] >= baseline_cutoff]
+    baseline_red = [c for c in baseline_candles if c["close"] < c["open"]]
+    if len(baseline_red) < 10:
         return []
-    red_vols = [c.get("vol", 0) or 0 for c in red_candles]
+    red_vols = [c.get("vol", 0) or 0 for c in baseline_red]
     mean_v = sum(red_vols) / len(red_vols)
     var = sum((v - mean_v) ** 2 for v in red_vols) / len(red_vols)
     std_v = var ** 0.5
     if std_v <= 0:
+        return []
+    search_cutoff = now - VOL_PEAK_LOOKBACK_MIN * 60
+    red_candles = [c for c in baseline_red if c["t"] >= search_cutoff]
+    if not red_candles:
         return []
     biggest = max(red_candles, key=lambda c: c.get("vol", 0) or 0)
     vol = biggest.get("vol", 0) or 0
@@ -5151,9 +5188,9 @@ def _find_volume_peaks(symbol):
     if z < VOL_PEAK_ZSCORE_THRESHOLD:
         return []
     spike_price = biggest["close"]
-    # v0.29.13: реальная находка — эта проверка ("обнаружено задним числом")
-    # полностью ОТБРАСЫВАЛА кандидата (return []), если цена уже ушла на
-    # 7.5%+ с момента всплеска. Побочный эффект: более значимый (реально
+    # v0.29.13: раньше здесь была проверка "обнаружено задним числом"
+    # (полностью отбрасывала кандидата, если цена уже ушла на 7.5%+ с
+    # момента всплеска). Побочный эффект: более значимый (реально
     # самый крупный) всплеск, случившийся ПОЗЖЕ уже отслеживаемого, мог
     # никогда не попасть даже на сравнение "не крупнее ли он текущего" в
     # _vol_peak_find_loop — если цена после него уже успела заметно
@@ -5267,11 +5304,44 @@ def _vol_peak_fire_alert(symbol, watch_item, current_price, pct_move):
         olog(f"[vol_peak] {symbol}: ошибка рендера графика: {_explain_error(e)}")
 
     spike_ago_min = round((time.time() - watch_item["spike_ts"]) / 60)
+    # v0.30.6: по запросу — та же логика, что подтвердилась данными на
+    # обычных пампах (20/60-минутное окно даёт 85% в пользу шорта,
+    # 120-минутное — только 44-57%): быстрое движение цены от всплеска до
+    # подтверждения надёжнее, чем медленный, долгий отжим. Помечаем так же.
+    speed_note = None
+    if spike_ago_min > 60:
+        speed_note = (f"движение от всплеска до подтверждения заняло {spike_ago_min} мин "
+                      f"(>60) — на обычных пампах такой медленный характер движения давал "
+                      f"заметно более слабый результат для шорта, чем быстрое (~44-57% против ~85%)")
+    # v0.30.6 (пункт 4) — ТОЛЬКО диагностика, не влияет на отправку.
+    # Классический признак климакса/распределения: объём затухает, пока
+    # цена продолжает расти (последний рывок уже "на измене", без
+    # поддержки объёмом). Считаем по свечам ПОСЛЕ всплеска, что уже есть
+    # в candles (для картинки), без доп. запроса.
+    divergence = None
+    try:
+        post_spike = [c for c in candles if c["t"] >= watch_item["spike_ts"]]
+        if len(post_spike) >= 6:
+            mid = len(post_spike) // 2
+            first_half, second_half = post_spike[:mid], post_spike[mid:]
+            vol_first = sum(c.get("vol", 0) or 0 for c in first_half) / len(first_half)
+            vol_second = sum(c.get("vol", 0) or 0 for c in second_half) / len(second_half)
+            price_first = sum(c["close"] for c in first_half) / len(first_half)
+            price_second = sum(c["close"] for c in second_half) / len(second_half)
+            divergence = {
+                "volume_decelerating": vol_second < vol_first,
+                "price_still_rising": price_second > price_first,
+                "vol_first_half": round(vol_first, 1), "vol_second_half": round(vol_second, 1),
+            }
+    except Exception as e:
+        olog(f"[vol_peak] {symbol}: не смог посчитать дивергенцию (диагностика, не критично): {_explain_error(e)}")
+
     caption = (
         f"📐 <b>{symbol}</b> — Pump: {pct_move}% после аномального объёма продаж\n"
         f"Всплеск объёма был {spike_ago_min} мин назад: z-score {watch_item['z']} "
         f"(объём {watch_item['spike_vol']:.0f} против среднего {watch_item['mean']:.0f} ± {watch_item['std']:.0f})\n"
         f"{_fmt_px(watch_item['spike_price'])} -> {_fmt_px(current_price)}"
+        + (f"\n⚠️ {speed_note}" if speed_note else "")
     )
     _send_alert_photo(png, caption)
     olog(f"[vol_peak] {symbol}: цена выросла на {pct_move}% с момента всплеска "
@@ -5282,7 +5352,8 @@ def _vol_peak_fire_alert(symbol, watch_item, current_price, pct_move):
     rec = {"ts": int(now), "symbol": symbol, "z": watch_item["z"], "vol": watch_item["spike_vol"],
            "mean": watch_item["mean"], "std": watch_item["std"], "price": current_price,
            "peak_price": watch_item["spike_price"], "peak_ts": watch_item["spike_ts"],
-           "peak_age_min": spike_ago_min, "pct_move": pct_move,
+           "peak_age_min": spike_ago_min, "pct_move": pct_move, "slow_move": spike_ago_min > 60,
+           "divergence": divergence,
            "schema_version": VOL_ANOMALY_SCHEMA_VERSION, "source_id": source_id,
            "track_until": now + VOL_PEAK_TRACK_WINDOW_SEC, "track_done": False,
            "max_follow_pct": 0.0, "max_reverse_pct": 0.0,
@@ -5298,7 +5369,8 @@ def _vol_peak_fire_alert(symbol, watch_item, current_price, pct_move):
     _pump_dump_history_append(VOL_ANOMALY_HISTORY_FILE, rec)
 
     try:
-        _pump_or_dump_maybe_trigger_ema_signal(symbol, expected_bias="short", triggered_by=source_id)
+        _pump_or_dump_maybe_trigger_ema_signal(symbol, expected_bias="short",
+                                                confidence_note=speed_note, triggered_by=source_id)
     except Exception as e:
         olog(f"[vol_peak] {symbol}: ошибка проверки EMA-триггера: {_explain_error(e)}")
 
@@ -5959,7 +6031,40 @@ def _render_ema_touch_chart_png(touch, lookback=50):
     return buf.getvalue()
 
 
+VOL_PEAK_WINRATE_MIN_SAMPLE = 10   # v0.30.6: не показываем статистику по связке (ТФ/период), пока сделок меньше этого — мала выборка, введёт в заблуждение
+
+
+def _vol_peak_historical_winrate(tf, period):
+    """v0.30.6: по запросу — обратная связь по накопленной статистике.
+    Смотрит на УЖЕ РЕШЁННЫЕ (take/stop) сигналы, пришедшие именно от
+    Volume Peak Watcher (triggered_by начинается с "vol_anomaly|"), для
+    ТОЙ ЖЕ связки таймфрейм+период EMA, и считает реальный винрейт.
+    Пока сделок меньше VOL_PEAK_WINRATE_MIN_SAMPLE — возвращает None,
+    чтобы не сбивать с толку статистикой на 2-3 наблюдениях."""
+    with _weekly_ema_touch_lock:
+        snapshot = list(_weekly_ema_recent)
+    resolved = [r for r in snapshot
+                if r.get("tf") == tf and r.get("period") == period
+                and (r.get("triggered_by") or "").startswith("vol_anomaly|")
+                and r.get("outcome") in ("take", "stop")]
+    if len(resolved) < VOL_PEAK_WINRATE_MIN_SAMPLE:
+        return None
+    wins = sum(1 for r in resolved if r["outcome"] == "take")
+    return wins, len(resolved)
+
+
 def _weekly_ema_fire_alert(touch, confidence_note=None, triggered_by=None):
+    # v0.30.6: если сигнал пришёл от Volume Peak Watcher, добавляем
+    # реальную статистику по этой же связке (ТФ/период), если данных
+    # накопилось достаточно — иначе молчим, не гадаем на 2-3 сделках.
+    if triggered_by and triggered_by.startswith("vol_anomaly|"):
+        stats = _vol_peak_historical_winrate(touch["tf"], touch["period"])
+        if stats:
+            wins, total = stats
+            stats_note = (f"по накопленной статистике эта связка (EMA{touch['period']}, "
+                          f"{'неделя' if touch['tf']=='1w' else 'день'}) от аномалии объёма "
+                          f"дала {wins}/{total} = {wins/total*100:.0f}% в тейк")
+            confidence_note = f"{confidence_note}; {stats_note}" if confidence_note else stats_note
     ladder_note = {"up": "лесенка вверх (здоровый up-тренд)",
                    "down": "лесенка вниз (здоровый down-тренд)",
                    None: "лесенка не выстроена (боковик/переход)"}[touch["ladder"]]
