@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.22 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.23 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.23: по прямому вопросу — "если сигнал был ночью, а тикет загружаю
+  в обед, какие свечи скачаются?" (раньше всегда "последние к текущему
+  моменту", не "на момент сигнала"). Добавлено необязательное поле
+  дата/время на странице /manual_scan — если указано, все свечи (день,
+  неделя, 1h/4h для всплесков) качаются со сдвигом в прошлое (offset_days)
+  и обрезаются по факту только барами, закрывшимися ДО указанного
+  момента — можно заносить данные задним числом, не только для монет,
+  увиденных прямо сейчас, статистика соберётся быстрее. Оговорка: объём
+  за 24ч и funding rate у Gate.io доступны только текущими — при
+  указанной дате помечается явно (contract.live_only). Проверено тестом:
+  скан "на 5 дней назад" даёт другую (более раннюю) цену, чем "сейчас";
+  будущая дата корректно отклоняется.
 - v0.30.22: по запросу — расширен /manual_scan (v0.30.21), на всякий
   случай, пока не знаем, что реально важно для сравнения с внешним
   референс-ботом. Теперь на КАЖДЫЙ таймфрейм (день и неделя, было только
@@ -1112,7 +1124,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.22"
+APP_VERSION  = "0.30.23"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -5444,13 +5456,20 @@ MANUAL_SCAN_TIMEFRAMES = ["1h", "4h"]
 MANUAL_SCAN_LOOKBACK_DAYS = {"1h": 14, "4h": 30}   # разумный охват на каждый ТФ
 
 
-def _manual_scan_find_anomalies(symbol, tf, lookback_days):
-    """v0.30.21: по запросу — ручное исследовательское сканирование монеты
-    (не живой алертинг). Ищет ВСЕ доминирующие всплески объёма в окне (не
-    только самый крупный, как в живом _find_volume_peaks) — чтобы видеть
-    полную картину при сравнении с внешним референс-ботом."""
+def _manual_scan_find_anomalies(symbol, tf, lookback_days, at_ts=None):
+    """v0.30.21/23: по запросу — ручное исследовательское сканирование
+    монеты (не живой алертинг). Ищет ВСЕ доминирующие всплески объёма в
+    окне (не только самый крупный, как в живом _find_volume_peaks) — чтобы
+    видеть полную картину при сравнении с внешним референс-ботом. С at_ts
+    — окно смещается в прошлое (offset_days), обрезка только свечами до
+    указанного момента, для занесения данных задним числом."""
     try:
-        candles = _fetch_candles(symbol, tf, lookback_days)
+        if at_ts is None:
+            candles = _fetch_candles(symbol, tf, lookback_days)
+        else:
+            offset_days = max(0.0, (time.time() - at_ts) / 86400)
+            candles = _fetch_candles(symbol, tf, lookback_days, offset_days=offset_days)
+            candles = [c for c in candles if c["t"] <= at_ts]
     except Exception as e:
         return {"error": _explain_error(e)}
     red_candles = [c for c in candles if c["close"] < c["open"]]
@@ -5472,33 +5491,26 @@ def _manual_scan_find_anomalies(symbol, tf, lookback_days):
     return anomalies[:10]   # топ-10 самых заметных, не заваливать лог
 
 
-def _manual_scan_tf_snapshot(symbol, tf):
-    """v0.30.22: по запросу — единый, богатый снимок по одному ТФ (день
-    или неделя), из ОДНОГО фетча свечей (через уже кэширующий
-    _ema_touch_get_closed_ctx, доп. сетевых запросов не добавляет):
-    EMA7/14/28, SMA7/14/28 (вдруг у референс-бота на самом деле не EMA, а
-    просто похоже названо), ATR + перцентиль (насколько сейчас волатильно
-    относительно последних 100 баров), лесенка (структура тренда по
-    EMA7/14/28), моментум (изменение цены за 1/3/7 последних баров этого
-    ТФ) и положение относительно хая/лоя за последние 30 баров — всё,
-    что может помочь опознать, что у них значит "сильный импульс"."""
-    try:
-        ctx = _ema_touch_get_closed_ctx(symbol, tf)
-    except Exception as e:
-        return {"error": _explain_error(e)}
-    if not ctx:
+def _manual_scan_compute_from_candles(candles):
+    """v0.30.23: общая вычислительная часть (EMA/SMA/ATR/лесенка/моментум/
+    хай-лоу), вынесена отдельно от способа получения свечей — используется
+    и для "сейчас" (через кэшированный ctx), и для "на дату/время" (через
+    отдельный исторический фетч), чтобы не дублировать логику."""
+    min_bars = max(WEEKLY_EMA_PERIODS) + 5
+    if len(candles) < min_bars:
         return {"insufficient_history": True}
-    closes = ctx["closes"]
-    i = ctx["i"]
+    closes = [c["close"] for c in candles]
+    i = len(candles) - 1
     price = closes[i]
-    atr_v = ctx["atr_v"]
-    ema_vals = {p: ctx["ema_arrays"][p][i] for p in (7, 14, 28)}
+    atr_arr = _atr(candles, 14)
+    atr_v = atr_arr[i]
+    if not atr_v:
+        return {"insufficient_history": True}
+    ema_vals = {p: _ema(closes, p)[i] for p in (7, 14, 28)}
     sma_vals = {p: _sma(closes, p)[i] for p in (7, 14, 28)}
-    try:
-        atr_arr = _atr(ctx["candles"], 14)
-        atr_pctl = _atr_percentile(atr_arr, i)
-    except Exception:
-        atr_pctl = None
+    if any(v is None for v in ema_vals.values()):
+        return {"insufficient_history": True}
+    atr_pctl = _atr_percentile(atr_arr, i)
     ladder = _ladder_order([ema_vals[7], ema_vals[14], ema_vals[28]])
     lookback = min(30, i)
     recent = closes[max(0, i - lookback):i + 1]
@@ -5519,7 +5531,36 @@ def _manual_scan_tf_snapshot(symbol, tf):
         "chg_1bar_pct": chg(1), "chg_3bar_pct": chg(min(3, i)), "chg_7bar_pct": chg(min(7, i)),
         "dist_from_30bar_high_pct": round((price - high_30) / high_30 * 100, 2) if high_30 else None,
         "dist_from_30bar_low_pct": round((price - low_30) / low_30 * 100, 2) if low_30 else None,
+        "bar_close_ts": int(candles[i]["t"]),
     }
+
+
+def _manual_scan_tf_snapshot(symbol, tf, at_ts=None):
+    """v0.30.22/23: по запросу — единый, богатый снимок по одному ТФ (день
+    или неделя). Без at_ts — "сейчас", через уже кэширующий
+    _ema_touch_get_closed_ctx (доп. запросов не добавляет). С at_ts (по
+    прямому запросу — "если сигнал был ночью, а тикет загружаю в обед") —
+    отдельный ИСТОРИЧЕСКИЙ фетч со сдвигом в прошлое (offset_days), обрезка
+    по факту только свечами, закрывшимися ДО указанного момента — так
+    можно занести данные задним числом, не только для монет, увиденных
+    прямо сейчас."""
+    if at_ts is None:
+        try:
+            ctx = _ema_touch_get_closed_ctx(symbol, tf)
+        except Exception as e:
+            return {"error": _explain_error(e)}
+        if not ctx:
+            return {"insufficient_history": True}
+        return _manual_scan_compute_from_candles(ctx["candles"][:ctx["i"] + 1])
+    try:
+        fetch_days = WEEKLY_EMA_FETCH_DAYS if tf == "1w" else DAILY_EMA_FETCH_DAYS
+        offset_days = max(0.0, (time.time() - at_ts) / 86400)
+        raw = _fetch_candles(symbol, "1d", fetch_days, offset_days=offset_days)
+    except Exception as e:
+        return {"error": _explain_error(e)}
+    candles = _resample_to_weekly(raw) if tf == "1w" else raw
+    candles = [c for c in candles if c["t"] <= at_ts]
+    return _manual_scan_compute_from_candles(candles)
 
 
 def _manual_scan_get_contract_extras(symbol):
@@ -5541,27 +5582,35 @@ def _manual_scan_get_contract_extras(symbol):
         return {"error": _explain_error(e)}
 
 
-def _manual_symbol_scan(symbol):
-    """v0.30.21/22: по прямому запросу — вводишь тикер, бот сам качает
-    свечи и собирает широкий набор данных (не только EMA — на всякий
-    случай, пока не знаем, что именно важно для сравнения с внешним
-    референс-ботом): EMA/SMA/ATR/лесенка/моментум по дню И неделе, объём
-    (24ч + всплески на 1h/4h), funding rate. Не даёт сигнал сам по себе,
-    просто копит данные. Не влияет на живые алерты вообще."""
+def _manual_symbol_scan(symbol, at_ts=None):
+    """v0.30.21/22/23: по прямому запросу — вводишь тикер (и, по желанию,
+    дату/время сигнала — "если сигнал был ночью, а тикет загружаю в
+    обед") — бот качает свечи НА ТОТ МОМЕНТ (не всегда "сейчас") и
+    собирает широкий набор данных (не только EMA — на всякий случай, пока
+    не знаем, что именно важно для сравнения с внешним референс-ботом):
+    EMA/SMA/ATR/лесенка/моментум по дню И неделе, объём (24ч + всплески
+    на 1h/4h), funding rate. at_ts=None — обычное "сейчас". Не даёт
+    сигнал сам по себе, просто копит данные. Не влияет на живые алерты
+    вообще. Оговорка: объём/funding у Gate.io доступны только ТЕКУЩИМИ —
+    исторических значений на конкретный момент отсюда не достать, при
+    at_ts помечается явно (see contract.live_only)."""
     now = time.time()
-    result = {"ts": int(now), "symbol": symbol, "daily": None, "weekly": None,
-               "contract": None, "anomalies": {}}
-    result["daily"] = _manual_scan_tf_snapshot(symbol, "1d")
-    result["weekly"] = _manual_scan_tf_snapshot(symbol, "1w")
+    result = {"ts": int(now), "symbol": symbol, "at_ts": int(at_ts) if at_ts else None,
+               "daily": None, "weekly": None, "contract": None, "anomalies": {}}
+    result["daily"] = _manual_scan_tf_snapshot(symbol, "1d", at_ts=at_ts)
+    result["weekly"] = _manual_scan_tf_snapshot(symbol, "1w", at_ts=at_ts)
     result["contract"] = _manual_scan_get_contract_extras(symbol)
+    if at_ts:
+        result["contract"]["live_only"] = True   # объём/funding тут всегда ТЕКУЩИЕ, не на at_ts
     for tf in MANUAL_SCAN_TIMEFRAMES:
         try:
             result["anomalies"][tf] = _manual_scan_find_anomalies(
-                symbol, tf, MANUAL_SCAN_LOOKBACK_DAYS.get(tf, 14))
+                symbol, tf, MANUAL_SCAN_LOOKBACK_DAYS.get(tf, 14), at_ts=at_ts)
         except Exception as e:
             result["anomalies"][tf] = {"error": _explain_error(e)}
     _pump_dump_history_append(MANUAL_SCAN_HISTORY_FILE, result)
-    olog(f"[manual_scan] {symbol}: скан завершён, записан в {MANUAL_SCAN_HISTORY_FILE}")
+    when_note = f" на момент {time.strftime('%Y-%m-%d %H:%M', time.localtime(at_ts))}" if at_ts else ""
+    olog(f"[manual_scan] {symbol}: скан завершён{when_note}, записан в {MANUAL_SCAN_HISTORY_FILE}")
     return result
 
 
@@ -8286,7 +8335,13 @@ th,td{padding:6px 8px;text-align:left;border-bottom:1px solid #21262d}
 <div class="card">
   <h2 style="margin-top:0">Ручной скан монеты (для сравнения с внешним референс-ботом)</h2>
   <p style="font-size:13px;color:#8b949e">Вводишь тикер — качаются свечи по нескольким ТФ, ищутся всплески объёма + смотрится статус недельных EMA7/14/28. Не влияет на живые алерты, только копит данные.</p>
-  <input id="symbolInput" placeholder="SYMBOL (например FF)">
+  <div style="margin-bottom:8px"><input id="symbolInput" placeholder="SYMBOL (например FF)"></div>
+  <div style="margin-bottom:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+    <label style="font-size:12px;color:#8b949e">Дата/время сигнала (необязательно — если пусто, берётся "сейчас"):</label>
+    <input type="date" id="scanDateInput" style="width:150px">
+    <input type="time" id="scanTimeInput" style="width:110px">
+    <button class="secondary" onclick="clearDateTime()" style="font-size:12px;padding:6px 10px">Очистить (сейчас)</button>
+  </div>
   <button onclick="doScan()">Сканировать</button>
   <span id="scanMsg" style="font-size:12px;color:#8b949e;margin-left:8px"></span>
   <div id="resultBox" style="margin-top:12px"></div>
@@ -8300,15 +8355,29 @@ async function doScan(){
   const symbol = document.getElementById('symbolInput').value.trim();
   const msg = document.getElementById('scanMsg');
   if(!symbol){ msg.style.color='#f85149'; msg.innerText='Введи тикер'; return; }
+  const dateVal = document.getElementById('scanDateInput').value;
+  const timeVal = document.getElementById('scanTimeInput').value;
+  let at_ts = null;
+  if(dateVal){
+    const dt = new Date(dateVal + 'T' + (timeVal || '00:00') + ':00');
+    if(isNaN(dt.getTime())){ msg.style.color='#f85149'; msg.innerText='Некорректная дата/время'; return; }
+    at_ts = Math.floor(dt.getTime()/1000);
+  }
   msg.style.color='#8b949e'; msg.innerText='Сканирую...';
   try{
-    const r = await fetch('/manual_scan', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({symbol})});
+    const payload = {symbol};
+    if(at_ts) payload.at_ts = at_ts;
+    const r = await fetch('/manual_scan', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
     const d = await r.json();
     if(!d.ok){ msg.style.color='#f85149'; msg.innerText = d.msg || 'Ошибка'; return; }
-    msg.style.color='#3fb950'; msg.innerText='Готово';
+    msg.style.color='#3fb950'; msg.innerText = at_ts ? 'Готово (на указанный момент)' : 'Готово (сейчас)';
     document.getElementById('resultBox').innerHTML = '<pre>'+JSON.stringify(d.result, null, 2)+'</pre>';
     loadHistory();
   }catch(e){ msg.style.color='#f85149'; msg.innerText='Ошибка запроса'; }
+}
+function clearDateTime(){
+  document.getElementById('scanDateInput').value = '';
+  document.getElementById('scanTimeInput').value = '';
 }
 async function loadHistory(){
   try{
@@ -8319,7 +8388,9 @@ async function loadHistory(){
       const ct = rec.contract || {};
       const a1 = (rec.anomalies && rec.anomalies['1h'] && rec.anomalies['1h'].length) || 0;
       const a4 = (rec.anomalies && rec.anomalies['4h'] && rec.anomalies['4h'].length) || 0;
-      const when = new Date(rec.ts*1000).toLocaleString();
+      const when = rec.at_ts
+        ? new Date(rec.at_ts*1000).toLocaleString() + ' <span style="color:#8b949e">(задним числом)</span>'
+        : new Date(rec.ts*1000).toLocaleString();
       const vol = ct.volume_24h_usd ? Number(ct.volume_24h_usd).toLocaleString() : '-';
       const fr = ct.funding_rate!=null ? (ct.funding_rate*100).toFixed(3)+'%' : '-';
       return `<tr><td>${rec.symbol}</td><td>${when}</td><td>${we.ema7?we.ema7.toPrecision(6):'-'}</td><td>${we.ema14?we.ema14.toPrecision(6):'-'}</td><td>${we.ema28?we.ema28.toPrecision(6):'-'}</td><td>${we.ladder||'-'}</td><td>${vol}</td><td>${fr}</td><td>${a1}/${a4}</td></tr>`;
@@ -9280,8 +9351,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json({"ok": False, "msg": "Не указан symbol"}); return
             if not symbol.endswith("_USDT"):
                 symbol = symbol + "_USDT"
+            at_ts = None
+            if isinstance(body, dict) and body.get("at_ts"):
+                try:
+                    at_ts = float(body["at_ts"])
+                    if at_ts > time.time():
+                        self._json({"ok": False, "msg": "Дата/время в будущем — так не получится"}); return
+                except (TypeError, ValueError) as e:
+                    self._json({"ok": False, "msg": f"Некорректная дата/время: {_explain_error(e)}"}); return
             try:
-                result = _manual_symbol_scan(symbol)
+                result = _manual_symbol_scan(symbol, at_ts=at_ts)
                 self._json({"ok": True, "result": result})
             except Exception as e:
                 self._json({"ok": False, "msg": _explain_error(e)})
