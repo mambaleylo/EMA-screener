@@ -1,7 +1,22 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.12 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.13 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.13: два изменения по прямому запросу. (1) Реальный баг —
+  многострочный текст алерта в HTTP-заголовке Message ломал весь запрос
+  к ntfy (InvalidHeader, HTTP-заголовки не поддерживают переносы строк) —
+  картинка тихо не доходила НИКОГДА, с самого v0.30.11. Перенёс текст в
+  query-параметр (там перенос строки нормально кодируется). Проверено
+  тестом на реальном многострочном тексте — запрос больше не падает.
+  (2) Новое отдельное уведомление — по подтверждённой находке (1w EMA28,
+  60.5% отскок для шорта на n=76, самый заметный уровень из всех
+  проверенных): пока мы продолжаем отслеживать уже сработавший сигнал
+  (памп/дамп/аномалия объёма), на каждом опросе цена ТАКЖЕ проверяется на
+  близость к EMA28(W) — не только в момент исходного сигнала, а в течение
+  всего времени слежения. Если цена подходит близко (тот же допуск, что
+  и у обычного касания) — шлётся отдельный алерт, один раз на запись (не
+  спамит на каждом опросе). Проверено тестом: первое приближение шлёт
+  алерт и помечает запись, повторные опросы — тишина.
 - v0.30.12: по прямому запросу "сделай как у него" — сверил три свежих
   скрина референса (PTB, TLM, SUSHI) пиксель в пиксель. Подтверждено: у
   него цена и объём ТОЖЕ делят одну высоту графика (та же независимая
@@ -1006,7 +1021,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.12"
+APP_VERSION  = "0.30.13"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4138,8 +4153,8 @@ def _send_alert_photo(png_bytes, caption):
         if NTFY_URL:
             try:
                 requests.post(NTFY_URL, data=png_bytes,
-                              headers={"Filename": "chart.png",
-                                       "Message": _strip_html_for_ntfy(caption)[:4096]},
+                              headers={"Filename": "chart.png"},
+                              params={"message": _strip_html_for_ntfy(caption)[:4096]},
                               timeout=15)
             except Exception as e:
                 olog(f"⚠ ntfy фото: {_explain_error(e)}")
@@ -5086,6 +5101,7 @@ def _pump_dump_track_loop():
                                 rec["last_tracked_price"] = price
                                 rec["last_tracked_ts"] = int(now)
                                 _track_record_checkpoint(rec, now, follow)
+                                _maybe_fire_ema28w_reversal_alert(rec, sym, price, kind)
                                 changed = True
                             if now >= rec.get("track_until", 0):
                                 rec["track_done"] = True
@@ -5802,6 +5818,7 @@ def _vol_anomaly_track_loop():
                             path = rec.get("path", [])
                             path.append({"ts": int(now), "price": price})
                             rec["path"] = path
+                            _maybe_fire_ema28w_reversal_alert(rec, sym, price, "аномалия объёма")
                             changed = True
                         if now >= rec.get("track_until", 0):
                             rec["track_done"] = True
@@ -5952,6 +5969,57 @@ def _ema_touch_get_closed_ctx(symbol, tf):
     with _ema_touch_ctx_lock:
         _ema_touch_ctx_cache[key] = ctx
     return ctx
+
+
+def _check_ema28w_proximity(symbol, price):
+    """v0.30.13: по запросу — отдельно от исходного сигнала. Подтверждено
+    на диагностике (3800+ наблюдений): 1w EMA28 — самый заметный уровень
+    из всех проверенных (60.5% отскок для шорта на n=76, против 25-40% у
+    большинства других связок). Пока мы продолжаем отслеживать УЖЕ
+    сработавший сигнал (памп/дамп/аномалия объёма), эта функция проверяет
+    — не подошла ли цена ПОЗЖЕ (не обязательно в момент исходного
+    сигнала) близко к этому конкретному уровню. Переиспользует тот же
+    кэшированный контекст и тот же допуск (WEEKLY_EMA_TOUCH_ATR), что и
+    обычная проверка касания — ничего нового не считает, просто смотрит
+    отдельно."""
+    try:
+        ctx = _ema_touch_get_closed_ctx(symbol, "1w")
+        if not ctx:
+            return None
+        i = ctx["i"]
+        atr_v = ctx["atr_v"]
+        ema28_arr = ctx["ema_arrays"].get(28)
+        if not atr_v or not ema28_arr or ema28_arr[i] is None:
+            return None
+        ema_value = ema28_arr[i]
+        dist_atr = abs(price - ema_value) / atr_v
+        if dist_atr <= WEEKLY_EMA_TOUCH_ATR:
+            return {"ema_value": ema_value, "dist_atr": round(dist_atr, 3)}
+        return None
+    except Exception:
+        return None
+
+
+def _maybe_fire_ema28w_reversal_alert(rec, symbol, price, source_label):
+    """Общий помощник для трёх трек-лупов (памп/дамп/аномалия объёма) —
+    если запись ещё не помечена (ema28w_alerted), проверяет близость к
+    EMA28(W) и, если найдена, шлёт ОТДЕЛЬНОЕ уведомление и помечает
+    запись, чтобы не спамить повторно на каждом опросе. Возвращает True,
+    если запись изменилась (нужно сохранить)."""
+    if rec.get("ema28w_alerted"):
+        return False
+    prox = _check_ema28w_proximity(symbol, price)
+    if not prox:
+        return False
+    rec["ema28w_alerted"] = True
+    msg = (f"📍 <b>{symbol}</b> — цена после сигнала ({source_label}) подошла к EMA28(W)\n"
+           f"Уровень: {_fmt_px(prox['ema_value'])} | текущая цена: {_fmt_px(price)} | "
+           f"расстояние: {prox['dist_atr']} ATR\n"
+           f"По диагностике — самый заметный уровень из проверенных (60.5% отскок для шорта на n=76)")
+    _send_alert(msg)
+    olog(f"[ema28w] {symbol}: цена подошла к EMA28(W) во время отслеживания {source_label} "
+         f"({price:.6g} рядом с {prox['ema_value']:.6g}, {prox['dist_atr']} ATR)")
+    return True
 
 
 def _ema_touch_check_symbol(symbol, tf="1w"):
