@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.35 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.36 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.36: по прямому вопросу — "отслеживаем ли статистику этих
+  сигналов, и где она". Данные УЖЕ были (каждая запись хранит
+  triggered_by и итог take/stop/open), просто не было готовой сводки.
+  Новая _weekly_ema_source_stats() разбивает по источнику (памп/дамп
+  напрямую, аномалия объёма, накопленный импульс) с винрейтом среди уже
+  решённых. Новый эндпоинт /weekly_ema_source_stats + блок на главной
+  странице над сводкой EMA-касаний, обновляется раз в 15с вместе с
+  остальным. Проверено тестом: разбивка считается верно, эндпоинт
+  отдаёт корректный JSON.
 - v0.30.35: реальная находка на расширенной выборке (19 сигналов
   референс-бота суммарно за две партии) — порог по накопленному
   недельному движению (SLOW_IMPULSE_MIN_WEEKLY_CHG_PCT=15%, v0.30.28)
@@ -1259,7 +1268,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.35"
+APP_VERSION  = "0.30.36"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3498,6 +3507,7 @@ details[open] summary:before{content:"▾ "}
     <h3>&#128204; Касания EMA7/14/28 (триггер — памп/дамп/объём)</h3>
     <div><a href="/weekly_ema_export" style="text-decoration:none"><button style="background:#21262d;border:1px solid #30363d;margin-right:6px">&#128190;</button></a><button onclick="clearHistory('weekly_ema')" class="btn-danger-sm">Очистить</button></div>
   </div>
+  <div id="sourceStatsBox" style="font-size:12px;color:#8b949e;margin-bottom:8px"></div>
   <div id="weeklyEmaSummary" class="summary-line">пока не было срабатываний</div>
   <div class="table-scroll">
     <table id="weeklyEma"><thead><tr><th>Монета</th><th>ТФ</th><th>EMA</th><th>Цена</th><th>Вход</th><th>Стоп</th><th>Тейк</th><th>Исход</th><th>Расст. (ATR)</th><th>Подход</th><th>Тренд</th><th>Когда</th></tr></thead><tbody></tbody></table>
@@ -3798,7 +3808,20 @@ pollPumpLogs(); setInterval(pollPumpLogs, 4000);
 refreshPumps(); setInterval(refreshPumps, 8000);
 refreshDumps(); setInterval(refreshDumps, 8000);
 refreshVolAnomaly(); setInterval(refreshVolAnomaly, 8000);
+async function loadSourceStats(){
+  try{
+    const r = await fetch('/weekly_ema_source_stats'); const d = await r.json();
+    const box = document.getElementById('sourceStatsBox');
+    const stats = d.stats || [];
+    if(!stats.length){ box.innerHTML = ''; return; }
+    box.innerHTML = 'По источнику: ' + stats.map(s => {
+      const wr = s.win_rate_pct != null ? `, винрейт ${s.win_rate_pct}%` : '';
+      return `<b>${s.source}</b> — ${s.total} (тейк ${s.take}/стоп ${s.stop}/открыто ${s.open}${wr})`;
+    }).join(' &nbsp;·&nbsp; ');
+  }catch(e){}
+}
 refreshWeeklyEma(); setInterval(refreshWeeklyEma, 15000);
+loadSourceStats(); setInterval(loadSourceStats, 15000);
 </script></body></html>"""
 
 
@@ -7107,6 +7130,44 @@ def _slow_impulse_scan_loop():
         time.sleep(SLOW_IMPULSE_SCAN_POLL_SEC)
 
 
+def _weekly_ema_source_stats():
+    """v0.30.36: по прямому вопросу — "отслеживаем ли статистику сигналов
+    этих [источников], и где она". Данные УЖЕ были (каждая запись
+    _weekly_ema_recent хранит triggered_by и итог take/stop/open), просто
+    не было готовой сводки по источнику. Разбивает по: памп/дамп напрямую
+    (triggered_by пусто), аномалия объёма, накопленный импульс
+    (slow_impulse) — с винрейтом среди уже решённых (take/stop)."""
+    with _weekly_ema_touch_lock:
+        snapshot = list(_weekly_ema_recent)
+
+    def classify(triggered_by):
+        if not triggered_by:
+            return "памп/дамп напрямую"
+        if triggered_by.startswith("vol_anomaly|"):
+            return "аномалия объёма"
+        if triggered_by.startswith("slow_impulse|"):
+            return "накопленный импульс"
+        return "прочее"
+
+    stats = {}
+    for r in snapshot:
+        cat = classify(r.get("triggered_by"))
+        s = stats.setdefault(cat, {"total": 0, "take": 0, "stop": 0, "open": 0})
+        s["total"] += 1
+        outcome = r.get("outcome", "open")
+        if outcome in ("take", "stop", "open"):
+            s[outcome] += 1
+    result = []
+    for cat, s in stats.items():
+        resolved = s["take"] + s["stop"]
+        win_rate = round(s["take"] / resolved * 100, 1) if resolved else None
+        result.append({"source": cat, "total": s["total"], "take": s["take"],
+                        "stop": s["stop"], "open": s["open"],
+                        "resolved": resolved, "win_rate_pct": win_rate})
+    result.sort(key=lambda x: -x["total"])
+    return result
+
+
 def _weekly_ema_resolve_loop():
     """Фоновый цикл: раз в WEEKLY_EMA_RESOLVE_POLL_SEC проверяет все ещё
     ОТКРЫТЫЕ сигналы из истории на предмет тейка/стопа (простая гонка
@@ -9488,6 +9549,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             with _weekly_ema_touch_lock:
                 recent = list(_weekly_ema_recent[-100:])
             self._json({"recent": recent})
+        elif self.path == "/weekly_ema_source_stats":
+            self._json({"stats": _weekly_ema_source_stats()})
         elif self.path == "/pump_export":
             recent = []
             try:
