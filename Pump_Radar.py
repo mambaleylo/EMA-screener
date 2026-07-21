@@ -1,7 +1,29 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.44 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.46 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.46: разгадал, почему MITO/NAORIS/AVAAI из ручного скана выглядели
+  так, будто должны были сработать, а не сработали. Ручной скан считает
+  dist_atr от цены ПОСЛЕДНЕЙ ЗАКРЫТОЙ свечи (bar_close_ts — у недельного
+  ТФ это может быть 5-6 дней в прошлом), а реальный движок
+  (_ema_touch_check_symbol) сравнивает с ЖИВОЙ ценой прямо сейчас — за
+  дни между закрытием бара и моментом скана цена вполне могла уйти от
+  уровня. Ручной скан теперь ДОПОЛНИТЕЛЬНО прогоняет ВСЕ те же гейты,
+  что и slow_impulse (живая дистанция, cooldown, гейт по аномалии
+  объёма, потолок/пол объёма) и пишет единый вердикт "live_engine_check"
+  с полем would_fire_now — теперь видно НАПРЯМУЮ, сработает движок
+  прямо сейчас или нет, и если нет — на каком именно гейте застряло.
+- v0.30.45: реальный баг от своей же правки (v0.30.44) — экспорт
+  показал 191 skipped_cooldown / 9 open за ОДИН цикл сканирования (10
+  мин), и все 191 — РАЗНЫЕ монеты, не дубли. Значит на каждый цикл
+  уходит ~190+ новых diag-записей в общий _weekly_ema_recent (кап 200)
+  — буфер целиком перезаписывается ОДНИМ циклом, и реально открытые
+  сделки ("open"), которые резолвер ждёт для проверки тейка/стопа,
+  вымывались из истории быстрее, чем успевали разрешиться. Заведён
+  отдельный, НЕперсистируемый _weekly_ema_skipped (свой кап 200) — на
+  экспорте (/weekly_ema_export) оба буфера склеиваются в один файл
+  (как и просили — не два разных файла), а резолвер и сохранение на
+  диск по-прежнему трогают только _weekly_ema_recent.
 - v0.30.44: 9 из его 22 сигналов совпали с нашими за всё время (HEMI,
   PIEVERSE, SAPIEN, COAI, XPIN, HAEDAL, JCT, EVAA, HANA) — остальные 13
   (B, SAGA, TURTLE, UB, ERA, BLESS, BANANA, TREE, USELESS, ME, BLUAI,
@@ -1382,7 +1404,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.44"
+APP_VERSION  = "0.30.46"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -6019,6 +6041,50 @@ def _manual_symbol_scan(symbol, at_ts=None, side=None, ref_entry=None, ref_stop=
                 symbol, tf, MANUAL_SCAN_LOOKBACK_DAYS.get(tf, 14), at_ts=at_ts)
         except Exception as e:
             result["anomalies"][tf] = {"error": _explain_error(e)}
+    # v0.30.46: реальная находка — "weekly"/"daily" выше считают dist_atr
+    # от ЦЕНЫ ПОСЛЕДНЕЙ ЗАКРЫТОЙ свечи (bar_close_ts, может быть на дни
+    # старее момента скана), а живой движок (_ema_touch_check_symbol,
+    # ровно то, что реально решает — слать алерт или нет) сравнивает с
+    # ЖИВОЙ ценой прямо сейчас. Из-за этого расхождения ручной скан мог
+    # показывать "должно было сработать" (dist_atr по старой цене мал),
+    # хотя на живой цене монета уже отошла от уровня и движок закономенно
+    # молчал. Теперь скан прогоняет ВСЕ те же гейты, что и реальный
+    # slow_impulse (живая дистанция, cooldown, гейт по аномалии объёма,
+    # потолок/пол объёма) и даёт единый вердикт would_fire_now — без
+    # этого поля "почему не сработало" было только гадать по кускам.
+    if at_ts:
+        result["live_engine_check"] = {"note": "не считается для исторического скана (at_ts задан)"}
+    else:
+        try:
+            live_touches = _ema_touch_check_symbol(symbol, "1w")
+            live_out = []
+            max_z = None
+            for tf_a in MANUAL_SCAN_TIMEFRAMES:
+                an = result["anomalies"].get(tf_a)
+                if isinstance(an, list):
+                    for a in an:
+                        if max_z is None or a["z"] > max_z:
+                            max_z = a["z"]
+            anomaly_ok = (not SLOW_IMPULSE_REQUIRE_SELL_ANOMALY) or \
+                         (max_z is not None and max_z >= VOL_PEAK_ZSCORE_THRESHOLD)
+            vol24 = (result["contract"] or {}).get("volume_24h_usd")
+            volume_ok = vol24 is not None and SLOW_IMPULSE_MIN_VOLUME_USD <= vol24 <= SLOW_IMPULSE_MAX_VOLUME_USD
+            for t in live_touches:
+                k = f"{symbol}|1w|{t['period']}"
+                with _weekly_ema_touch_lock:
+                    last_fire = _weekly_ema_touch_state.get(k, 0)
+                cooldown_left = max(0, round(WEEKLY_EMA_TOUCH_COOLDOWN_SEC - (time.time() - last_fire)))
+                live_out.append({"period": t["period"], "dist_atr": t["dist_atr"],
+                                  "side": t["side"], "classic_bias": t["classic_bias"],
+                                  "cooldown_remaining_sec": cooldown_left})
+            would_fire = bool(live_out) and volume_ok and anomaly_ok and \
+                         any(x["cooldown_remaining_sec"] == 0 for x in live_out)
+            result["live_engine_check"] = {
+                "touches": live_out, "max_anomaly_z": max_z, "anomaly_ok": anomaly_ok,
+                "volume_24h_usd": vol24, "volume_ok": volume_ok, "would_fire_now": would_fire,
+            }
+        except Exception as e:
+            result["live_engine_check"] = {"error": _explain_error(e)}
     _pump_dump_history_append(MANUAL_SCAN_HISTORY_FILE, result)
     when_note = f" на момент {time.strftime('%Y-%m-%d %H:%M', time.localtime(at_ts))}" if at_ts else ""
     olog(f"[manual_scan] {symbol}: скан завершён{when_note}, записан в {MANUAL_SCAN_HISTORY_FILE}")
@@ -6646,6 +6712,18 @@ EMA_TOUCH_LIVE_ONLY_SHORT = True
 _weekly_ema_touch_lock = threading.Lock()
 _weekly_ema_touch_state = {}   # "symbol|tf|period" -> last_alert_ts
 _weekly_ema_recent = []        # последние сработавшие касания — для /weekly_ema_status
+_weekly_ema_skipped = []       # v0.30.45: ОТДЕЛЬНЫЙ буфер для срезанных кандидатов
+                                # (skipped_cooldown/skipped_no_anomaly) — НЕ персистится,
+                                # НЕ используется резолвером исхода. Раньше (v0.30.44) эти
+                                # записи шли в ТОТ ЖЕ _weekly_ema_recent — реальная находка:
+                                # за один цикл сканирования (10 мин) это ~190 разных монет
+                                # разом, буфер на 200 записей забивался целиком ОДНИМ циклом,
+                                # и реально открытые сделки ("open"), которые ждут резолва
+                                # тейка/стопа, вымывались из истории быстрее, чем успевали
+                                # разрешиться — резолвер терял их из виду. На экспорте
+                                # (/weekly_ema_export) оба буфера склеиваются в один файл —
+                                # для пользователя выглядит так же, как раньше, а по факту
+                                # реальные сделки больше не страдают от диагностического шума.
 WEEKLY_EMA_HISTORY_FILE = os.path.expanduser("~/pumpradar_weekly_ema_history.json")
 
 
@@ -7344,10 +7422,10 @@ def _slow_impulse_append_diag(touch, outcome, cooldown_remaining_sec, anomaly_z,
            "anomaly_z": anomaly_z, "anomaly_count": anomaly_count,
            "cooldown_remaining_sec": cooldown_remaining_sec,
            "outcome": outcome, "resolved_at": None, "resolved_price": None}
-    global _weekly_ema_recent
+    global _weekly_ema_skipped
     with _weekly_ema_touch_lock:
-        _weekly_ema_recent.append(rec)
-        _weekly_ema_recent = _weekly_ema_recent[-200:]
+        _weekly_ema_skipped.append(rec)
+        _weekly_ema_skipped = _weekly_ema_skipped[-200:]
 
 
 def _slow_impulse_scan_loop():
@@ -9898,7 +9976,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                  "records": recent}, "ema28w_touch_history")
         elif self.path == "/weekly_ema_export":
             with _weekly_ema_touch_lock:
-                recent = list(_weekly_ema_recent)
+                recent = list(_weekly_ema_recent) + list(_weekly_ema_skipped)
+            recent.sort(key=lambda r: r.get("ts", 0))
             self._json_download({"exported_at": int(time.time()), "count": len(recent),
                                  "records": recent}, "weekly_ema_signals")
         elif self.path == "/alert_cfg":
