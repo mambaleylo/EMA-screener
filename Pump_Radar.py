@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.33 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.34 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.34: по запросу — общая панель навигации в шапке всех пяти
+  активных страниц (Главная /ema, Ручной скан /manual_scan, EMA
+  Диагностика /ema_diag, Pump Match /pump_match, Бэктест EMA
+  /weekly_ema_backtest) — переход между ними теперь в один клик, не через
+  ручной ввод адреса. Старая /ema_full (нерабочий EMA Invert движок,
+  сейчас не запущен) намеренно не тронута — незачем вести туда. Проверено
+  тестом на всех пяти страницах.
 - v0.30.33: реальная находка на живых скринах — ntfy получил WLD_USDT и
   ADA_USDT (07:48), а Telegram по тем же сигналам молчал вообще. Причина
   не в коде-асимметрии (проверено ранее — оба канала действительно
@@ -1241,7 +1248,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.33"
+APP_VERSION  = "0.30.34"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3367,6 +3374,14 @@ details[open] summary:before{content:"▾ "}
   .section-card{padding:10px;margin-top:10px}
 }
 </style></head><body>
+<div style="background:#161b22;border-bottom:1px solid #30363d;padding:8px 12px;display:flex;gap:6px;flex-wrap:wrap;font-size:12px">
+  <a href="/ema" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#127968; Главная</a>
+  <a href="/manual_scan" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128269; Ручной скан</a>
+  <a href="/ema_diag" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128202; EMA Диагностика</a>
+  <a href="/pump_match" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#127919; Pump Match</a>
+  <a href="/weekly_ema_backtest" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128200; Бэктест EMA</a>
+</div>
+
 <h1>&#128225; Pump Radar <span style="font-size:12px;color:#8b949e;font-weight:normal">v__APP_VERSION__</span></h1>
 <p style="color:#8b949e;font-size:13px;max-width:480px">Детектит резкий рост цены (памп) по топ-монетам Gate.io и шлёт алерт в Telegram с картинкой. Старый EMA-инверт движок отключён и не показан — код остался в файле, просто не в фокусе сейчас.</p>
 <button onclick="openAlertSettings()" style="background:#21262d;border:1px solid #30363d">&#128276; Алерты</button>
@@ -8662,6 +8677,14 @@ pre{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px;o
 table{width:100%;border-collapse:collapse;font-size:13px}
 th,td{padding:6px 8px;text-align:left;border-bottom:1px solid #21262d}
 </style></head><body>
+<div style="background:#161b22;border-bottom:1px solid #30363d;padding:8px 12px;display:flex;gap:6px;flex-wrap:wrap;font-size:12px">
+  <a href="/ema" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#127968; Главная</a>
+  <a href="/manual_scan" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128269; Ручной скан</a>
+  <a href="/ema_diag" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128202; EMA Диагностика</a>
+  <a href="/pump_match" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#127919; Pump Match</a>
+  <a href="/weekly_ema_backtest" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128200; Бэктест EMA</a>
+</div>
+
 <div class="card">
   <h2 style="margin-top:0">Ручной скан монеты (для сравнения с внешним референс-ботом)</h2>
   <p style="font-size:13px;color:#8b949e">Вводишь тикер — качаются свечи по нескольким ТФ, ищутся всплески объёма + смотрится статус недельных EMA7/14/28. Не влияет на живые алерты, только копит данные.</p>
@@ -8775,6 +8798,14 @@ tbody tr:hover{background:#1c2128}
 select,input{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px;font-size:13px}
 .summary-line{font-size:13px;color:#8b949e;margin-top:6px}
 </style></head><body>
+<div style="background:#161b22;border-bottom:1px solid #30363d;padding:8px 12px;display:flex;gap:6px;flex-wrap:wrap;font-size:12px">
+  <a href="/ema" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#127968; Главная</a>
+  <a href="/manual_scan" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128269; Ручной скан</a>
+  <a href="/ema_diag" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128202; EMA Диагностика</a>
+  <a href="/pump_match" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#127919; Pump Match</a>
+  <a href="/weekly_ema_backtest" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128200; Бэктест EMA</a>
+</div>
+
 <h1>&#128300; EMA Diagnostics — сбор данных для анализа</h1>
 <p style="color:#8b949e;font-size:13px;max-width:520px">Широкий (не алертовый) скан касаний EMA7/14/28 на 1h/4h/1d/1w — собирает ВСЕ приближения в пределах 1.0 ATR (не только те, что проходят узкий порог для реального сигнала), отслеживает MFE/MAE и срезы через 15/30/60/120/240 минут после касания. Цель — понять, откуда цена реально отскакивает чаще всего, а не только то, что мы уже алертим.</p>
 <p style="color:#d29922;font-size:12px;max-width:520px">⚠️ "Карта ликвидации" в исходном запросе — честно, у нас её нет (нужен платный источник типа Coinglass). Funding rate — единственный реально доступный прокси перекошенности позиций, это не то же самое, показан отдельным полем в сырых записях.</p>
@@ -8965,6 +8996,14 @@ tbody tr:hover{background:#1c2128}
 .table-scroll{overflow-x:auto}
 .section-card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:14px;margin-top:14px}
 </style></head><body>
+<div style="background:#161b22;border-bottom:1px solid #30363d;padding:8px 12px;display:flex;gap:6px;flex-wrap:wrap;font-size:12px">
+  <a href="/ema" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#127968; Главная</a>
+  <a href="/manual_scan" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128269; Ручной скан</a>
+  <a href="/ema_diag" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128202; EMA Диагностика</a>
+  <a href="/pump_match" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#127919; Pump Match</a>
+  <a href="/weekly_ema_backtest" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128200; Бэктест EMA</a>
+</div>
+
 <h1>&#128202; Weekly EMA Backtest — рейтинг угадывания</h1>
 <p style="color:#8b949e;font-size:13px;max-width:480px">Сигнал ищется на НЕДЕЛЬНОМ графике (касание EMA7/14/28), но оценивается БЫСТРАЯ реакция — по 1-минутным свечам в первые часы после касания: достигла ли цена цели (3/4/6/10%) в сторону классического bounce-bias, и за сколько минут. Так, как реально торгуется сигнал — сделки на минуты-час, а не удержание неделями.</p>
 <p style="color:#d29922;font-size:12px;max-width:480px">⚠️ У биржи почти наверняка нет 1m-истории на годы назад — реакцию можно проверить только для сравнительно недавних касаний (см. "макс. давность сигнала" ниже). Для более старых сигналов факт касания всё равно посчитается (total_signals), но в винрейт по реакции они не попадут — это видно по числу "evaluable" в скобках у каждой ячейки.</p>
@@ -9151,6 +9190,14 @@ button{background:#238636;color:#fff;border:0;padding:10px 16px;border-radius:6p
 #previewCard img{max-width:100%;border-radius:6px}
 details summary{cursor:pointer;font-size:13px;color:#8b949e;margin-top:12px}
 </style></head><body>
+<div style="background:#161b22;border-bottom:1px solid #30363d;padding:8px 12px;display:flex;gap:6px;flex-wrap:wrap;font-size:12px">
+  <a href="/ema" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#127968; Главная</a>
+  <a href="/manual_scan" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128269; Ручной скан</a>
+  <a href="/ema_diag" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128202; EMA Диагностика</a>
+  <a href="/pump_match" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#127919; Pump Match</a>
+  <a href="/weekly_ema_backtest" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128200; Бэктест EMA</a>
+</div>
+
 <h1>&#127919; Pump Match — авто-подбор параметров по скрину</h1>
 <p style="color:#8b949e;font-size:13px;max-width:480px">Загрузи скрин чужого бота (пампа), укажи монету и дату — время окна искать НЕ нужно, бот сам сравнит форму ценовой линии со скрина с реальными свечами Gate.io за день и найдёт совпадение. Дальше перебирает варианты отрисовки и подбирает ближайший. Лучший вариант сразу становится рабочим для всех новых алертов.</p>
 
