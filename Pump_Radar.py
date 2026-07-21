@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.34 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.35 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.35: реальная находка на расширенной выборке (19 сигналов
+  референс-бота суммарно за две партии) — порог по накопленному
+  недельному движению (SLOW_IMPULSE_MIN_WEEKLY_CHG_PCT=15%, v0.30.28)
+  резал БОЛЬШЕ реальных сигналов, чем помогал: 6 из 9 их сигналов,
+  прошедших по расстоянию до EMA, не набирали 15% по моментуму (ACE
+  +0.9%, PROVE -3.9%, EPIC -5.8% — далеко ниже, не просто "чуть не
+  дотянули"). Расстояние до EMA само по себе оказалось надёжным
+  критерием (9 из 11 прошли, кроме повторяющегося ERA — там у них,
+  похоже, допуск шире нашего). Убран как БЛОКИРУЮЩИЙ фильтр — остался
+  только как информационная пометка в тексте алерта. Проверено тестом:
+  слабый момент (2%) больше не блокирует отправку, но виден в тексте.
 - v0.30.34: по запросу — общая панель навигации в шапке всех пяти
   активных страниц (Главная /ema, Ручной скан /manual_scan, EMA
   Диагностика /ema_diag, Pump Match /pump_match, Бэктест EMA
@@ -1248,7 +1259,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.34"
+APP_VERSION  = "0.30.35"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -7029,13 +7040,21 @@ def _slow_impulse_maybe_trigger_ema_signal(symbol):
     недель, из-за которого цена вернулась к недельной EMA. Отдельный,
     независимый от пампа/дампа/аномалии объёма источник сигналов — та же
     логика касания, что и везде (_ema_touch_check_symbol, включая
-    "вход=сам уровень EMA" — уже совпадала с их ботом ДО этого сравнения),
-    плюс новый фильтр: заметное накопленное недельное движение перед
-    касанием. Использует ТОТ ЖЕ _weekly_ema_touch_state/cooldown, что и
-    остальные источники — не задублирует алерт, если по этой же связке
-    (символ/период) уже сработал памп/дамп/аномалия объёма недавно.
-    Только 1w — по прямому уточнению, "точки для отскока только ема
-    7 14 и 28 на неделе"."""
+    "вход=сам уровень EMA" — уже совпадала с их ботом ДО этого сравнения).
+    Использует ТОТ ЖЕ _weekly_ema_touch_state/cooldown, что и остальные
+    источники — не задублирует алерт, если по этой же связке (символ/
+    период) уже сработал памп/дамп/аномалия объёма недавно. Только 1w —
+    по прямому уточнению, "точки для отскока только ема 7 14 и 28 на
+    неделе".
+    v0.30.35: реальная находка на РАСШИРЕННОЙ выборке (19 сигналов
+    суммарно за две партии) — порог по накопленному движению
+    (SLOW_IMPULSE_MIN_WEEKLY_CHG_PCT=15%) резал БОЛЬШЕ реальных сигналов
+    референс-бота, чем помогал: 6 из 9 их сигналов, прошедших по
+    расстоянию до EMA, НЕ набирали 15% по моментуму (ACE +0.9%, PROVE
+    -3.9%, EPIC -5.8% — далеко ниже, не просто "чуть не дотянули").
+    Расстояние до EMA само по себе оказалось надёжным критерием (9 из 11
+    прошли), момент — нет. Убран как БЛОКИРУЮЩИЙ фильтр, оставлен только
+    как информационная пометка в тексте алерта, когда он есть."""
     try:
         ctx = _ema_touch_get_closed_ctx(symbol, "1w")
     except Exception as e:
@@ -7044,8 +7063,6 @@ def _slow_impulse_maybe_trigger_ema_signal(symbol):
     if not ctx:
         return
     weekly_chg = _weekly_chg_7bar_pct(ctx)
-    if weekly_chg is None or abs(weekly_chg) < SLOW_IMPULSE_MIN_WEEKLY_CHG_PCT:
-        return
     try:
         touches = _ema_touch_check_symbol(symbol, "1w")
     except Exception as e:
@@ -7058,14 +7075,15 @@ def _slow_impulse_maybe_trigger_ema_signal(symbol):
             last = _weekly_ema_touch_state.get(key, 0)
         if now - last < WEEKLY_EMA_TOUCH_COOLDOWN_SEC:
             continue
-        note = (f"накопленное движение за 7 недельных баров: {weekly_chg:+.1f}% "
-                f"(не резкий памп/дамп — источник: сравнение с внешним референс-ботом)")
+        note = (f"накопленное движение за 7 недельных баров: {weekly_chg:+.1f}%"
+                if weekly_chg is not None else None)
         source_id = f"slow_impulse|{symbol}|{int(now)}"
         _weekly_ema_fire_alert(touch, confidence_note=note, triggered_by=source_id)
         with _weekly_ema_touch_lock:
             _weekly_ema_touch_state[key] = now
-        olog(f"[slow_impulse] {symbol}: недельная EMA{touch['period']} + накопленное "
-             f"движение {weekly_chg:+.1f}% — сигнал отправлен")
+        chg_txt = f"{weekly_chg:+.1f}%" if weekly_chg is not None else "н/д"
+        olog(f"[slow_impulse] {symbol}: недельная EMA{touch['period']} (накопленное "
+             f"движение {chg_txt}) — сигнал отправлен")
 
 
 def _slow_impulse_scan_loop():
