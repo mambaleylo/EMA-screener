@@ -1,7 +1,20 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.29 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.30 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.30: по прямому запросу — исключены токенизированные акции/ETF
+  Gate.io ("xStocks": MSTRX, CRCLX, AAPLX, GOOGLX, TSLAX, AMZNX, COINX,
+  NVDAX, METAX, HOODX, DFDVX, QQQX, SPYX) из отбора монет для ВСЕХ
+  детекторов. Найдено при сравнении с внешним крипто-ботом — MSTRX
+  (MicroStrategy), CRCLX (Circle) и SOXL (leveraged ETF) оказались среди
+  "лишних" наших сигналов; это не крипта вообще, другой класс актива,
+  которого физически нет на Bybit/MEXC — референс-бот их никогда не
+  увидит, сколько бы наши критерии ни совпадали. Исключены из ОБОИХ
+  независимых источников монет — _fetch_all_symbols() (используется
+  почти всем: slow_impulse, диагностика, дамп/vol_anomaly-триггер) и
+  отдельного _pump_fetch_tickers_snapshot() (свой фетч у пампа/дампа,
+  v0.30.3). Список стартовый, может расти по мере новых листингов Gate.
+  Проверено тестом на обоих источниках.
 - v0.30.29: реальная находка — 4 сигнала референс-бота (HAEDAL/ERA/BLESS/
   XPIN) НИ РАЗУ не появились ни в живом slow_impulse-сканере, ни даже в
   "широкой" EMA-диагностике, хотя цифры (дистанция до EMA, накопленный
@@ -1192,7 +1205,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.29"
+APP_VERSION  = "0.30.30"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2081,6 +2094,21 @@ def _strip_html_for_ntfy(text):
 # убраны — те же значения (0.15%, $3,000,000) теперь дефолты в
 # _scan_settings, настраиваемые через /scan_settings без правки кода.
 
+# v0.30.30: по прямому запросу — Gate.io с 2025 предлагает отдельный
+# раздел "xStocks" (токенизированные акции/ETF: MicroStrategy, Circle,
+# Apple, Tesla и т.п. под тикерами вида MSTRX/CRCLX/AAPLX) — это НЕ
+# крипта, а совсем другой класс актива, которого физически нет на
+# Bybit/MEXC (чисто крипто-биржах). Сравнение сигналов с внешним
+# крипто-ботом эти монеты только зашумляли — он их никогда не увидит,
+# сколько бы наши критерии ни совпадали. Список может расти со временем
+# (Gate добавляет новые), это стартовый набор по официальным анонсам.
+GATE_XSTOCKS_SYMBOLS = {
+    "AAPLX_USDT", "GOOGLX_USDT", "TSLAX_USDT", "AMZNX_USDT", "MSTRX_USDT",
+    "COINX_USDT", "NVDAX_USDT", "CRCLX_USDT", "METAX_USDT", "HOODX_USDT",
+    "DFDVX_USDT", "QQQX_USDT", "SPYX_USDT",
+}
+
+
 def _fetch_all_symbols(min_volume_usd_override=None):
     """v0.30.1: ПОЛНАЯ ПЕРЕРАБОТКА — раньше здесь было ДВА зашитых прямо в
     код потолка (candidates = valid[:150], top50 = filtered[:100]) —
@@ -2104,7 +2132,8 @@ def _fetch_all_symbols(min_volume_usd_override=None):
         data = r.json()
         if not isinstance(data, list): return []
         valid = [t for t in data
-                 if isinstance(t, dict) and "_USDT" in t.get("contract","")]
+                 if isinstance(t, dict) and "_USDT" in t.get("contract","")
+                 and t.get("contract") not in GATE_XSTOCKS_SYMBOLS]
         valid.sort(key=lambda t: float(t.get("volume_24h_usd") or t.get("volume_24h_quote") or t.get("volume_24h") or 0), reverse=True)
         min_volume_usd, max_spread_pct = _get_liquidity_thresholds()
         if min_volume_usd_override is not None:
@@ -4551,6 +4580,8 @@ def _pump_fetch_tickers_snapshot():
                 continue
             contract = t.get("contract", "")
             if "_USDT" not in contract:
+                continue
+            if contract in GATE_XSTOCKS_SYMBOLS:
                 continue
             try:
                 px = float(t.get("last") or t.get("mark_price") or 0)
