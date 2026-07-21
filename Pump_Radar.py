@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.31 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.32 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.32: реальный пробел, найден на живом скрине — TQQQX_USDT
+  (ProShares UltraPro QQQ, плечевой ETF) не был в списке исключений
+  xStocks (v0.30.30). Заодно вскрылось: SOXL_USDT был упомянут в ТЕКСТЕ
+  changelog'а v0.30.30 как "исключённый", но по факту в само множество
+  GATE_XSTOCKS_SYMBOLS так и не попал — забыт при реализации, хотя в
+  описании версии значился. Оба добавлены. Проверено тестом.
 - v0.30.31: по прямому запросу — приоритет "как у референс-бота" (только
   сигналы, реально дошедшие до недельной EMA). AKE_USDT сработал 18 раз
   за экспорт (13 памп + 5 аномалия объёма), НИ РАЗУ не дойдя до
@@ -1220,7 +1226,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.31"
+APP_VERSION  = "0.30.32"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2121,6 +2127,12 @@ GATE_XSTOCKS_SYMBOLS = {
     "AAPLX_USDT", "GOOGLX_USDT", "TSLAX_USDT", "AMZNX_USDT", "MSTRX_USDT",
     "COINX_USDT", "NVDAX_USDT", "CRCLX_USDT", "METAX_USDT", "HOODX_USDT",
     "DFDVX_USDT", "QQQX_USDT", "SPYX_USDT",
+    # v0.30.32: реальный пробел — TQQQX (плечевой ETF ProShares UltraPro
+    # QQQ) увиден на живом скрине, не был в списке. SOXL (плечевой ETF на
+    # полупроводники) был упомянут в тексте версии v0.30.30 как
+    # "исключённый", но по факту забыт в самом множестве — тоже добавлен
+    # только сейчас.
+    "TQQQX_USDT", "SOXL_USDT",
 }
 
 
