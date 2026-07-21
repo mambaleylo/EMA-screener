@@ -1,7 +1,22 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.30 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.31 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.31: по прямому запросу — приоритет "как у референс-бота" (только
+  сигналы, реально дошедшие до недельной EMA). AKE_USDT сработал 18 раз
+  за экспорт (13 памп + 5 аномалия объёма), НИ РАЗУ не дойдя до
+  полноценного сигнала с EMA — референс-бот такое в принципе не может
+  увидеть, у него критерий "рядом с уровнем" первичный. Пампы/дампы уже
+  были приглушены (v0.30.7), аномалия объёма — нет, слалась без разбора.
+  Применён тот же PUMP_DUMP_ALERTS_ENABLED флаг к _vol_peak_fire_alert —
+  теперь ОБЕ "голые" (без подтверждённого касания EMA) категории
+  уведомлений подавлены одним и тем же переключателем (по умолчанию
+  выключено). Детект, история и проверка EMA-триггера продолжают
+  работать в фоне без изменений — переключатель влияет только на
+  отправку голого текста. Обновлена подпись переключателя на странице.
+  Проверено тестом: при выключенном флаге аномалия объёма не уходит в
+  Telegram, но EMA-проверка всё равно вызывается; включение обратно
+  восстанавливает отправку.
 - v0.30.30: по прямому запросу — исключены токенизированные акции/ETF
   Gate.io ("xStocks": MSTRX, CRCLX, AAPLX, GOOGLX, TSLAX, AMZNX, COINX,
   NVDAX, METAX, HOODX, DFDVX, QQQX, SPYX) из отбора монет для ВСЕХ
@@ -1205,7 +1220,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.30"
+APP_VERSION  = "0.30.31"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3365,9 +3380,9 @@ details[open] summary:before{content:"▾ "}
 <div class="section-card" style="max-width:420px">
   <label style="display:flex;gap:8px;align-items:center;font-size:13px;color:#c9d1d9;cursor:pointer">
     <input type="checkbox" id="pumpDumpAlertsToggle" onchange="togglePumpDumpAlerts()" style="width:16px;height:16px">
-    Уведомления о голых пампах/дампах в Telegram
+    Уведомления о "голых" сигналах (памп/дамп/аномалия объёма без EMA)
   </label>
-  <p style="font-size:11px;color:#6e7681;margin:6px 0 0">Детект и проверка EMA-сигнала продолжают работать в фоне в любом случае (нужны для сигналов от аномалии объёма и для истории) — переключатель влияет только на отправку самого текста "Pump: X%"/"Dump: X%" в Telegram.</p>
+  <p style="font-size:11px;color:#6e7681;margin:6px 0 0">v0.30.31: теперь охватывает и аномалию объёма тоже — приоритет "как у референс-бота": только сигналы, реально дошедшие до недельной EMA. Детект и проверка EMA-сигнала продолжают работать в фоне в любом случае (нужны для полноценных сигналов и для истории) — переключатель влияет только на отправку голого текста "Pump: X%"/"Dump: X%"/"после аномального объёма" без привязки к уровню.</p>
   <span id="pumpDumpAlertsMsg" style="font-size:12px;color:#8b949e"></span>
 </div>
 <div id="status"></div>
@@ -5980,9 +5995,15 @@ def _vol_peak_fire_alert(symbol, watch_item, current_price, pct_move):
         f"{_fmt_px(watch_item['spike_price'])} -> {_fmt_px(current_price)}"
         + (f"\n⚠️ {speed_note}" if speed_note else "")
     )
-    _send_alert_photo(png, caption)
-    olog(f"[vol_peak] {symbol}: цена выросла на {pct_move}% с момента всплеска "
-         f"({watch_item['spike_price']:.6g} -> {current_price:.6g}, z={watch_item['z']}) — алерт отправлен")
+    if PUMP_DUMP_ALERTS_ENABLED:
+        _send_alert_photo(png, caption)
+        olog(f"[vol_peak] {symbol}: цена выросла на {pct_move}% с момента всплеска "
+             f"({watch_item['spike_price']:.6g} -> {current_price:.6g}, z={watch_item['z']}) — алерт отправлен")
+    else:
+        olog(f"[vol_peak] {symbol}: цена выросла на {pct_move}% с момента всплеска "
+             f"({watch_item['spike_price']:.6g} -> {current_price:.6g}, z={watch_item['z']}) — уведомление "
+             f"отключено (PUMP_DUMP_ALERTS_ENABLED=False, приоритет — только сигналы у EMA, как у референс-бота), "
+             f"детект и EMA-проверка продолжаются")
 
     now = time.time()
     source_id = f"vol_anomaly|{symbol}|{watch_item['spike_ts']}"
