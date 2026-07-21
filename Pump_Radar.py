@@ -1,7 +1,23 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.43 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.44 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.44: 9 из его 22 сигналов совпали с нашими за всё время (HEMI,
+  PIEVERSE, SAPIEN, COAI, XPIN, HAEDAL, JCT, EVAA, HANA) — остальные 13
+  (B, SAGA, TURTLE, UB, ERA, BLESS, BANANA, TREE, USELESS, ME, BLUAI,
+  1INCH, ROAM) НИ РАЗУ не сработали у нас, хотя дистанция до недельной
+  EMA и объём у 10 из этих 13 в норме — то есть где-то теряются уже
+  ПОСЛЕ прохождения проверки касания. Раньше это было не разглядеть: в
+  weekly_ema_signals попадали только УЖЕ отправленные алерты — если
+  монета терялась на cooldown или на гейте по аномалии, в файле не
+  оставалось вообще никакого следа. По прямому запросу — не отдельный
+  файл/лог, а те же записи в тот же _weekly_ema_recent (тот же
+  weekly_ema_export/weekly_ema_signals файл), с outcome=
+  "skipped_cooldown" / "skipped_no_anomaly" вместо "open", плюс новые
+  поля: anomaly_z, anomaly_count, cooldown_remaining_sec,
+  weekly_chg_7bar_pct. Резолвер исхода фильтрует строго по outcome==
+  "open" — новые записи не тронет. Теперь при следующем экспорте будет
+  прямо видно, почему конкретно каждая из этих 13 не дошла до алерта.
 - v0.30.43: сверил новую пачку его сигналов (28 ручных сканов, включая
   свежие ERA/HANA) с тем, что реально прислал наш weekly_ema после
   гейта по аномалии (v0.30.42) — прислал BTC/ETH/SOL/DOGE, а среди ВСЕХ
@@ -1366,7 +1382,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.43"
+APP_VERSION  = "0.30.44"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -7116,7 +7132,7 @@ def _vol_peak_historical_winrate(tf, period):
     return wins, len(resolved)
 
 
-def _weekly_ema_fire_alert(touch, confidence_note=None, triggered_by=None):
+def _weekly_ema_fire_alert(touch, confidence_note=None, triggered_by=None, anomaly_z=None, anomaly_count=None):
     # v0.30.8: по запросу — фильтр по объёму в момент касания, на
     # реальных данных диагностики (5000 записей): при vol_ratio > 1.2
     # отскок случается заметно чаще (SHORT 45.5% против 27.7% на обычном
@@ -7178,6 +7194,7 @@ def _weekly_ema_fire_alert(touch, confidence_note=None, triggered_by=None):
            "entry": touch["entry"], "stop": touch["stop"], "take": touch["take"],
            "rr": touch["rr"], "confidence_note": confidence_note, "triggered_by": triggered_by,
            "vol_ratio": touch.get("vol_ratio"),
+           "anomaly_z": anomaly_z, "anomaly_count": anomaly_count,
            "outcome": "open", "resolved_at": None, "resolved_price": None}
     global _weekly_ema_recent
     # v0.29.12: аудит — единственное место, где этот список менялся БЕЗ
@@ -7265,12 +7282,17 @@ def _slow_impulse_maybe_trigger_ema_signal(symbol):
     with _weekly_ema_touch_lock:
         last = _weekly_ema_touch_state.get(key, 0)
     if now - last < WEEKLY_EMA_TOUCH_COOLDOWN_SEC:
+        _slow_impulse_append_diag(touch, outcome="skipped_cooldown",
+                                   cooldown_remaining_sec=round(WEEKLY_EMA_TOUCH_COOLDOWN_SEC - (now - last)),
+                                   anomaly_z=None, anomaly_count=None, weekly_chg=weekly_chg)
         return
     max_anomaly_z = None
+    anomaly_count = 0
     if SLOW_IMPULSE_REQUIRE_SELL_ANOMALY:
         for tf_a in MANUAL_SCAN_TIMEFRAMES:
             anomalies = _manual_scan_find_anomalies(symbol, tf_a, MANUAL_SCAN_LOOKBACK_DAYS[tf_a])
             if isinstance(anomalies, list):
+                anomaly_count += len(anomalies)
                 for a in anomalies:
                     if max_anomaly_z is None or a["z"] > max_anomaly_z:
                         max_anomaly_z = a["z"]
@@ -7279,6 +7301,10 @@ def _slow_impulse_maybe_trigger_ema_signal(symbol):
                  f"распродажной аномалии объёма (z>={VOL_PEAK_ZSCORE_THRESHOLD}) в истории "
                  f"1h/{MANUAL_SCAN_LOOKBACK_DAYS['1h']}д или 4h/{MANUAL_SCAN_LOOKBACK_DAYS['4h']}д "
                  f"— пропуск (max_z={max_anomaly_z})")
+            _slow_impulse_append_diag(touch, outcome="skipped_no_anomaly",
+                                       cooldown_remaining_sec=0,
+                                       anomaly_z=max_anomaly_z, anomaly_count=anomaly_count,
+                                       weekly_chg=weekly_chg)
             return
     note_parts = []
     if weekly_chg is not None:
@@ -7287,12 +7313,41 @@ def _slow_impulse_maybe_trigger_ema_signal(symbol):
         note_parts.append(f"распродажная аномалия объёма z={max_anomaly_z}")
     note = "; ".join(note_parts) if note_parts else None
     source_id = f"slow_impulse|{symbol}|{int(now)}"
-    _weekly_ema_fire_alert(touch, confidence_note=note, triggered_by=source_id)
+    _weekly_ema_fire_alert(touch, confidence_note=note, triggered_by=source_id,
+                            anomaly_z=max_anomaly_z, anomaly_count=anomaly_count)
     with _weekly_ema_touch_lock:
         _weekly_ema_touch_state[key] = now
     chg_txt = f"{weekly_chg:+.1f}%" if weekly_chg is not None else "н/д"
     olog(f"[slow_impulse] {symbol}: недельная EMA{touch['period']} (ближайшая, накопленное "
          f"движение {chg_txt}) — сигнал отправлен")
+
+
+def _slow_impulse_append_diag(touch, outcome, cooldown_remaining_sec, anomaly_z, anomaly_count, weekly_chg):
+    """v0.30.44: по прямому запросу — не отдельный лог/файл, а те же
+    записи, что и обычные сигналы, просто с outcome="skipped_cooldown"/
+    "skipped_no_anomaly" вместо "open" — попадают в тот же
+    /weekly_ema_export (weekly_ema_signals файл), который уже скачивают.
+    Резолвер исхода (открыт/тейк/стоп) фильтрует строго по outcome=="open"
+    — эти записи он не тронет. Позволяет напрямую видеть в уже знакомом
+    файле: монета дошла до касания EMA, но была отсеяна — и почему
+    именно (cooldown ещё активен на столько-то секунд, или аномалии не
+    нашлось вообще / какой z был максимальный)."""
+    rec = {"ts": int(time.time()), "symbol": touch["symbol"], "tf": touch["tf"],
+           "period": touch["period"],
+           "price": touch["price"], "ema_value": touch["ema_value"],
+           "dist_atr": touch["dist_atr"], "ladder": touch["ladder"],
+           "side": touch["side"], "classic_bias": touch["classic_bias"],
+           "entry": touch["entry"], "stop": touch["stop"], "take": touch["take"],
+           "rr": touch["rr"], "confidence_note": None, "triggered_by": f"slow_impulse|{touch['symbol']}",
+           "vol_ratio": touch.get("vol_ratio"),
+           "weekly_chg_7bar_pct": weekly_chg,
+           "anomaly_z": anomaly_z, "anomaly_count": anomaly_count,
+           "cooldown_remaining_sec": cooldown_remaining_sec,
+           "outcome": outcome, "resolved_at": None, "resolved_price": None}
+    global _weekly_ema_recent
+    with _weekly_ema_touch_lock:
+        _weekly_ema_recent.append(rec)
+        _weekly_ema_recent = _weekly_ema_recent[-200:]
 
 
 def _slow_impulse_scan_loop():
