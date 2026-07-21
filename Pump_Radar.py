@@ -1,7 +1,24 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.39 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.40 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.40: реальный, серьёзный найденный баг — прямой вопрос "точно ли
+  всё так хорошо, отслеживается ли очерёдность стоп/тейк" оказался
+  обоснован. _weekly_ema_resolve_loop раньше проверял ТОЛЬКО живую цену
+  раз в 2 минуты, не весь путь цены между проверками — если цена сначала
+  пробивала стоп, а потом отскакивала выше тейка ДО следующего опроса,
+  это оставалось незамеченным, записывался тейк, хотя по-настоящему
+  сделка закрылась бы в минус раньше. Системная погрешность в пользу
+  тейка, влияла на ВСЮ статистику с самого начала фичи. Переписано на
+  проверку по свечам (1m, high/low) в хронологическом порядке с момента
+  последней проверки (новое поле last_checked_ts на каждой записи) —
+  первая свеча, где пробит хоть один уровень, определяет исход. Если
+  свеча накрывает оба уровня разом — консервативно считается стоп (не
+  можем знать точный порядок внутри одной свечи без тиковых данных). Для
+  старых открытых записей (без last_checked_ts) при первом проходе
+  честно перепроверяется ВЕСЬ путь с момента сигнала. Проверено тестом на
+  точном сценарии из вопроса: стоп пробит раньше, потом отскок выше
+  тейка — теперь корректно засчитывается стоп, не тейк.
 - v0.30.39: по прямому запросу — тейк переведён на фиксированные 4.5% от
   входа (EMA_TOUCH_TAKE_FIXED_PCT), подтверждено на 23 чистых наблюдениях
   внешнего референс-бота (4.499%-4.503%, практически идеальная точность,
@@ -1303,7 +1320,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.39"
+APP_VERSION  = "0.30.40"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -7263,55 +7280,85 @@ def _weekly_ema_source_stats():
 
 def _weekly_ema_resolve_loop():
     """Фоновый цикл: раз в WEEKLY_EMA_RESOLVE_POLL_SEC проверяет все ещё
-    ОТКРЫТЫЕ сигналы из истории на предмет тейка/стопа (простая гонка
-    take-vs-stop по живой цене — вход отдельно не моделируется, лимитка
-    стоит вплотную к уже произошедшему касанию, поэтому считаем её
-    исполненной; та же упрощённая логика, что в Weekly EMA Backtest, для
-    единообразия). Группирует по монете, чтобы не дёргать живую цену
-    больше одного раза за проход, даже если у монеты несколько открытых
-    сигналов сразу."""
+    ОТКРЫТЫЕ сигналы из истории на предмет тейка/стопа.
+    v0.30.40: реальный найденный баг — раньше проверялась ТОЛЬКО живая
+    цена в момент опроса (раз в 2 минуты), не весь путь цены МЕЖДУ
+    опросами. Если цена сначала пробивала стоп, а потом отскакивала выше
+    тейка ДО следующего опроса — это оставалось незамеченным, записывался
+    тейк, хотя по-настоящему сделка закрылась бы в минус раньше. Системная
+    погрешность в пользу тейка. Теперь — свечи (1m, high/low) с момента
+    ПОСЛЕДНЕЙ проверки, в хронологическом порядке: первая свеча, где
+    пробит хоть один уровень, и определяет исход. Если свеча накрывает
+    ОБА уровня разом (для очень волатильных монет) — консервативно
+    считаем стоп (не можем знать точный порядок внутри одной свечи без
+    тиковых данных). Группирует по монете, чтобы не дёргать свечи больше
+    одного раза за проход, даже если у монеты несколько открытых сигналов
+    сразу."""
     time.sleep(30)
     while True:
         try:
             with _weekly_ema_touch_lock:
                 open_recs = [r for r in _weekly_ema_recent if r.get("outcome") == "open"]
             if open_recs:
-                price_cache = {}
+                candles_cache = {}
                 changed = False
+                now = time.time()
                 for rec in open_recs:
                     try:
                         sym = rec["symbol"]
-                        if sym not in price_cache:
-                            try:
-                                price_cache[sym] = _gate_get_price(sym)
-                            except Exception as e:
-                                olog(f"[weekly_ema_resolve] {sym}: ошибка получения цены: {_explain_error(e)}")
-                                price_cache[sym] = None
-                        price = price_cache[sym]
-                        if not price:
+                        since_ts = rec.get("last_checked_ts") or rec["ts"]
+                        if since_ts >= now:
                             continue
-                        if rec["classic_bias"] == "long":
-                            hit_take = price >= rec["take"]
-                            hit_stop = price <= rec["stop"]
-                        else:
-                            hit_take = price <= rec["take"]
-                            hit_stop = price >= rec["stop"]
-                        if hit_take or hit_stop:
-                            rec["outcome"] = "take" if hit_take else "stop"
+                        if sym not in candles_cache:
+                            try:
+                                span_days = max(1, math.ceil((now - since_ts) / 86400) + 1)
+                                offset_days = 0.0   # нужны свечи ДО текущего момента включительно
+                                candles_cache[sym] = _fetch_candles(sym, "1m", span_days, offset_days=offset_days)
+                            except Exception as e:
+                                olog(f"[weekly_ema_resolve] {sym}: ошибка получения свечей: {_explain_error(e)}")
+                                candles_cache[sym] = []
+                        relevant = sorted(
+                            [c for c in candles_cache[sym] if c["t"] >= since_ts and c["t"] <= now],
+                            key=lambda c: c["t"])
+                        if not relevant:
+                            continue
+                        outcome = None
+                        resolved_price = None
+                        for c in relevant:
+                            high = c.get("high", c["close"])
+                            low = c.get("low", c["close"])
+                            if rec["classic_bias"] == "long":
+                                hit_take = high >= rec["take"]
+                                hit_stop = low <= rec["stop"]
+                            else:
+                                hit_take = low <= rec["take"]
+                                hit_stop = high >= rec["stop"]
+                            if hit_stop:
+                                outcome, resolved_price = "stop", rec["stop"]
+                                break
+                            if hit_take:
+                                outcome, resolved_price = "take", rec["take"]
+                                break
+                        rec["last_checked_ts"] = int(relevant[-1]["t"]) + 60
+                        if outcome:
+                            rec["outcome"] = outcome
                             rec["resolved_at"] = int(time.time())
-                            rec["resolved_price"] = price
+                            rec["resolved_price"] = resolved_price
                             changed = True
-                            emoji = "✅" if hit_take else "❌"
+                            emoji = "✅" if outcome == "take" else "❌"
                             _send_alert(
                                 f"{emoji} <b>{rec['symbol']}</b> | EMA{rec['period']}"
                                 f"({'W' if rec['tf']=='1w' else 'D'}) — "
-                                f"{'ТЕЙК' if hit_take else 'СТОП'} по сигналу от "
+                                f"{'ТЕЙК' if outcome=='take' else 'СТОП'} по сигналу от "
                                 f"{time.strftime('%d.%m %H:%M', time.localtime(rec['ts']))}\n"
-                                f"Вход: {_fmt_px(rec['entry'])} → {_fmt_px(price)}"
+                                f"Вход: {_fmt_px(rec['entry'])} → {_fmt_px(resolved_price)}"
                             )
                             olog(f"[weekly_ema_resolve] {rec['symbol']}: сигнал от "
                                  f"{time.strftime('%H:%M', time.localtime(rec['ts']))} закрылся по "
-                                 f"{'тейку' if hit_take else 'стопу'} ({price})")
+                                 f"{'тейку' if outcome=='take' else 'стопу'} ({resolved_price}), "
+                                 f"проверено по свечам с {time.strftime('%H:%M', time.localtime(since_ts))}")
+                        else:
+                            changed = True   # last_checked_ts продвинулся, стоит сохранить
                     except Exception as e:
                         # одна повреждённая/неполная запись не должна срывать
                         # проверку ОСТАЛЬНЫХ открытых сигналов в этом же проходе
