@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.36 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.37 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.37: по прямому запросу — "гораздо больше монет алертят, чем у
+  него". Реальная находка: slow_impulse слал ОТДЕЛЬНЫЙ алерт на КАЖДЫЙ
+  период EMA, подходящий по расстоянию одновременно (пример из логов:
+  TLM сработал на EMA7+14+28 разом, WLD и NEAR — по 2 раза каждая) — это
+  раздувало число "лишних" алертов относительно референс-бота, который
+  шлёт один сигнал на монету, по ближайшему уровню. Теперь берём только
+  САМОЕ БЛИЗКОЕ касание (наименьший dist_atr), не все подряд — ровно один
+  алерт на монету за цикл. Проверено тестом: монета, одновременно близкая
+  к трём уровням (как реальный случай TLM), теперь даёт 1 алерт вместо 3,
+  выбирая корректно самый близкий период.
 - v0.30.36: по прямому вопросу — "отслеживаем ли статистику этих
   сигналов, и где она". Данные УЖЕ были (каждая запись хранит
   triggered_by и итог take/stop/open), просто не было готовой сводки.
@@ -1268,7 +1278,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.36"
+APP_VERSION  = "0.30.37"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -7092,21 +7102,30 @@ def _slow_impulse_maybe_trigger_ema_signal(symbol):
         olog(f"[slow_impulse] {symbol}: ошибка проверки касания: {_explain_error(e)}")
         return
     now = time.time()
-    for touch in touches:
-        key = f"{symbol}|1w|{touch['period']}"
-        with _weekly_ema_touch_lock:
-            last = _weekly_ema_touch_state.get(key, 0)
-        if now - last < WEEKLY_EMA_TOUCH_COOLDOWN_SEC:
-            continue
-        note = (f"накопленное движение за 7 недельных баров: {weekly_chg:+.1f}%"
-                if weekly_chg is not None else None)
-        source_id = f"slow_impulse|{symbol}|{int(now)}"
-        _weekly_ema_fire_alert(touch, confidence_note=note, triggered_by=source_id)
-        with _weekly_ema_touch_lock:
-            _weekly_ema_touch_state[key] = now
-        chg_txt = f"{weekly_chg:+.1f}%" if weekly_chg is not None else "н/д"
-        olog(f"[slow_impulse] {symbol}: недельная EMA{touch['period']} (накопленное "
-             f"движение {chg_txt}) — сигнал отправлен")
+    if not touches:
+        return
+    # v0.30.37: реальная находка — мы слали ОТДЕЛЬНЫЙ алерт на КАЖДЫЙ
+    # период EMA, который подходил по расстоянию одновременно (пример из
+    # логов: TLM сработал на EMA7+14+28 разом, WLD и NEAR — по 2 раза
+    # каждая) — раздувало число "лишних" алертов относительно
+    # референс-бота, который шлёт один сигнал на монету, по ближайшему
+    # уровню. Теперь берём только САМОЕ БЛИЗКОЕ касание (наименьший
+    # dist_atr), не все подряд.
+    touch = min(touches, key=lambda t: t.get("dist_atr", 999))
+    key = f"{symbol}|1w|{touch['period']}"
+    with _weekly_ema_touch_lock:
+        last = _weekly_ema_touch_state.get(key, 0)
+    if now - last < WEEKLY_EMA_TOUCH_COOLDOWN_SEC:
+        return
+    note = (f"накопленное движение за 7 недельных баров: {weekly_chg:+.1f}%"
+            if weekly_chg is not None else None)
+    source_id = f"slow_impulse|{symbol}|{int(now)}"
+    _weekly_ema_fire_alert(touch, confidence_note=note, triggered_by=source_id)
+    with _weekly_ema_touch_lock:
+        _weekly_ema_touch_state[key] = now
+    chg_txt = f"{weekly_chg:+.1f}%" if weekly_chg is not None else "н/д"
+    olog(f"[slow_impulse] {symbol}: недельная EMA{touch['period']} (ближайшая, накопленное "
+         f"движение {chg_txt}) — сигнал отправлен")
 
 
 def _slow_impulse_scan_loop():
