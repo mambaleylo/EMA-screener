@@ -1,7 +1,21 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.38 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.39 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.39: по прямому запросу — тейк переведён на фиксированные 4.5% от
+  входа (EMA_TOUCH_TAKE_FIXED_PCT), подтверждено на 23 чистых наблюдениях
+  внешнего референс-бота (4.499%-4.503%, практически идеальная точность,
+  не совпадение) — раньше был ATR-based (RR 1.5 × 1.5×ATR стопа),
+  переменный по волатильности монеты. Стоп остался ATR-based — данных на
+  его стоп нет вообще (ref_stop ни разу не был виден на скринах). RR
+  теперь не константа, а фактическое отношение (тейк-дистанция/стоп-
+  дистанция), считается для каждого сигнала отдельно. По прямому
+  уточнению — уже ОТКРЫТЫЕ (нерешённые) сигналы пересчитываются на новую
+  формулу автоматически при старте (_migrate_open_signals_to_fixed_take),
+  чтобы не остаться зависшими на старой цели; уже РЕШЁННЫЕ (take/stop) не
+  трогаются — история результатов не переписывается задним числом.
+  Проверено тестом: формула точна для LONG/SHORT, миграция трогает
+  только открытые записи.
 - v0.30.38: реальная находка, третья по счёту на эту же тему —
   BANANA_USDT (объём $21,643) снова оказался НИЖЕ нашего уже сниженного
   порога slow_impulse ($150к, v0.30.29). Опущено до почти нулевого уровня
@@ -1289,7 +1303,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.38"
+APP_VERSION  = "0.30.39"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -6516,7 +6530,8 @@ WEEKLY_EMA_TOUCH_ATR = 0.25       # тот же допуск касания на
 # точные цифры — мы не знаем их формулу, ATR-based даёт масштаб под
 # конкретную волатильность монеты вместо фиксированного % для всех.
 EMA_TOUCH_STOP_ATR_MULT = 1.5     # стоп = цена входа ± 1.5×ATR(14) этого ТФ
-EMA_TOUCH_RR = 1.5                # тейк = стоп-дистанция × RR в прибыльную сторону
+EMA_TOUCH_RR = 1.5                # тейк = стоп-дистанция × RR в прибыльную сторону — v0.30.39: больше не используется для расчёта тейка (см. EMA_TOUCH_TAKE_FIXED_PCT), оставлен только как исторический дефолт для старых записей без rr
+EMA_TOUCH_TAKE_FIXED_PCT = 4.5    # v0.30.39: подтверждено на 23 чистых наблюдениях внешнего референс-бота (4.499%-4.503% от входа, практически идеально, не совпадение) — тейк у него ВСЕГДА фиксированный % от входа, не ATR-based, как было у нас. Стоп остаётся ATR-based — данных на его стоп нет вообще (ref_stop ни разу не был виден на скринах)
 VOL_RATIO_CONFIDENCE_THRESHOLD = 1.2   # v0.30.8: порог из диагностики (5000 записей) — выше него отскок заметно надёжнее
 # v0.11.0: раньше опрос был раз в 30 минут — по прямому фидбеку со скрина
 # ("сигнал приходит не тогда, когда надо, цена уже упала") это было СЛИШКОМ
@@ -6582,6 +6597,45 @@ def _load_weekly_ema_history():
     except Exception as e:
         olog(f"[weekly_ema] ⚠ не смог подхватить историю с диска: {_explain_error(e)} "
              f"(файл мог повредиться при аварийном завершении — начинаем с пустой истории)")
+
+
+def _migrate_open_signals_to_fixed_take():
+    """v0.30.39: по прямому запросу — "надо учесть уже открытые сделки в
+    ожидании". Формула тейка поменялась (ATR-based -> фиксированный %,
+    см. EMA_TOUCH_TAKE_FIXED_PCT, подтверждено на 23 наблюдениях внешнего
+    референс-бота) — без этой миграции уже открытые (ещё не решённые)
+    сигналы остались бы зависшими на старой, ATR-based цели. Пересчитывает
+    take/rr для ВСЕХ ещё открытых записей по НОВОЙ формуле, используя уже
+    сохранённые entry/stop/classic_bias — стоп не трогает (по нему данных
+    от референс-бота нет вообще). Запускается один раз при старте,
+    сохраняет результат на диск."""
+    global _weekly_ema_recent
+    changed = 0
+    with _weekly_ema_touch_lock:
+        for rec in _weekly_ema_recent:
+            if rec.get("outcome") != "open":
+                continue
+            entry, stop = rec.get("entry"), rec.get("stop")
+            classic_bias = rec.get("classic_bias")
+            if not entry or not stop or classic_bias not in ("short", "long"):
+                continue
+            stop_dist = abs(stop - entry)
+            if classic_bias == "short":
+                new_take = entry * (1 - EMA_TOUCH_TAKE_FIXED_PCT / 100)
+            else:
+                new_take = entry * (1 + EMA_TOUCH_TAKE_FIXED_PCT / 100)
+            new_take_r = _round_price(new_take)
+            if rec.get("take") == new_take_r:
+                continue
+            rec["take"] = new_take_r
+            rec["rr"] = round(abs(new_take - entry) / stop_dist, 3) if stop_dist else None
+            changed += 1
+        if changed:
+            _save_weekly_ema_history()
+    if changed:
+        olog(f"[weekly_ema] пересчитан тейк на фиксированные {EMA_TOUCH_TAKE_FIXED_PCT}% "
+             f"от входа для {changed} открытых сигналов (была ATR-based формула)")
+    return changed
 
 
 _ema_touch_ctx_cache = {}   # "symbol|tf" -> {candles, closes, atr_v, i, ema_arrays, next_close_t} ИЛИ {"insufficient": True, next_close_t}
@@ -6761,9 +6815,18 @@ def _ema_touch_check_symbol(symbol, tf="1w"):
             # с моментом входа, раз цена к моменту алерта уже могла отойти.
             level = ema_now
             if classic_bias == "short":
-                entry, stop, take = level, level + stop_dist, level - stop_dist * EMA_TOUCH_RR
+                entry, stop = level, level + stop_dist
+                take = level * (1 - EMA_TOUCH_TAKE_FIXED_PCT / 100)
             else:
-                entry, stop, take = level, level - stop_dist, level + stop_dist * EMA_TOUCH_RR
+                entry, stop = level, level - stop_dist
+                take = level * (1 + EMA_TOUCH_TAKE_FIXED_PCT / 100)
+            # v0.30.39: rr теперь не константа — тейк фиксированный % от
+            # входа, стоп по-прежнему ATR-based, так что фактическое
+            # соотношение прибыль/риск теперь МЕНЯЕТСЯ от сигнала к
+            # сигналу (у волатильных монет стоп шире при том же тейке —
+            # RR ниже, и наоборот). Считаем фактическое значение, не
+            # берём константу.
+            actual_rr = round(abs(take - entry) / stop_dist, 3) if stop_dist else None
             # v0.16.2: для очень волатильных дешёвых монет ATR может быть
             # настолько большим относительно самой цены (реально видели
             # >45% от цены), что stop_dist*RR превышает саму цену — тейк
@@ -6802,7 +6865,7 @@ def _ema_touch_check_symbol(symbol, tf="1w"):
                 "ema_value": ema_now, "dist_atr": round(dist / atr_v, 3),
                 "ladder": ladder, "side": side, "classic_bias": classic_bias,
                 "entry": _round_price(entry), "stop": _round_price(stop),
-                "take": _round_price(take), "rr": EMA_TOUCH_RR, "levels": levels,
+                "take": _round_price(take), "rr": actual_rr, "levels": levels,
                 "week_t": candles[i]["t"], "vol_ratio": _vol_ratio(candles, i),
                 "candles": candles, "ema_arrays": ema_arrays, "bar_i": i,
                 "live_ema_values": live_ema_values, "live_t": int(time.time()),
@@ -10142,6 +10205,7 @@ def main():
     # _weekly_ema_resolve_loop их больше не видел. Теперь вызывается здесь,
     # не зависит от того, какие циклы включены.
     _load_weekly_ema_history()
+    _migrate_open_signals_to_fixed_take()
     _load_scan_settings()
     _diag_load()
     threading.Thread(target=_watchdog_loop, daemon=True).start()
