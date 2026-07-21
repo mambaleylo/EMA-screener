@@ -1,7 +1,22 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.32 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.33 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.33: реальная находка на живых скринах — ntfy получил WLD_USDT и
+  ADA_USDT (07:48), а Telegram по тем же сигналам молчал вообще. Причина
+  не в коде-асимметрии (проверено ранее — оба канала действительно
+  вызываются симметрично), а в лимите скорости самого Telegram Bot API
+  (~1 сообщение/сек в один чат): при частых сериях алертов (залп
+  slow_impulse и подобное) каждый алерт отправлялся Telegram СВОИМ
+  отдельным потоком одновременно — часть сообщений тонула молча (429),
+  пока ntfy (без такого жёсткого лимита) получал всё нормально. Теперь
+  Telegram-отправка (и текст, и фото) идёт через ОДНУ общую очередь
+  (_telegram_send_queue + _telegram_sender_worker), последовательно, с
+  паузой ~1.1с между сообщениями — не теряем сообщения из-за собственного
+  всплеска. ntfy остаётся полностью независимым и немедленным, как и
+  раньше. Проверено тестом: залп из 5 алертов уходит в Telegram
+  последовательно с паузой ≥1с между каждым, ни один не теряется; ntfy
+  при этом отправляет все 5 почти мгновенно, не дожидаясь очереди.
 - v0.30.32: реальный пробел, найден на живом скрине — TQQQX_USDT
   (ProShares UltraPro QQQ, плечевой ETF) не был в списке исключений
   xStocks (v0.30.30). Заодно вскрылось: SOXL_USDT был упомянут в ТЕКСТЕ
@@ -1206,7 +1221,7 @@ EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
   резать/переделывать/выключать, ничего в оригинальном EMA_Invert_
   Experiment.py от этого не пострадает.
 """
-import os, sys, json, time, math, random, threading, base64, hashlib, subprocess, io, gc, uuid, statistics, re
+import os, sys, json, time, math, random, threading, base64, hashlib, subprocess, io, gc, uuid, statistics, re, queue
 import multiprocessing
 import http.server, urllib.request, urllib.parse
 from functools import lru_cache
@@ -1226,7 +1241,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.32"
+APP_VERSION  = "0.30.33"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4220,51 +4235,79 @@ refreshPumps(); setInterval(refreshPumps, 8000);
 # ─── конец live EMA-сигналов ────────────────────────────────────────────────
 # ─── конец EMA-bounce dossier engine ────────────────────────────────────────
 # ─── Telegram / ntfy ────────────────────────────────────────────────────────
+_telegram_send_queue = queue.Queue()
+
+
+def _telegram_sender_worker():
+    """v0.30.33: реальная находка на реальных скринах — при частых сериях
+    алертов (например, залп slow_impulse) каждый алерт спамил Telegram
+    СВОИМ отдельным потоком ОДНОВРЕМЕННО — у Telegram Bot API реальный
+    лимит около 1 сообщения/сек в один чат, часть сообщений тонула молча
+    (429 Too Many Requests), пока ntfy (без такого жёсткого лимита)
+    получал всё нормально — отсюда и расхождение между каналами, которое
+    выглядело как баг кода, а на деле было лимитом скорости самого
+    Telegram. Теперь отправка в Telegram идёт через ОДНУ очередь,
+    последовательно, с паузой между сообщениями — не теряем сообщения
+    из-за собственного всплеска. ntfy остаётся независимым и
+    немедленным — у него такого жёсткого лимита нет."""
+    while True:
+        task = _telegram_send_queue.get()
+        try:
+            task()
+        except Exception as e:
+            olog(f"⚠ ошибка в очереди отправки Telegram: {_explain_error(e)}")
+        time.sleep(1.1)   # с запасом чуть выше лимита Telegram ~1 сообщение/сек в один чат
+
+
 def _send_alert(msg):
-    """Отправка алерта в Telegram и/или ntfy. Запускается в фоновом потоке.
-    При сетевой ошибке — 3 попытки с паузой 5с.
+    """Отправка алерта в Telegram и/или ntfy. Telegram идёт через общую
+    последовательную очередь (см. _telegram_sender_worker), ntfy —
+    независимо и немедленно в своём потоке.
     v0.30.9: реальный баг — раньше generic-исключение (не сетевое, напр.
     из-за некорректной HTML-разметки в тексте) на ОДНОМ канале делало
     `break`, который выходил из ВСЕГО цикла попыток целиком — включая ещё
-    не выполненную отправку в ДРУГОЙ канал в этой же попытке. Из-за этого
-    ntfy мог вообще не получить конкретное уведомление, если именно на
-    нём споткнулся Telegram — отсюда расхождение между каналами. Теперь
+    не выполненную отправку в ДРУГОЙ канал в этой же попытке. Теперь
     каждый канал отслеживается и повторяется НЕЗАВИСИМО — сбой одного
     (сетевой или нет) больше не задевает другой."""
-    def _do_send():
-        tg_done = not (TG_TOKEN and TG_CHAT)      # если не настроен — считаем "уже готово"
-        ntfy_done = not NTFY_URL
+    def _do_telegram():
+        if not (TG_TOKEN and TG_CHAT):
+            return
         for attempt in range(1, 4):
-            if not tg_done:
-                try:
-                    r = requests.post(
-                        f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                        json={"chat_id": TG_CHAT, "text": msg, "parse_mode": "HTML"},
-                        timeout=8)
-                    if r.ok:
-                        tg_done = True
-                    else:
-                        olog(f"⚠ TG алерт HTTP {r.status_code} (попытка {attempt}/3)")
-                except (requests.exceptions.ConnectionError,
-                        requests.exceptions.Timeout) as e:
-                    olog(f"⚠ TG алерт сеть (попытка {attempt}/3): {_explain_error(e)}")
-                except Exception as e:
-                    olog(f"⚠ TG алерт: {_explain_error(e)} — не повторяю (не сетевая ошибка), но ntfy это не остановит")
-                    tg_done = True   # не ретраим не-сетевую ошибку, но и не блокируем ntfy
-            if not ntfy_done:
-                try:
-                    requests.post(NTFY_URL, data=_strip_html_for_ntfy(msg).encode(), timeout=8)
-                    ntfy_done = True
-                except (requests.exceptions.ConnectionError,
-                        requests.exceptions.Timeout) as e:
-                    olog(f"⚠ ntfy алерт сеть (попытка {attempt}/3): {_explain_error(e)}")
-                except Exception as e:
-                    olog(f"⚠ ntfy алерт: {_explain_error(e)} — не повторяю (не сетевая ошибка)")
-                    ntfy_done = True
-            if (tg_done and ntfy_done) or attempt == 3:
-                break
-            time.sleep(5)
-    threading.Thread(target=_do_send, daemon=True).start()
+            try:
+                r = requests.post(
+                    f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                    json={"chat_id": TG_CHAT, "text": msg, "parse_mode": "HTML"},
+                    timeout=8)
+                if r.ok:
+                    return
+                olog(f"⚠ TG алерт HTTP {r.status_code} (попытка {attempt}/3)")
+            except (requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout) as e:
+                olog(f"⚠ TG алерт сеть (попытка {attempt}/3): {_explain_error(e)}")
+            except Exception as e:
+                olog(f"⚠ TG алерт: {_explain_error(e)} — не повторяю (не сетевая ошибка)")
+                return
+            if attempt < 3:
+                time.sleep(5)
+
+    def _do_ntfy():
+        if not NTFY_URL:
+            return
+        for attempt in range(1, 4):
+            try:
+                requests.post(NTFY_URL, data=_strip_html_for_ntfy(msg).encode(), timeout=8)
+                return
+            except (requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout) as e:
+                olog(f"⚠ ntfy алерт сеть (попытка {attempt}/3): {_explain_error(e)}")
+            except Exception as e:
+                olog(f"⚠ ntfy алерт: {_explain_error(e)} — не повторяю (не сетевая ошибка)")
+                return
+            if attempt < 3:
+                time.sleep(5)
+
+    _telegram_send_queue.put(_do_telegram)
+    threading.Thread(target=_do_ntfy, daemon=True).start()
 
 def _render_signal_chart_png(candles, sig, sym, tf):
     """Скриншот сделки (EMA-сигнал) для Telegram — своя картинка, отдельная
@@ -4364,34 +4407,30 @@ def _send_alert_photo(png_bytes, caption):
     работал нормально — ntfy молчал по ВСЕМ картиночным алертам (а это
     почти все наши — памп/дамп, аномалия объёма, EMA-сигналы).
     v0.30.11: по прямому вопросу "а в ntfy нет картинки, это нормально?" —
-    нет, не специально: раньше в ntfy уходил только текст (сам факт
-    получения хоть чего-то был важнее на тот момент). Теперь ntfy тоже
-    получает настоящую картинку (через Filename-заголовок — так ntfy
-    понимает, что тело запроса это файл-вложение, не текст) — и делает
-    это ПОЛНОСТЬЮ НЕЗАВИСИМО от исхода Telegram (свой блок, не через
-    _send_alert), чтобы не пересобирать риск дублей заново."""
+    нет, не специально: раньше в ntfy уходил только текст. Теперь ntfy
+    тоже получает настоящую картинку (через Filename-заголовок) — и
+    делает это ПОЛНОСТЬЮ НЕЗАВИСИМО от исхода Telegram.
+    v0.30.33: реальная находка на живых скринах — при частых сериях
+    алертов Telegram-отправка каждого алерта шла СВОИМ отдельным потоком
+    одновременно, упираясь в реальный лимит Telegram Bot API (~1
+    сообщение/сек в один чат) — часть тонула молча, пока ntfy получал всё
+    (у него такого жёсткого лимита нет). Теперь Telegram-часть идёт через
+    ту же общую последовательную очередь, что и _send_alert."""
     if not png_bytes:
         _send_alert(caption)
         return
-    def _do_send():
-        if TG_TOKEN and TG_CHAT:
-            try:
-                r = requests.post(
-                    f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto",
-                    data={"chat_id": TG_CHAT, "caption": caption, "parse_mode": "HTML"},
-                    files={"photo": ("signal.png", png_bytes, "image/png")},
-                    timeout=20)
-                if not r.ok:
-                    olog(f"⚠ TG фото HTTP {r.status_code} — пробую текстом в TG")
-                    try:
-                        requests.post(
-                            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                            json={"chat_id": TG_CHAT, "text": caption, "parse_mode": "HTML"},
-                            timeout=8)
-                    except Exception as e2:
-                        olog(f"⚠ TG текст (запасной вариант): {_explain_error(e2)}")
-            except Exception as e:
-                olog(f"⚠ TG фото: {_explain_error(e)} — пробую текстом в TG")
+
+    def _do_telegram():
+        if not (TG_TOKEN and TG_CHAT):
+            return
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto",
+                data={"chat_id": TG_CHAT, "caption": caption, "parse_mode": "HTML"},
+                files={"photo": ("signal.png", png_bytes, "image/png")},
+                timeout=20)
+            if not r.ok:
+                olog(f"⚠ TG фото HTTP {r.status_code} — пробую текстом в TG")
                 try:
                     requests.post(
                         f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
@@ -4399,15 +4438,29 @@ def _send_alert_photo(png_bytes, caption):
                         timeout=8)
                 except Exception as e2:
                     olog(f"⚠ TG текст (запасной вариант): {_explain_error(e2)}")
-        if NTFY_URL:
+        except Exception as e:
+            olog(f"⚠ TG фото: {_explain_error(e)} — пробую текстом в TG")
             try:
-                requests.post(NTFY_URL, data=png_bytes,
-                              headers={"Filename": "chart.png"},
-                              params={"message": _strip_html_for_ntfy(caption)[:4096]},
-                              timeout=15)
-            except Exception as e:
-                olog(f"⚠ ntfy фото: {_explain_error(e)}")
-    threading.Thread(target=_do_send, daemon=True).start()
+                requests.post(
+                    f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                    json={"chat_id": TG_CHAT, "text": caption, "parse_mode": "HTML"},
+                    timeout=8)
+            except Exception as e2:
+                olog(f"⚠ TG текст (запасной вариант): {_explain_error(e2)}")
+
+    def _do_ntfy():
+        if not NTFY_URL:
+            return
+        try:
+            requests.post(NTFY_URL, data=png_bytes,
+                          headers={"Filename": "chart.png"},
+                          params={"message": _strip_html_for_ntfy(caption)[:4096]},
+                          timeout=15)
+        except Exception as e:
+            olog(f"⚠ ntfy фото: {_explain_error(e)}")
+
+    _telegram_send_queue.put(_do_telegram)
+    threading.Thread(target=_do_ntfy, daemon=True).start()
 
 
 # ─── v0.1.11: Live Pump Detector ────────────────────────────────────────────
@@ -9934,6 +9987,7 @@ def main():
     _load_scan_settings()
     _diag_load()
     threading.Thread(target=_watchdog_loop, daemon=True).start()
+    threading.Thread(target=_telegram_sender_worker, daemon=True).start()
     threading.Thread(target=_heartbeat_loop, daemon=True).start()
     # v0.5.0: остановлен по запросу — уходим от EMA-инверт как основной
     # фичи, главная страница теперь только про пампы. Код движка остался в
