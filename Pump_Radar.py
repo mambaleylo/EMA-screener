@@ -1,7 +1,22 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.46 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.47 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.47: по прямому запросу — убрано лишнее относительно цели
+  "скопировать его бота". Проверено по ВСЕМ собранным сравнениям: ни
+  один из его 22+ сигналов ни разу не пришёл через памп/дамп-детектор
+  или Volume Peak Watcher (аномалия объёма как ИСТОЧНИК алерта, не
+  путать с гейтом внутри slow_impulse — тот остался, использует другую,
+  независимую функцию _manual_scan_find_anomalies). EMA28W-трекинг
+  зависел ИСКЛЮЧИТЕЛЬНО от них как источников событий. Остановлены
+  фоновые циклы: _pump_detect_loop, _pump_dump_track_loop,
+  _vol_peak_find_loop, _vol_peak_watch_loop, _vol_anomaly_track_loop,
+  _ema28w_touch_track_loop — тем же способом, что раньше в файле уже
+  останавливали _ema_signal_loop (не запускается, код остаётся в файле
+  нетронутым). Обновлено описание на главной странице (было
+  устаревшее "детектит памп"). slow_impulse, ручной скан, бэктест,
+  диагностика, Pump Match (калибровка отрисовки — не про памп-сигналы)
+  не тронуты, ничего из этого не зависит от убранных циклов.
 - v0.30.46: разгадал, почему MITO/NAORIS/AVAAI из ручного скана выглядели
   так, будто должны были сработать, а не сработали. Ручной скан считает
   dist_atr от цены ПОСЛЕДНЕЙ ЗАКРЫТОЙ свечи (bar_close_ts — у недельного
@@ -1404,7 +1419,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.46"
+APP_VERSION  = "0.30.47"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3548,7 +3563,7 @@ details[open] summary:before{content:"▾ "}
 </div>
 
 <h1>&#128225; Pump Radar <span style="font-size:12px;color:#8b949e;font-weight:normal">v__APP_VERSION__</span></h1>
-<p style="color:#8b949e;font-size:13px;max-width:480px">Детектит резкий рост цены (памп) по топ-монетам Gate.io и шлёт алерт в Telegram с картинкой. Старый EMA-инверт движок отключён и не показан — код остался в файле, просто не в фокусе сейчас.</p>
+<p style="color:#8b949e;font-size:13px;max-width:480px">Ищет недельные касания EMA(7/14/28) с гейтом по распродажной аномалии объёма — цель: повторить сигналы стороннего референс-бота. Памп/дамп-детектор и Volume Peak Watcher отключены (ни разу не совпали с его сигналами за всё время сравнения) — код остался в файле, просто не запускается.</p>
 <button onclick="openAlertSettings()" style="background:#21262d;border:1px solid #30363d">&#128276; Алерты</button>
 <a href="/pump_match" style="text-decoration:none"><button style="background:#8250df">&#127919; Pump Match (подбор параметров отрисовки)</button></a>
 <a href="/weekly_ema_backtest" style="text-decoration:none"><button style="background:#8250df">&#128202; Weekly EMA Backtest</button></a>
@@ -10508,16 +10523,26 @@ def main():
     # крутится в фоне — не дёргает Gate.io и не может случайно открыть
     # реальную сделку через _ema_maybe_open_live_trade без видимого UI.
     # threading.Thread(target=_ema_signal_loop, daemon=True).start()
-    threading.Thread(target=_pump_detect_loop, daemon=True).start()
     threading.Thread(target=_weekly_ema_resolve_loop, daemon=True).start()
     threading.Thread(target=_slow_impulse_scan_loop, daemon=True).start()
-    threading.Thread(target=_pump_dump_track_loop, daemon=True).start()
     threading.Thread(target=_diag_scan_loop, daemon=True).start()
     threading.Thread(target=_diag_track_loop, daemon=True).start()
-    threading.Thread(target=_vol_peak_find_loop, daemon=True).start()
-    threading.Thread(target=_vol_peak_watch_loop, daemon=True).start()
-    threading.Thread(target=_vol_anomaly_track_loop, daemon=True).start()
-    threading.Thread(target=_ema28w_touch_track_loop, daemon=True).start()
+    # v0.30.47: по прямому запросу — убрано всё лишнее относительно цели
+    # "скопировать его бота". Проверено по ВСЕМ собранным сравнениям: ни
+    # один из его 22+ сигналов ни разу не пришёл через памп/дамп или
+    # аномалию объёма (Volume Peak Watcher) — только через slow_impulse.
+    # EMA28W-трекинг зависел ИСКЛЮЧИТЕЛЬНО от пампа/дампа/аномалии как
+    # источников (свой отдельный, независимый триггер) — без них ему
+    # неоткуда брать события. Код всех функций остался в файле нетронутым
+    # (как и раньше поступали с _ema_signal_loop/_weekly_ema_touch_loop) —
+    # просто не запускается, ничего не потребляет и не может сломать
+    # slow_impulse, ручной скан или бэктест, которые от этого не зависят.
+    # threading.Thread(target=_pump_detect_loop, daemon=True).start()
+    # threading.Thread(target=_pump_dump_track_loop, daemon=True).start()
+    # threading.Thread(target=_vol_peak_find_loop, daemon=True).start()
+    # threading.Thread(target=_vol_peak_watch_loop, daemon=True).start()
+    # threading.Thread(target=_vol_anomaly_track_loop, daemon=True).start()
+    # threading.Thread(target=_ema28w_touch_track_loop, daemon=True).start()
     # v0.13.0: полностью заменено на триггер от пампа/дампа (см.
     # _pump_or_dump_maybe_trigger_ema_signal, вызывается изнутри
     # _pump_fire_alert/_dump_fire_alert) — постоянный опрос топ-100 монет
