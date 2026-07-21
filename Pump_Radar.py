@@ -1,7 +1,23 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.40 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.41 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.41: ещё один реальный найденный баг, по прямому вопросу
+  "отслеживается ли вообще был ли вход в сделку". Ответ был — нет: вход
+  (лимитка на EMA-уровне) вообще не проверялся, просто ПРЕДПОЛАГАЛОСЬ,
+  что раз алерт сработал (касание в пределах допуска WEEKLY_EMA_TOUCH_ATR
+  от уровня, не точно НА уровне), значит лимитка исполнилась. Цена вполне
+  могла развернуться, так и не дойдя до точной цены входа — "сделки" по-
+  настоящему не было бы вообще, но мы всё равно засчитывали бы тейк или
+  стоп. Теперь сначала ищем первую свечу, где цена реально дошла до
+  entry (high/low, не close) — новое поле entry_filled_at — и ТОЛЬКО С
+  ЭТОГО МОМЕНТА начинаем считать стоп/тейк. Если вход не подтверждается
+  за WEEKLY_EMA_ENTRY_FILL_TIMEOUT_SEC (3 дня) — запись помечается
+  "no_fill" и не участвует в винрейте (честно: сделки не было). Новая
+  метка видна и в разбивке по источнику (/weekly_ema_source_stats), и на
+  главной странице. Проверено тестом: цена, никогда не дошедшая до
+  входа, корректно даёт no_fill по таймауту; цена, дошедшая до входа и
+  ЗАТЕМ пробившая стоп в следующей свече, корректно даёт stop.
 - v0.30.40: реальный, серьёзный найденный баг — прямой вопрос "точно ли
   всё так хорошо, отслеживается ли очерёдность стоп/тейк" оказался
   обоснован. _weekly_ema_resolve_loop раньше проверял ТОЛЬКО живую цену
@@ -1320,7 +1336,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.40"
+APP_VERSION  = "0.30.41"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3868,7 +3884,7 @@ async function loadSourceStats(){
     if(!stats.length){ box.innerHTML = ''; return; }
     box.innerHTML = 'По источнику: ' + stats.map(s => {
       const wr = s.win_rate_pct != null ? `, винрейт ${s.win_rate_pct}%` : '';
-      return `<b>${s.source}</b> — ${s.total} (тейк ${s.take}/стоп ${s.stop}/открыто ${s.open}${wr})`;
+      return `<b>${s.source}</b> — ${s.total} (тейк ${s.take}/стоп ${s.stop}/открыто ${s.open}/без входа ${s.no_fill||0}${wr})`;
     }).join(' &nbsp;·&nbsp; ');
   }catch(e){}
 }
@@ -7137,6 +7153,7 @@ def _weekly_ema_fire_alert(touch, confidence_note=None, triggered_by=None):
 
 
 WEEKLY_EMA_RESOLVE_POLL_SEC = 120   # раз в 2 минуты — недельные/дневные уровни не убегают быстро
+WEEKLY_EMA_ENTRY_FILL_TIMEOUT_SEC = 3 * 86400   # v0.30.41: если цена так и не дошла до точного уровня входа за 3 дня — считаем, что сделки не было (лимитка не исполнилась), не тейк и не стоп
 
 
 SLOW_IMPULSE_MIN_WEEKLY_CHG_PCT = 15.0   # v0.30.28: по прямому сравнению с внешним референс-ботом — 6 из 8 их сигналов имели |изменение за 7 недельных баров| в диапазоне 18-109%, порог поставлен консервативно ниже этого диапазона
@@ -7246,7 +7263,11 @@ def _weekly_ema_source_stats():
     _weekly_ema_recent хранит triggered_by и итог take/stop/open), просто
     не было готовой сводки по источнику. Разбивает по: памп/дамп напрямую
     (triggered_by пусто), аномалия объёма, накопленный импульс
-    (slow_impulse) — с винрейтом среди уже решённых (take/stop)."""
+    (slow_impulse) — с винрейтом среди уже решённых (take/stop).
+    v0.30.41: добавлен no_fill — вход (лимитка на EMA-уровне) так и не
+    исполнился за WEEKLY_EMA_ENTRY_FILL_TIMEOUT_SEC, сделки по-настоящему
+    не было. Не участвует в винрейте, но виден отдельно для прозрачности —
+    "сколько сигналов вообще не дошли до входа"."""
     with _weekly_ema_touch_lock:
         snapshot = list(_weekly_ema_recent)
 
@@ -7262,17 +7283,17 @@ def _weekly_ema_source_stats():
     stats = {}
     for r in snapshot:
         cat = classify(r.get("triggered_by"))
-        s = stats.setdefault(cat, {"total": 0, "take": 0, "stop": 0, "open": 0})
+        s = stats.setdefault(cat, {"total": 0, "take": 0, "stop": 0, "open": 0, "no_fill": 0})
         s["total"] += 1
         outcome = r.get("outcome", "open")
-        if outcome in ("take", "stop", "open"):
+        if outcome in s:
             s[outcome] += 1
     result = []
     for cat, s in stats.items():
         resolved = s["take"] + s["stop"]
         win_rate = round(s["take"] / resolved * 100, 1) if resolved else None
         result.append({"source": cat, "total": s["total"], "take": s["take"],
-                        "stop": s["stop"], "open": s["open"],
+                        "stop": s["stop"], "open": s["open"], "no_fill": s["no_fill"],
                         "resolved": resolved, "win_rate_pct": win_rate})
     result.sort(key=lambda x: -x["total"])
     return result
@@ -7293,7 +7314,18 @@ def _weekly_ema_resolve_loop():
     считаем стоп (не можем знать точный порядок внутри одной свечи без
     тиковых данных). Группирует по монете, чтобы не дёргать свечи больше
     одного раза за проход, даже если у монеты несколько открытых сигналов
-    сразу."""
+    сразу.
+    v0.30.41: ещё один реальный найденный баг — вход (лимитка на уровне
+    EMA) вообще не проверялся, просто ПРЕДПОЛАГАЛОСЬ, что раз алерт
+    сработал (касание в пределах допуска), значит лимитка исполнилась.
+    Но допуск — до WEEKLY_EMA_TOUCH_ATR от уровня, не точно НА уровне —
+    цена вполне могла развернуться, так и не дойдя до точной цены входа,
+    и "сделки" по-настоящему не было бы вообще. Теперь сначала ищем
+    первую свечу, где цена реально дошла до entry (high/low, не close), и
+    ТОЛЬКО С ЭТОГО МОМЕНТА начинаем считать стоп/тейк — до подтверждения
+    входа стоп/тейк не проверяются вообще. Если вход не подтверждается за
+    WEEKLY_EMA_ENTRY_FILL_TIMEOUT_SEC — запись помечается "no_fill" и не
+    участвует в винрейте (сделки не было)."""
     time.sleep(30)
     while True:
         try:
@@ -7324,9 +7356,19 @@ def _weekly_ema_resolve_loop():
                             continue
                         outcome = None
                         resolved_price = None
+                        entry_filled_at = rec.get("entry_filled_at")
                         for c in relevant:
                             high = c.get("high", c["close"])
                             low = c.get("low", c["close"])
+                            if entry_filled_at is None:
+                                # ждём, пока цена реально дойдёт до точного
+                                # уровня входа — до этого стоп/тейк не считаем
+                                filled = (high >= rec["entry"]) if rec["classic_bias"] == "short" \
+                                         else (low <= rec["entry"])
+                                if not filled:
+                                    continue
+                                entry_filled_at = c["t"]
+                                rec["entry_filled_at"] = int(entry_filled_at)
                             if rec["classic_bias"] == "long":
                                 hit_take = high >= rec["take"]
                                 hit_stop = low <= rec["stop"]
@@ -7357,6 +7399,14 @@ def _weekly_ema_resolve_loop():
                                  f"{time.strftime('%H:%M', time.localtime(rec['ts']))} закрылся по "
                                  f"{'тейку' if outcome=='take' else 'стопу'} ({resolved_price}), "
                                  f"проверено по свечам с {time.strftime('%H:%M', time.localtime(since_ts))}")
+                        elif entry_filled_at is None and (now - rec["ts"]) > WEEKLY_EMA_ENTRY_FILL_TIMEOUT_SEC:
+                            rec["outcome"] = "no_fill"
+                            rec["resolved_at"] = int(time.time())
+                            changed = True
+                            olog(f"[weekly_ema_resolve] {rec['symbol']}: сигнал от "
+                                 f"{time.strftime('%H:%M', time.localtime(rec['ts']))} — вход так и не "
+                                 f"исполнился за {WEEKLY_EMA_ENTRY_FILL_TIMEOUT_SEC//3600}ч, "
+                                 f"сделки не было, в винрейт не считается")
                         else:
                             changed = True   # last_checked_ts продвинулся, стоит сохранить
                     except Exception as e:
