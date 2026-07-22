@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.62 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.63 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.63: по прямому запросу — "сигнал приходит, а новая свеча уже
+  откатилась, и её нет на графике". Два действия: (1) STRETCH_DIAG_
+  SCAN_POLL_SEC снижен со 180с до 45с — теперь, когда скан параллельный
+  (v0.30.62) и завершается на порядок быстрее, можно опрашивать заметно
+  чаще без перегрузки API, это прямо сокращает "ожидание следующего
+  прогона". (2) Добавлена прозрачность вместо тихого допущения "картинка
+  свежая": каждая запись хранит bar_close_ts (реальный момент закрытия
+  свечи, не момент обнаружения), и в сам текст алерта теперь попадает
+  строка "Задержка от закрытия свечи: Xс/Yм" — видно напрямую в
+  сообщении, насколько снимок устарел к моменту доставки, без гаданий.
 - v0.30.62: два прямых замечания разом.
   1) "картинка рисовалась без Pillow в других проектах" — добавлен свой
   PNG-рендерер на чистом stdlib (struct+zlib, оба всегда доступны, PIL
@@ -1597,7 +1607,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.62"
+APP_VERSION  = "0.30.63"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -8629,7 +8639,7 @@ STRETCH_DIAG_TIMEFRAMES = ["15m", "30m", "1h", "4h"]
 STRETCH_DIAG_FETCH_DAYS = {"15m": 10, "30m": 15, "1h": 30, "4h": 60}
 STRETCH_DIAG_MIN_PCT = 1.0          # минимальный % отрыва ВВЕРХ от EMA, чтобы зафиксировать событие (v0.30.52: только вверх, см. _stretch_check_symbol) — иначе шум почти на каждой свече
 STRETCH_DIAG_TOUCH_TOL_PCT = 0.1    # ближе этого к EMA (или пересечение на другую сторону) считается "коснулась снова"
-STRETCH_DIAG_SCAN_POLL_SEC = 180    # почаще обычного — самый быстрый ТФ (15м) требует нередкого опроса, не пропустить момент отрыва
+STRETCH_DIAG_SCAN_POLL_SEC = 45      # v0.30.63: по прямому запросу — "сигналы приходят позже, чем надо, следующий прогон может быть уже поздно". Раньше 180с (3 мин) было разумно при ПОСЛЕДОВАТЕЛЬНОМ обходе (сам скан и так уже мог занимать сравнимое время), теперь скан параллельный (v0.30.62) и завершается на порядок быстрее — можно опрашивать намного чаще, не перегружая API
 STRETCH_DIAG_TRACK_POLL_SEC = 60
 STRETCH_DIAG_TRACK_WINDOW_SEC = {"15m": 6 * 3600, "30m": 12 * 3600, "1h": 24 * 3600, "4h": 4 * 86400}   # с запасом под масштаб ТФ
 STRETCH_DIAG_FILE = os.path.expanduser("~/pumpradar_ema_stretch_diag.json")
@@ -8700,9 +8710,11 @@ def _stretch_check_symbol(symbol, tf):
         stretch_pct = (closed_price - ema_closed) / ema_closed * 100.0
         if stretch_pct < STRETCH_DIAG_MIN_PCT:   # v0.30.52: по прямому запросу — только отрыв ВВЕРХ (цена выше EMA), ожидаем падение к EMA обратно. Отрыв вниз (price < ema) больше не фиксируем — раньше ловили оба направления симметрично
             continue
+        bar_close_ts = ctx["candles"][ctx["i"]]["t"] + TF_SECONDS.get(tf, 0)
         out.append({
             "id": f"{symbol}|{tf}|{period}|{int(now)}",
             "ts": int(now), "symbol": symbol, "tf": tf, "period": period,
+            "bar_close_ts": bar_close_ts,   # v0.30.63: по прямому запросу — прозрачность задержки: реальный момент закрытия свечи, не момент обнаружения
             "trigger_price": closed_price, "trigger_ema": _round_price(ema_closed),
             "stretch_pct": round(stretch_pct, 3), "side": "above" if stretch_pct > 0 else "below",
             "touched": False, "touched_at": None, "time_to_touch_sec": None,
@@ -8862,10 +8874,13 @@ def _stretch_diag_maybe_alert_top_combo(new_recs):
     for rec in new_recs:
         if rec["tf"] != top_tf or rec["period"] != top_period:
             continue
+        lag_sec = max(0, int(time.time() - rec.get("bar_close_ts", rec["ts"])))
+        lag_txt = f"{lag_sec}с" if lag_sec < 60 else f"{lag_sec // 60}м{lag_sec % 60}с"
         msg = (f"📉 <b>{rec['symbol']}</b> — отрыв вверх от EMA{top_period} ({top_tf}), "
                f"топ связка по устойчивости к стопу (10х)\n"
                f"Отрыв: {rec['stretch_pct']:+.2f}% | уровень EMA: {_fmt_px(rec['trigger_ema'])} | "
                f"цена: {_fmt_px(rec['trigger_price'])}\n"
+               f"Задержка от закрытия свечи: {lag_txt}\n"
                f"По статистике этой связки (n={o['evaluated']}, риск-выборка n={o['stop_survival_n']}): "
                f"выживает при стопе {STRETCH_REF_STOP_PCT}% — {o['stop_survival_rate']}%, "
                f"средний откат {o['avg_retrace_pct_of_stretch']}%, touch rate {o['touch_rate']}%")
