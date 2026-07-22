@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.56 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.57 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.57: по прямому запросу — "нужны пары только по криптовалютам".
+  У Gate.io нет отдельного API-поля "это акция/товар, не крипта" — весь
+  список исключений строится ТОЛЬКО ручным пополнением по факту находки
+  (уже 2 пробела было раньше: TQQQX, SOXL). Найдены живьём в данных
+  "Отрыв от EMA" ещё 3 утечки: XAUT_USDT (Tether Gold — токенизированное
+  золото), SKHYNIX_USDT и SKHY_USDT (акция SK Hynix, видны оба варианта
+  тикера). Добавлены в исключения (переименован в GATE_NON_CRYPTO_SYMBOLS
+  для ясности, старое имя GATE_XSTOCKS_SYMBOLS оставлено алиасом).
+  Гарантии полноты списка НЕТ — если попадётся что-то ещё нерыночное
+  (акции/ETF/товары), нужно будет добавлять по факту находки.
 - v0.30.56: по прямому запросу — "Отрыв от EMA" раньше показывал только
   шанс вернуться (closest_stretch_pct/retrace%), но не худший случай на
   пути. Добавлено новое поле max_adverse_stretch_pct (пик удаления от
@@ -1534,7 +1544,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.56"
+APP_VERSION  = "0.30.57"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2431,7 +2441,7 @@ def _strip_html_for_ntfy(text):
 # крипто-ботом эти монеты только зашумляли — он их никогда не увидит,
 # сколько бы наши критерии ни совпадали. Список может расти со временем
 # (Gate добавляет новые), это стартовый набор по официальным анонсам.
-GATE_XSTOCKS_SYMBOLS = {
+GATE_NON_CRYPTO_SYMBOLS = {
     "AAPLX_USDT", "GOOGLX_USDT", "TSLAX_USDT", "AMZNX_USDT", "MSTRX_USDT",
     "COINX_USDT", "NVDAX_USDT", "CRCLX_USDT", "METAX_USDT", "HOODX_USDT",
     "DFDVX_USDT", "QQQX_USDT", "SPYX_USDT",
@@ -2441,7 +2451,18 @@ GATE_XSTOCKS_SYMBOLS = {
     # "исключённый", но по факту забыт в самом множестве — тоже добавлен
     # только сейчас.
     "TQQQX_USDT", "SOXL_USDT",
+    # v0.30.57: реальный пробел #3 — по прямому запросу "нужны пары
+    # только по криптовалютам", найдены живьём в данных "Отрыв от EMA":
+    # XAUT_USDT (Tether Gold — токенизированное золото, не крипто-актив
+    # по сути) и SKHYNIX_USDT/SKHY_USDT (акция SK Hynix, похоже видны ОБА
+    # варианта тикера одной и той же бумаги). У Gate.io нет отдельного
+    # API-поля "это акция/товар" — весь список строится ТОЛЬКО на ручном
+    # пополнении по факту находки, так что гарантии полноты нет: если
+    # увидишь ещё что-то нерыночное (акции, ETF, товары) — присылай
+    # тикер, добавлю сюда же.
+    "XAUT_USDT", "SKHYNIX_USDT", "SKHY_USDT",
 }
+GATE_XSTOCKS_SYMBOLS = GATE_NON_CRYPTO_SYMBOLS   # обратная совместимость имени, ничего не переименовываю в местах использования без необходимости
 
 
 def _fetch_all_symbols(min_volume_usd_override=None, max_volume_usd_override=None):
