@@ -1,7 +1,20 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.67 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.68 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.68: по прямому возражению — "тогда почти все сигналы будут
+  исключены, это не решение" (справедливо: реальная медиана задержки на
+  15m — 5.1 мин, порог в 3-5 мин резал бы 50-89% сигналов). Убрал идею
+  фильтрации по задержке, вместо этого — настоящая находка причины:
+  КАЖДЫЙ цикл в очередь уходили ВСЕ ~700 монет × 4 ТФ, даже те, чей кэш
+  свечи ещё не истёк (в среднем это 95%+ проверок впустую — кэш просто
+  вернул бы то же самое). Эти бесполезные проверки всё равно занимали
+  место в очереди у ограниченных 24 потоков, оттягивая внимание от
+  немногих, кому СЕЙЧАС реально нужен свежий фетч. Теперь заранее
+  фильтруем — в пул уходят только (symbol, tf), у которых кэш реально
+  просрочен или не создавался вообще. В обычном цикле задач должно стать
+  на порядки меньше (кроме моментов синхронного закрытия у всех разом),
+  и внимание потоков будет сосредоточено именно там, где нужно.
 - v0.30.67: по прямому запросу — "может уже можно сигналы придумать с
   тейком и стопом". "Отрыв от EMA" из чисто наблюдательного инструмента
   стал настоящим сигналом: Вход = цена триггера, Стоп = вход+2%
@@ -1652,7 +1665,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.67"
+APP_VERSION  = "0.30.68"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -8820,7 +8833,24 @@ def _stretch_diag_scan_loop():
         try:
             symbols = _fetch_all_symbols()
             added = 0
-            tasks = [(symbol, tf) for symbol in symbols for tf in STRETCH_DIAG_TIMEFRAMES]
+            now0 = time.time()
+            # v0.30.68: реальная находка по прямому вопросу "почему задержка
+            # всё ещё большая" — раньше на КАЖДОМ цикле в очередь уходили
+            # ВСЕ ~700 монет × 4 ТФ, даже те, чей кэш свечи ещё не истёк
+            # (99% проверок впустую — кэш просто возвращает то же самое).
+            # Эти бесполезные проверки всё равно занимали место в очереди
+            # у ограниченного числа потоков, оттягивая внимание от
+            # немногих, кому СЕЙЧАС реально нужен свежий фетч. Теперь
+            # заранее фильтруем — в пул уходят только те (symbol, tf), у
+            # которых кэш просрочен или ещё не создавался вообще.
+            with _stretch_diag_ctx_cache_lock:
+                due_tasks = []
+                for symbol in symbols:
+                    for tf in STRETCH_DIAG_TIMEFRAMES:
+                        cached = _stretch_diag_ctx_cache.get(f"{symbol}|{tf}")
+                        if not cached or now0 >= cached["next_close_t"]:
+                            due_tasks.append((symbol, tf))
+            tasks = due_tasks
             with ThreadPoolExecutor(max_workers=STRETCH_DIAG_SCAN_WORKERS) as pool:
                 futures = {pool.submit(_stretch_check_symbol, symbol, tf): (symbol, tf) for symbol, tf in tasks}
                 for fut in _as_completed(futures):
@@ -8860,7 +8890,8 @@ def _stretch_diag_scan_loop():
             cycle_sec = round(time.time() - cycle_start, 1)
             _stretch_diag_last_cycle_sec = cycle_sec
             olog(f"[ema_stretch] скан завершён за {cycle_sec}с: +{added} новых отрывов "
-                 f"(задач {len(tasks)}, всего в истории {len(_stretch_diag_records)})")
+                 f"(задач {len(tasks)} из {len(symbols) * len(STRETCH_DIAG_TIMEFRAMES)} возможных, "
+                 f"всего в истории {len(_stretch_diag_records)})")
         except Exception as e:
             olog(f"[ema_stretch] ошибка цикла сканирования: {_explain_error(e)}")
         time.sleep(STRETCH_DIAG_SCAN_POLL_SEC)
