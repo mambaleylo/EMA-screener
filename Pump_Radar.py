@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.60 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.61 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.61: по прямому вопросу "нет графика" — раньше любая причина
+  провала рендера (PIL не установлен, мало свечей, что угодно) тихо
+  схлопывалась в один и тот же None, видимый только в консольных логах,
+  до которых на телефоне неудобно добираться. Теперь причина попадает
+  ПРЯМО В ТЕКСТ самого алерта в Telegram ("⚠️ график не приложен: ..."),
+  не нужно лезть в логи, чтобы понять, что произошло — включая явную
+  проверку доступности PIL (частая причина на Termux).
 - v0.30.60: по прямому уточнению — "буду торговать с фикс. 10х плечом,
   учти на будущее". Пересчитал риск с этой поправкой: у 4h/EMA20 (прежний
   лидер по чистому % отката) при стопе 2% (=20% маржи на 10х) сносило бы
@@ -1573,7 +1580,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.60"
+APP_VERSION  = "0.30.61"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -8669,17 +8676,30 @@ def _stretch_render_alert_chart(rec):
     подключён) — рисует последние свечи, entry = цена триггера (текущая,
     это последняя свеча в окне), tp = уровень EMA (это и есть "куда
     планируется движение" — цель возврата), sl не показываем (тут не
-    сделка, стопа нет)."""
+    сделка, стопа нет).
+    v0.30.61: реальная находка по прямому вопросу "нет графика" — раньше
+    любая причина провала (PIL не установлен, мало свечей, что угодно)
+    тихо схлопывалась в один и тот же None, видимый только в логах
+    консоли, до которых на телефоне неудобно добираться. Теперь функция
+    возвращает (png, причина_отказа) — причина явно попадает в текст
+    самого алерта в Telegram, не нужно лезть в логи, чтобы понять, что
+    произошло."""
+    try:
+        from PIL import Image  # noqa: F401 — только для проверки доступности
+    except ImportError:
+        return None, "PIL (Pillow) не установлен — на телефоне: pip install Pillow --break-system-packages"
     try:
         ctx = _stretch_get_closed_ctx(rec["symbol"], rec["tf"])
         if not ctx:
-            return None
+            return None, "не удалось получить контекст свечей для графика (ctx пуст)"
         sig = {"entry": rec["trigger_price"], "tp": rec["trigger_ema"], "sl": None,
                "dir": f"жду возврата к EMA{rec['period']}", "entry_i": ctx["i"]}
-        return _render_signal_chart_png(ctx["candles"], sig, rec["symbol"], rec["tf"])
+        png = _render_signal_chart_png(ctx["candles"], sig, rec["symbol"], rec["tf"])
+        if not png:
+            return None, "рендерер графика вернул пусто (недостаточно свечей в окне или внутренняя ошибка отрисовки)"
+        return png, None
     except Exception as e:
-        olog(f"[ema_stretch] ⚠ не смог отрисовать график для алерта: {_explain_error(e)}")
-        return None
+        return None, _explain_error(e)
 
 
 def _stretch_diag_maybe_alert_top_combo(new_recs):
@@ -8712,10 +8732,12 @@ def _stretch_diag_maybe_alert_top_combo(new_recs):
                f"По статистике этой связки (n={o['evaluated']}, риск-выборка n={o['stop_survival_n']}): "
                f"выживает при стопе {STRETCH_REF_STOP_PCT}% — {o['stop_survival_rate']}%, "
                f"средний откат {o['avg_retrace_pct_of_stretch']}%, touch rate {o['touch_rate']}%")
-        png = _stretch_render_alert_chart(rec)
+        png, err = _stretch_render_alert_chart(rec)
         if png:
             _send_alert_photo(png, msg)
         else:
+            msg += f"\n⚠️ график не приложен: {err}"
+            olog(f"[ema_stretch] ⚠ график для {rec['symbol']} не отрисован: {err}")
             _send_alert(msg)
         olog(f"[ema_stretch] {rec['symbol']} {top_tf} EMA{top_period}: "
              f"алерт по топ-связке отправлен (отрыв {rec['stretch_pct']:+.2f}%)")
