@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.59 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.60 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.60: по прямому уточнению — "буду торговать с фикс. 10х плечом,
+  учти на будущее". Пересчитал риск с этой поправкой: у 4h/EMA20 (прежний
+  лидер по чистому % отката) при стопе 2% (=20% маржи на 10х) сносило бы
+  стопом ~24% случаев ДО разворота, у 15m/EMA5 — почти никогда (~4%).
+  Ранжирование топ-связки (та, по которой шлются алерты) теперь по
+  НОВОЙ метрике stop_survival_rate — доле случаев, где цена НЕ прошла
+  STRETCH_REF_STOP_PCT=2.0% против входа прежде чем начать откат, а не
+  по абстрактному "% отката когда-нибудь". Добавлена колонка в сводку,
+  обновлён текст алерта в Telegram. Сохранена память проекта (пользователь
+  планирует фикс. 10х плечо) — учитывать во всех будущих расчётах
+  риска/стопа для этого движка.
 - v0.30.59: по прямому запросу — к алерту по топ-связке добавлен кусочек
   графика (последние свечи + горизонтальная линия уровня EMA — это и
   есть "куда планируется движение", цель возврата). Переиспользован
@@ -1562,7 +1573,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.59"
+APP_VERSION  = "0.30.60"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -8695,11 +8706,12 @@ def _stretch_diag_maybe_alert_top_combo(new_recs):
         if rec["tf"] != top_tf or rec["period"] != top_period:
             continue
         msg = (f"📉 <b>{rec['symbol']}</b> — отрыв вверх от EMA{top_period} ({top_tf}), "
-               f"топ связка по откату\n"
+               f"топ связка по устойчивости к стопу (10х)\n"
                f"Отрыв: {rec['stretch_pct']:+.2f}% | уровень EMA: {_fmt_px(rec['trigger_ema'])} | "
                f"цена: {_fmt_px(rec['trigger_price'])}\n"
-               f"По статистике этой связки (n={o['evaluated']}): средний откат "
-               f"{o['avg_retrace_pct_of_stretch']}%, touch rate {o['touch_rate']}%")
+               f"По статистике этой связки (n={o['evaluated']}, риск-выборка n={o['stop_survival_n']}): "
+               f"выживает при стопе {STRETCH_REF_STOP_PCT}% — {o['stop_survival_rate']}%, "
+               f"средний откат {o['avg_retrace_pct_of_stretch']}%, touch rate {o['touch_rate']}%")
         png = _stretch_render_alert_chart(rec)
         if png:
             _send_alert_photo(png, msg)
@@ -8768,10 +8780,20 @@ def _stretch_diag_track_loop():
         time.sleep(STRETCH_DIAG_TRACK_POLL_SEC)
 
 
+STRETCH_REF_STOP_PCT = 2.0   # v0.30.60: по прямому запросу — "буду торговать с фикс. 10х плечом, учти на будущее". 2% движения цены при 10х = 20% маржи — ориентировочная, разумная ширина стопа для ранжирования (не «истинно оптимальный» стоп, просто общая линейка сравнения между связками; можно пересмотреть). НЕ равно ликвидации — ликвидация на 10х наступает ближе к ~9-10% (грубо, без учёта комиссий/фандинга/maintenance rate конкретной монеты), стоп ставится заметно раньше неё осознанно
+
+
 def _stretch_diag_summary(min_events=3):
     """Сводка по каждой связке (ТФ × период), плюс разбивка по величине
     исходного отрыва (STRETCH_DIAG_BUCKETS) — цель ровно та, что просили:
-    "какой фрейм и период EMA лучше всего по проценту отката"."""
+    "какой фрейм и период EMA лучше всего по проценту отката".
+    v0.30.60: реальная находка по прямому уточнению про 10х плечо — чистый
+    % отката ничего не говорит о том, насколько БОЛЬНО было по пути. У
+    4h/EMA20 (лидер по старому критерию) при стопе 2% сносило бы ~24%
+    случаев ДО разворота — а у 15m/EMA5 почти никогда. Ранжирование
+    теперь по stop_survival_rate (доля случаев, где цена НЕ прошла
+    STRETCH_REF_STOP_PCT против входа прежде чем начать откат) — прямая
+    оценка риска именно под плечо, а не абстрактный "% отката когда-то"."""
     with _stretch_diag_lock:
         records = list(_stretch_diag_records)
     groups = {}
@@ -8790,8 +8812,13 @@ def _stretch_diag_summary(min_events=3):
         # пошла в откат без дальнейшего ухудшения). Считаем по ВСЕМ
         # записям (не только оценённым) — это живой риск-профиль, важен
         # даже для ещё не решённых
-        excess_vals = [max(0.0, abs(r.get("max_adverse_stretch_pct", r["stretch_pct"])) - abs(r["stretch_pct"]))
-                       for r in items]
+        adverse_items = [r for r in items if "max_adverse_stretch_pct" in r]
+        excess_vals = [max(0.0, abs(r["max_adverse_stretch_pct"]) - abs(r["stretch_pct"]))
+                       for r in adverse_items]
+        # v0.30.60: движение ПРОТИВ ВХОДА (не против исходного отрыва) —
+        # именно это режет P&L при реальной позиции с фиксированным стопом
+        survived = sum(1 for r in adverse_items
+                       if abs(r["max_adverse_stretch_pct"] - r["stretch_pct"]) < STRETCH_REF_STOP_PCT)
         return {
             "total": total, "evaluated": len(evaluated), "touched": touched,
             "touch_rate": round(touched / len(evaluated) * 100, 1) if evaluated else None,
@@ -8800,6 +8827,8 @@ def _stretch_diag_summary(min_events=3):
             "avg_time_to_touch_min": round(sum(touch_times) / len(touch_times) / 60, 1) if touch_times else None,
             "avg_extra_adverse_pct": round(sum(excess_vals) / len(excess_vals), 2) if excess_vals else None,
             "max_extra_adverse_pct": round(max(excess_vals), 2) if excess_vals else None,
+            "stop_survival_n": len(adverse_items),
+            "stop_survival_rate": round(survived / len(adverse_items) * 100, 1) if adverse_items else None,
         }
 
     result = []
@@ -8812,7 +8841,13 @@ def _stretch_diag_summary(min_events=3):
             if subset:
                 entry[f"stretch_{label}"] = _agg(subset)
         result.append(entry)
-    result.sort(key=lambda e: (e["overall"]["avg_retrace_pct_of_stretch"] or 0), reverse=True)
+    # v0.30.60: сортировка теперь по stop_survival_rate (см. докстринг) —
+    # если у связки ещё нет данных по адверс-полю (survival=None), считаем
+    # её неизвестной/худшей (0), а не случайно лучшей из-за отсутствия
+    # данных — иначе новые/непроверенные связки могли бы обманом всплыть
+    # в топ просто по нехватке информации
+    result.sort(key=lambda e: (e["overall"]["stop_survival_rate"] if e["overall"]["stop_survival_rate"] is not None else 0,
+                               e["overall"]["avg_retrace_pct_of_stretch"] or 0), reverse=True)
     return result
 
 # ─── конец EMA Stretch/Retrace Diagnostics ──────────────────────────────────
@@ -9956,6 +9991,7 @@ select,input{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-ra
 
 <h1>&#128201; Отрыв от EMA — сколько в среднем откатывает</h1>
 <p style="color:#8b949e;font-size:13px;max-width:520px">Триггер — отрыв цены ВВЕРХ от короткой EMA (5/10/20) на ЗАКРЫТИИ свечи, ≥1%, на ТФ 15м/30м/1h/4h (только вверх — ожидаем падение к EMA обратно, отрыв вниз не отслеживается). Дальше следим ЛИБО до касания той же EMA обратно, ЛИБО до таймаута (свой на каждый ТФ) — и считаем % отката от исходного отрыва (100% = полностью коснулась). Сводка разбита ещё и по величине самого отрыва (1-3% / 3-6% / 6%+), чтобы видеть, растёт ли шанс отката вместе с силой отрыва.</p>
+<p style="color:#d29922;font-size:12px;max-width:520px">С v0.30.60 топ-связка (та, по которой шлются алерты) ранжируется по "выживаемости при стопе 2%" (см. колонку), а не по чистому % отката — с учётом 10х плеча важнее не "вернётся ли когда-нибудь", а "снесёт ли стопом раньше, чем успеет вернуться". Стоп 2% при 10х — это 20% маржи, ориентировочная линейка сравнения, не готовая рекомендация.</p>
 
 <div class="section-card">
   <div class="section-head">
@@ -9965,7 +10001,7 @@ select,input{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-ra
   <div id="summaryStatus" class="summary-line">загрузка...</div>
   <div class="table-scroll">
     <table id="summaryTable">
-      <thead><tr><th>ТФ</th><th>EMA</th><th>Событий</th><th>Оценено</th><th>Touch rate</th><th>Avg откат%</th><th>Med откат%</th><th>Avg время до касания</th><th>Avg хуже на%</th><th>Худший случай</th><th>1-3% events</th><th>3-6% events</th><th>6%+ events</th></tr></thead>
+      <thead><tr><th>ТФ</th><th>EMA</th><th>Событий</th><th>Оценено</th><th>Выжив. при стопе 2% (10х)</th><th>Touch rate</th><th>Avg откат%</th><th>Med откат%</th><th>Avg время до касания</th><th>Avg хуже на%</th><th>Худший случай</th><th>1-3% events</th><th>3-6% events</th><th>6%+ events</th></tr></thead>
       <tbody></tbody>
     </table>
   </div>
@@ -10020,6 +10056,7 @@ async function loadSummary(){
       const tr = document.createElement('tr');
       const b13 = e['stretch_1-3%'], b36 = e['stretch_3-6%'], b6p = e['stretch_6%+'];
       tr.innerHTML = `<td>${e.tf}</td><td>EMA${e.period}</td><td>${o.total}</td><td>${o.evaluated}</td>`+
+        `<td>${o.stop_survival_rate ?? '—'}% (n=${o.stop_survival_n ?? 0})</td>`+
         `<td>${o.touch_rate ?? '—'}%</td><td>${o.avg_retrace_pct_of_stretch ?? '—'}%</td>`+
         `<td>${o.median_retrace_pct_of_stretch ?? '—'}%</td><td>${o.avg_time_to_touch_min ?? '—'} мин</td>`+
         `<td>${o.avg_extra_adverse_pct ?? '—'}%</td><td>${o.max_extra_adverse_pct ?? '—'}%</td>`+
