@@ -1,7 +1,21 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.73 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.74 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.74: серьёзный реальный баг, найден по прямому сообщению "стоп
+  был, а в логах не нашёл, где-то баг". Проверил конкретную запись
+  (BLUAI_USDT, вход 0.012482, стоп 0.012732) — цена на графике реально
+  доходила до 0.012925 (выше стопа), но у записи last_checked_ts точно
+  равен времени создания, хотя прошло уже 34 минуты. Проверил ВСЕ 1413
+  открытых записей в файле — у 100% last_checked_ts == ts, трек-луп НИ
+  РАЗУ не обновил ни одну из них. Причина — _stretch_diag_track_loop был
+  ОДНОПОТОЧНЫМ: шёл по открытым записям по одной, с сетевым запросом на
+  каждую. Когда открытых записей накопилось за тысячу, один проход
+  просто не успевал закончиться до следующего цикла, а список тем
+  временем только рос — ровно та же болезнь, что чинили в скане монет
+  (v0.30.62), только тут пропустил при рефакторинге под тейк/стоп
+  (v0.30.67). Теперь трек-луп параллельный, пул из 32 потоков — та же
+  схема, что и у скана. Добавлено логирование длительности прохода.
 - v0.30.73: реальная находка по новой разбивке задержки (v0.30.72) —
   медиана ожидания в самом рейт-лимите всего 0.4с, максимум времени
   запроса 13.2с (не 25с+, как было бы при повторных попытках после 429)
@@ -1718,7 +1732,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.73"
+APP_VERSION  = "0.30.74"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -9127,6 +9141,9 @@ def _stretch_diag_maybe_alert_top_combo(new_recs):
              f"алерт по топ-связке отправлен (отрыв {rec['stretch_pct']:+.2f}%)")
 
 
+STRETCH_TRACK_WORKERS = 32   # v0.30.74: реальный баг, найден по прямому сообщению "стоп был, а в логах не нашёл" — трек-луп был ОДНОПОТОЧНЫМ: шёл по всем открытым записям ПО ОДНОЙ, с сетевым запросом на каждую. Когда открытых записей накопилось за тысячу (100% из них!), last_checked_ts НИ РАЗУ не обновлялся после создания — однопоточный проход просто не успевал закончиться до следующего цикла, а список тем временем только рос. Ровно та же болезнь, что была у скана монет (v0.30.62), только тут пропустил. Теперь параллельно, пулом потоков — как и скан
+
+
 def _stretch_diag_track_loop():
     """Раз в STRETCH_DIAG_TRACK_POLL_SEC пересчитывает живую EMA и цену для
     каждой ещё открытой записи, обновляет ближайший подход к EMA
@@ -9140,23 +9157,22 @@ def _stretch_diag_track_loop():
             with _stretch_diag_lock:
                 open_recs = [r for r in _stretch_diag_records if not r.get("track_done", True)]
             if open_recs:
-                changed = False
                 now = time.time()
-                for rec in open_recs:
+
+                def _process(rec):
                     try:
                         ctx = _stretch_get_closed_ctx(rec["symbol"], rec["tf"])
                         live_price = _gate_get_price(rec["symbol"])
                         if not ctx or not live_price:
                             if now >= rec.get("track_until", 0):
                                 rec["track_done"] = True
-                                changed = True
-                            continue
+                                return True
+                            return False
                         ema_closed = ctx["ema_arrays"][rec["period"]][ctx["i"]]
                         ema_now = _ema_live_value(ema_closed, live_price, rec["period"]) if ema_closed else None
                         if not ema_now:
-                            continue
+                            return False
                         current_stretch = (live_price - ema_now) / ema_now * 100.0
-                        original_side = 1 if rec["stretch_pct"] > 0 else -1
                         crossed = (current_stretch > 0) != (rec["stretch_pct"] > 0)
                         if abs(current_stretch) < abs(rec["closest_stretch_pct"]):
                             rec["closest_stretch_pct"] = round(current_stretch, 3)
@@ -9166,7 +9182,6 @@ def _stretch_diag_track_loop():
                         if retrace > rec["max_retrace_pct_of_stretch"]:
                             rec["max_retrace_pct_of_stretch"] = round(retrace, 1)
                         rec["last_checked_ts"] = int(now)
-                        changed = True
                         # v0.30.67: по прямому запросу — реальный сигнал с
                         # тейком/стопом. СТОП проверяется ПЕРВЫМ (в порядке
                         # реальных событий) — если цена уже ушла дальше
@@ -9192,11 +9207,17 @@ def _stretch_diag_track_loop():
                         elif now >= rec.get("track_until", 0):
                             rec["signal_outcome"] = "timeout"
                             rec["track_done"] = True
+                        return True
                     except Exception as e:
                         olog(f"[ema_stretch_track] ⚠ пропущена битая запись "
-                             f"({rec.get('symbol','?')}): {_explain_error(e)}")
-                        continue
-                if changed:
+                             f"({rec.get('symbol', '?')}): {_explain_error(e)}")
+                        return False
+
+                with ThreadPoolExecutor(max_workers=STRETCH_TRACK_WORKERS) as pool:
+                    t0 = time.time()
+                    results = list(pool.map(_process, open_recs))
+                    olog(f"[ema_stretch_track] проверено {len(open_recs)} открытых записей за {round(time.time()-t0,1)}с")
+                if any(results):
                     _stretch_diag_save()
         except Exception as e:
             olog(f"[ema_stretch_track] ошибка цикла: {_explain_error(e)}")
