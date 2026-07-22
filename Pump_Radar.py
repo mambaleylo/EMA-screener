@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.74 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.75 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.75: по прямому запросу — старая история "Отрыв от EMA" копилась
+  в период, когда трек-луп был сломан (v0.30.74) и не проверял открытые
+  записи вообще — их реальный исход (задело ли стоп/тейк за то время,
+  пока не проверялось) неизвестен, статистика по ним ненадёжна. Добавлена
+  кнопка "Очистить историю" на странице /ema_stretch (эндпоинт
+  /ema_stretch_history_clear, тот же паттерн, что уже был у
+  /weekly_ema_history_clear) — дальше копим статистику честно, с рабочим
+  параллельным трек-лупом.
 - v0.30.74: серьёзный реальный баг, найден по прямому сообщению "стоп
   был, а в логах не нашёл, где-то баг". Проверил конкретную запись
   (BLUAI_USDT, вход 0.012482, стоп 0.012732) — цена на графике реально
@@ -1732,7 +1740,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.74"
+APP_VERSION  = "0.30.75"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -10451,7 +10459,10 @@ select,input{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-ra
 <div class="section-card">
   <div class="section-head">
     <h3>&#128202; Сводка: какой ТФ/период откатывает лучше всего</h3>
-    <button onclick="loadSummary()">&#128260; Обновить</button>
+    <div>
+      <button onclick="loadSummary()">&#128260; Обновить</button>
+      <button onclick="clearStretchHistory()" style="background:#3a1414;border:1px solid #f85149;color:#f85149">🗑 Очистить историю</button>
+    </div>
   </div>
   <div id="summaryStatus" class="summary-line">загрузка...</div>
   <div class="table-scroll">
@@ -10522,6 +10533,16 @@ async function loadSummary(){
       tbody.appendChild(tr);
     }
   }catch(e){ statusEl.innerText = 'Ошибка загрузки'; }
+}
+
+async function clearStretchHistory(){
+  if(!confirm('Точно очистить всю историю "Отрыв от EMA"? Это нельзя отменить.')) return;
+  try{
+    const r = await fetch('/ema_stretch_history_clear', {method:'POST'});
+    const d = await r.json();
+    if(d.ok){ loadSummary(); loadRaw(); }
+    else { alert('Не получилось очистить'); }
+  }catch(e){ alert('Ошибка запроса'); }
 }
 
 async function loadRaw(){
@@ -11364,6 +11385,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 _weekly_ema_recent = []
                 _save_weekly_ema_history()
             olog("[weekly_ema] история EMA-сигналов очищена вручную")
+            self._json({"ok": True})
+
+        elif self.path == "/ema_stretch_history_clear":
+            # v0.30.75: по прямому запросу — старая история "Отрыв от EMA"
+            # копилась в период, когда трек-луп был сломан (v0.30.74) и
+            # не проверял открытые записи вообще — их реальный исход
+            # (взяла ли цена стоп/тейк за то время, пока не проверялась)
+            # неизвестен, статистика по ним ненадёжна. Чистим начисто,
+            # дальше копим честно, с рабочим трек-лупом
+            global _stretch_diag_records
+            with _stretch_diag_lock:
+                _stretch_diag_records = []
+                _stretch_diag_save()
+            olog("[ema_stretch] история отрывов от EMA очищена вручную")
             self._json({"ok": True})
 
         elif self.path == "/ema_diag_backfill_extended":
