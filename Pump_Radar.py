@@ -1,7 +1,23 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.66 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.67 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.67: по прямому запросу — "может уже можно сигналы придумать с
+  тейком и стопом". "Отрыв от EMA" из чисто наблюдательного инструмента
+  стал настоящим сигналом: Вход = цена триггера, Стоп = вход+2%
+  (STRETCH_REF_STOP_PCT, та же линейка, что уже использовалась для
+  ранжирования связок), Тейк = уровень EMA. Реальная находка при
+  реализации: раньше (v0.30.56/60) "плохой случай" фиксировался просто
+  как рекорд худшего захода, БЕЗ выхода из отслеживания — то есть даже
+  если цена реально прошла бы стоп, мы продолжали ждать и потом могли
+  засчитать touch=true, если она ВСЁ РАВНО потом дошла до EMA. Это была
+  задняя дата, не честный сигнал: в реальности позиции бы уже не было
+  после стопа. Теперь трек-луп проверяет СТОП ПЕРВЫМ (в порядке реальных
+  событий) — как только цена достигает уровня стопа, запись сразу
+  закрывается как "stop", даже если позже вернулась бы к EMA. Новое поле
+  signal_outcome (open/take/stop/timeout) и статистика "Винрейт
+  тейк/стоп" в сводке и в тексте алерта Telegram. Картинка (и PIL, и
+  stdlib-версия) теперь показывает все три линии — вход/стоп/тейк.
 - v0.30.66: по прямому вопросу "сколько времени уходит на цикл" — раньше
   никак не измерялось, только косвенно оценивалось по лагу. Добавлен
   честный замер длительности каждого полного скана (в секундах), пишется
@@ -1636,7 +1652,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.66"
+APP_VERSION  = "0.30.67"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4706,8 +4722,8 @@ def _render_signal_chart_png_stdlib(candles, sig, sym, tf):
 
         highs = [_g(c, "high", "h") for c in window]
         lows = [_g(c, "low", "l") for c in window]
-        entry, tp = sig.get("entry"), sig.get("tp")
-        vals = highs + lows + [v for v in (entry, tp) if v]
+        entry, tp, sl = sig.get("entry"), sig.get("tp"), sig.get("sl")
+        vals = highs + lows + [v for v in (entry, tp, sl) if v]
         vmax, vmin = max(vals), min(vals)
         if vmax <= vmin:
             vmax = vmin + max(abs(vmin) * 0.001, 1e-9)
@@ -4761,6 +4777,7 @@ def _render_signal_chart_png_stdlib(candles, sig, sym, tf):
 
         hline(entry, white)
         hline(tp, green)
+        hline(sl, red)
 
         rows = [bytes(buf[y * W * 3:(y + 1) * W * 3]) for y in range(H)]
         return _png_encode_rgb(W, H, rows)
@@ -8740,16 +8757,21 @@ def _stretch_check_symbol(symbol, tf):
         if stretch_pct < STRETCH_DIAG_MIN_PCT:   # v0.30.52: по прямому запросу — только отрыв ВВЕРХ (цена выше EMA), ожидаем падение к EMA обратно. Отрыв вниз (price < ema) больше не фиксируем — раньше ловили оба направления симметрично
             continue
         bar_close_ts = ctx["candles"][ctx["i"]]["t"] + TF_SECONDS.get(tf, 0)
+        entry = closed_price
+        stop = _round_price(entry * (1 + STRETCH_REF_STOP_PCT / 100))   # v0.30.67: по прямому запросу — реальный сигнал с тейком/стопом. Шорт на возврат к EMA: стоп ВЫШЕ входа (цена ушла ещё дальше), тейк — сам уровень EMA
+        take = _round_price(ema_closed)
         out.append({
             "id": f"{symbol}|{tf}|{period}|{int(now)}",
             "ts": int(now), "symbol": symbol, "tf": tf, "period": period,
             "bar_close_ts": bar_close_ts,   # v0.30.63: по прямому запросу — прозрачность задержки: реальный момент закрытия свечи, не момент обнаружения
             "trigger_price": closed_price, "trigger_ema": _round_price(ema_closed),
+            "entry": entry, "stop": stop, "take": take,
             "stretch_pct": round(stretch_pct, 3), "side": "above" if stretch_pct > 0 else "below",
             "touched": False, "touched_at": None, "time_to_touch_sec": None,
             "closest_stretch_pct": round(stretch_pct, 3),
             "max_retrace_pct_of_stretch": 0.0,
             "max_adverse_stretch_pct": round(stretch_pct, 3),
+            "signal_outcome": "open",   # v0.30.67: "open" | "take" | "stop" | "timeout" — реальный исход С УЧЁТОМ порядка событий (что случилось раньше), не задним числом по пиковым значениям
             "last_checked_ts": int(now),
             "track_until": now + STRETCH_DIAG_TRACK_WINDOW_SEC.get(tf, 6 * 3600), "track_done": False,
         })
@@ -8871,8 +8893,8 @@ def _stretch_render_alert_chart(rec):
         ctx = _stretch_get_closed_ctx(rec["symbol"], rec["tf"])
         if not ctx:
             return None, "не удалось получить контекст свечей для графика (ctx пуст)"
-        sig = {"entry": rec["trigger_price"], "tp": rec["trigger_ema"], "sl": None,
-               "dir": f"жду возврата к EMA{rec['period']}", "entry_i": ctx["i"]}
+        sig = {"entry": rec.get("entry", rec["trigger_price"]), "tp": rec.get("take", rec["trigger_ema"]),
+               "sl": rec.get("stop"), "dir": f"SHORT — цель EMA{rec['period']}", "entry_i": ctx["i"]}
         if have_pil:
             png = _render_signal_chart_png(ctx["candles"], sig, rec["symbol"], rec["tf"])
             if png:
@@ -8911,14 +8933,15 @@ def _stretch_diag_maybe_alert_top_combo(new_recs):
             continue
         lag_sec = max(0, int(time.time() - rec.get("bar_close_ts", rec["ts"])))
         lag_txt = f"{lag_sec}с" if lag_sec < 60 else f"{lag_sec // 60}м{lag_sec % 60}с"
-        msg = (f"📉 <b>{rec['symbol']}</b> — отрыв вверх от EMA{top_period} ({top_tf}), "
+        msg = (f"📉 <b>{rec['symbol']}</b> — SHORT на возврат к EMA{top_period} ({top_tf}), "
                f"топ связка по устойчивости к стопу (10х)\n"
-               f"Отрыв: {rec['stretch_pct']:+.2f}% | уровень EMA: {_fmt_px(rec['trigger_ema'])} | "
-               f"цена: {_fmt_px(rec['trigger_price'])}\n"
+               f"Вход: {_fmt_px(rec['entry'])} | Стоп: {_fmt_px(rec['stop'])} ({STRETCH_REF_STOP_PCT}%) | "
+               f"Тейк: {_fmt_px(rec['take'])} (уровень EMA{top_period})\n"
+               f"Отрыв: {rec['stretch_pct']:+.2f}%\n"
                f"Задержка от закрытия свечи: {lag_txt}\n"
                f"По статистике этой связки (n={o['evaluated']}, риск-выборка n={o['stop_survival_n']}): "
                f"выживает при стопе {STRETCH_REF_STOP_PCT}% — {o['stop_survival_rate']}%, "
-               f"средний откат {o['avg_retrace_pct_of_stretch']}%, touch rate {o['touch_rate']}%")
+               f"винрейт тейк/стоп (n={o['signal_resolved_n']}) — {o['signal_win_rate']}%")
         png, err = _stretch_render_alert_chart(rec)
         if png:
             _send_alert_photo(png, msg)
@@ -8970,13 +8993,30 @@ def _stretch_diag_track_loop():
                             rec["max_retrace_pct_of_stretch"] = round(retrace, 1)
                         rec["last_checked_ts"] = int(now)
                         changed = True
-                        if crossed or abs(current_stretch) <= STRETCH_DIAG_TOUCH_TOL_PCT:
+                        # v0.30.67: по прямому запросу — реальный сигнал с
+                        # тейком/стопом. СТОП проверяется ПЕРВЫМ (в порядке
+                        # реальных событий) — если цена уже ушла дальше
+                        # условного стопа, сделка была бы закрыта по стопу,
+                        # даже если ПОЗЖЕ цена всё-таки дошла бы до EMA —
+                        # в реальной торговле это уже не считалось бы, потому
+                        # что позиции бы уже не было. Раньше (v0.30.56) мы
+                        # просто фиксировали "рекорд" худшего захода без
+                        # выхода из отслеживания — годилось для наблюдения,
+                        # но не для честного сигнала с реальным исходом.
+                        stop = rec.get("stop")
+                        if stop and rec["stretch_pct"] > 0 and live_price >= stop:
+                            rec["signal_outcome"] = "stop"
+                            rec["touched_at"] = None
+                            rec["track_done"] = True
+                        elif crossed or abs(current_stretch) <= STRETCH_DIAG_TOUCH_TOL_PCT:
                             rec["touched"] = True
                             rec["touched_at"] = int(now)
                             rec["time_to_touch_sec"] = int(now - rec["ts"])
                             rec["max_retrace_pct_of_stretch"] = 100.0
+                            rec["signal_outcome"] = "take"
                             rec["track_done"] = True
                         elif now >= rec.get("track_until", 0):
+                            rec["signal_outcome"] = "timeout"
                             rec["track_done"] = True
                     except Exception as e:
                         olog(f"[ema_stretch_track] ⚠ пропущена битая запись "
@@ -9028,6 +9068,13 @@ def _stretch_diag_summary(min_events=3):
         # именно это режет P&L при реальной позиции с фиксированным стопом
         survived = sum(1 for r in adverse_items
                        if abs(r["max_adverse_stretch_pct"] - r["stretch_pct"]) < STRETCH_REF_STOP_PCT)
+        # v0.30.67: реальный сигнал с тейком/стопом — исход по факту
+        # порядка событий (не задним числом), считается в трек-лупе.
+        # win_rate — среди РЕШЁННЫХ по стопу/тейку (таймауты — отдельно,
+        # это "ни то ни другое", не считаем как проигрыш явно)
+        resolved_sig = [r for r in items if r.get("signal_outcome") in ("take", "stop")]
+        wins = sum(1 for r in resolved_sig if r["signal_outcome"] == "take")
+        timeouts = sum(1 for r in items if r.get("signal_outcome") == "timeout")
         return {
             "total": total, "evaluated": len(evaluated), "touched": touched,
             "touch_rate": round(touched / len(evaluated) * 100, 1) if evaluated else None,
@@ -9038,6 +9085,9 @@ def _stretch_diag_summary(min_events=3):
             "max_extra_adverse_pct": round(max(excess_vals), 2) if excess_vals else None,
             "stop_survival_n": len(adverse_items),
             "stop_survival_rate": round(survived / len(adverse_items) * 100, 1) if adverse_items else None,
+            "signal_resolved_n": len(resolved_sig),
+            "signal_win_rate": round(wins / len(resolved_sig) * 100, 1) if resolved_sig else None,
+            "signal_timeouts": timeouts,
         }
 
     result = []
@@ -10201,6 +10251,7 @@ select,input{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-ra
 <h1>&#128201; Отрыв от EMA — сколько в среднем откатывает</h1>
 <p style="color:#8b949e;font-size:13px;max-width:520px">Триггер — отрыв цены ВВЕРХ от короткой EMA (5/10/20) на ЗАКРЫТИИ свечи, ≥1%, на ТФ 15м/30м/1h/4h (только вверх — ожидаем падение к EMA обратно, отрыв вниз не отслеживается). Дальше следим ЛИБО до касания той же EMA обратно, ЛИБО до таймаута (свой на каждый ТФ) — и считаем % отката от исходного отрыва (100% = полностью коснулась). Сводка разбита ещё и по величине самого отрыва (1-3% / 3-6% / 6%+), чтобы видеть, растёт ли шанс отката вместе с силой отрыва.</p>
 <p style="color:#d29922;font-size:12px;max-width:520px">С v0.30.60 топ-связка (та, по которой шлются алерты) ранжируется по "выживаемости при стопе 2%" (см. колонку), а не по чистому % отката — с учётом 10х плеча важнее не "вернётся ли когда-нибудь", а "снесёт ли стопом раньше, чем успеет вернуться". Стоп 2% при 10х — это 20% маржи, ориентировочная линейка сравнения, не готовая рекомендация.</p>
+<p style="color:#3fb950;font-size:12px;max-width:520px">С v0.30.67 это уже настоящий сигнал: Вход = цена триггера, Стоп = вход+2% (SHORT — цена ушла вверх, ждём падения), Тейк = уровень EMA. Исход (тейк/стоп/таймаут) считается в реальном порядке событий — если стоп задело раньше, чем цена дошла до EMA, это "stop", даже если ПОЗЖЕ цена всё равно дошла бы до цели (реальной позиции бы уже не было). Колонка "Винрейт тейк/стоп" — по этому честному исходу.</p>
 
 <div class="section-card">
   <div class="section-head">
@@ -10210,7 +10261,7 @@ select,input{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-ra
   <div id="summaryStatus" class="summary-line">загрузка...</div>
   <div class="table-scroll">
     <table id="summaryTable">
-      <thead><tr><th>ТФ</th><th>EMA</th><th>Событий</th><th>Оценено</th><th>Выжив. при стопе 2% (10х)</th><th>Touch rate</th><th>Avg откат%</th><th>Med откат%</th><th>Avg время до касания</th><th>Avg хуже на%</th><th>Худший случай</th><th>1-3% events</th><th>3-6% events</th><th>6%+ events</th></tr></thead>
+      <thead><tr><th>ТФ</th><th>EMA</th><th>Событий</th><th>Оценено</th><th>Винрейт тейк/стоп</th><th>Выжив. при стопе 2% (10х)</th><th>Touch rate</th><th>Avg откат%</th><th>Med откат%</th><th>Avg время до касания</th><th>Avg хуже на%</th><th>Худший случай</th><th>1-3% events</th><th>3-6% events</th><th>6%+ events</th></tr></thead>
       <tbody></tbody>
     </table>
   </div>
@@ -10239,7 +10290,7 @@ select,input{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-ra
   <div id="rawStatus" class="summary-line"></div>
   <div class="table-scroll">
     <table id="rawTable">
-      <thead><tr><th>Монета</th><th>ТФ</th><th>EMA</th><th>Сторона</th><th>Отрыв%</th><th>Ближайший подход%</th><th>Худший заход%</th><th>Откат%</th><th>Коснулась?</th><th>Время до касания</th><th>Статус</th><th>Когда</th></tr></thead>
+      <thead><tr><th>Монета</th><th>ТФ</th><th>EMA</th><th>Вход</th><th>Стоп</th><th>Тейк</th><th>Отрыв%</th><th>Ближайший подход%</th><th>Худший заход%</th><th>Откат%</th><th>Исход</th><th>Время до касания</th><th>Когда</th></tr></thead>
       <tbody></tbody>
     </table>
   </div>
@@ -10265,6 +10316,7 @@ async function loadSummary(){
       const tr = document.createElement('tr');
       const b13 = e['stretch_1-3%'], b36 = e['stretch_3-6%'], b6p = e['stretch_6%+'];
       tr.innerHTML = `<td>${e.tf}</td><td>EMA${e.period}</td><td>${o.total}</td><td>${o.evaluated}</td>`+
+        `<td>${o.signal_win_rate ?? '—'}% (n=${o.signal_resolved_n ?? 0}, таймаутов=${o.signal_timeouts ?? 0})</td>`+
         `<td>${o.stop_survival_rate ?? '—'}% (n=${o.stop_survival_n ?? 0})</td>`+
         `<td>${o.touch_rate ?? '—'}%</td><td>${o.avg_retrace_pct_of_stretch ?? '—'}%</td>`+
         `<td>${o.median_retrace_pct_of_stretch ?? '—'}%</td><td>${o.avg_time_to_touch_min ?? '—'} мин</td>`+
@@ -10291,13 +10343,15 @@ async function loadRaw(){
     for(const it of items.slice(0,100)){
       const tr = document.createElement('tr');
       const timeToTouch = it.time_to_touch_sec ? Math.round(it.time_to_touch_sec/60)+' мин' : '—';
-      const status = it.touched ? '<span style="color:#3fb950">коснулась</span>' :
-                     (it.track_done ? '<span style="color:#f85149">таймаут</span>' : 'следим...');
-      tr.innerHTML = `<td>${it.symbol}</td><td>${it.tf}</td><td>EMA${it.period}</td><td>${it.side}</td>`+
+      const outcomeColors = {take:'#3fb950', stop:'#f85149', timeout:'#8b949e', open:'#d29922'};
+      const oc = it.signal_outcome || (it.touched ? 'take' : (it.track_done ? 'timeout' : 'open'));
+      const status = `<span style="color:${outcomeColors[oc]||'#8b949e'}">${oc}</span>`;
+      tr.innerHTML = `<td>${it.symbol}</td><td>${it.tf}</td><td>EMA${it.period}</td>`+
+        `<td>${it.entry ?? '—'}</td><td>${it.stop ?? '—'}</td><td>${it.take ?? '—'}</td>`+
         `<td>${it.stretch_pct>0?'+':''}${it.stretch_pct}%</td><td>${it.closest_stretch_pct}%</td>`+
         `<td>${it.max_adverse_stretch_pct ?? it.stretch_pct}%</td>`+
-        `<td>${it.max_retrace_pct_of_stretch}%</td><td>${it.touched?'да':'нет'}</td>`+
-        `<td>${timeToTouch}</td><td>${status}</td><td>${fmtAgo(it.ts)}</td>`;
+        `<td>${it.max_retrace_pct_of_stretch}%</td><td>${status}</td>`+
+        `<td>${timeToTouch}</td><td>${fmtAgo(it.ts)}</td>`;
       tbody.appendChild(tr);
     }
   }catch(e){ statusEl.innerText = 'Ошибка загрузки'; }
