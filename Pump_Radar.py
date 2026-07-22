@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.57 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.58 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.58: реальный баг, найден по прямому вопросу "почему алерты
+  пачками и потом тишина" — подтверждено по факту: у лидера (4h EMA20)
+  событие AKE_USDT создалось в 10:27:02 UTC, а последний алерт в Telegram
+  был почти на час раньше (09:44-09:49 UTC, доставлен как единая пачка).
+  Причина — _stretch_diag_maybe_alert_top_combo() вызывалась ОДИН раз,
+  ПОСЛЕ полного прохода по всем символам×ТФ (реально может занимать
+  десятки минут сетевого времени на ~700+ монет × 4 ТФ) — все новые
+  события копились весь проход, алерты по ним улетали разом пачкой в
+  конце, с задержкой в десятки минут от реального момента события и
+  тишиной на весь следующий проход. Теперь алерт проверяется СРАЗУ по
+  каждой найденной записи внутри цикла, без накопления — не привязано к
+  длительности всего прохода.
 - v0.30.57: по прямому запросу — "нужны пары только по криптовалютам".
   У Gate.io нет отдельного API-поля "это акция/товар, не крипта" — весь
   список исключений строится ТОЛЬКО ручным пополнением по факту находки
@@ -1544,7 +1556,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.57"
+APP_VERSION  = "0.30.58"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -8588,7 +8600,6 @@ def _stretch_diag_scan_loop():
         try:
             symbols = _fetch_all_symbols()
             added = 0
-            new_recs = []
             for symbol in symbols:
                 for tf in STRETCH_DIAG_TIMEFRAMES:
                     try:
@@ -8601,19 +8612,31 @@ def _stretch_diag_scan_loop():
                     with _stretch_diag_lock:
                         open_keys = {f"{r['symbol']}|{r['tf']}|{r['period']}"
                                      for r in _stretch_diag_records if not r.get("track_done", True)}
+                        fresh = []
                         for rec in candidates:
                             rkey = f"{rec['symbol']}|{rec['tf']}|{rec['period']}"
                             if rkey in open_keys:   # уже отслеживаем отрыв по этой же связке — не дублируем
                                 continue
                             _stretch_diag_records.append(rec)
                             open_keys.add(rkey)
-                            new_recs.append(rec)
+                            fresh.append(rec)
                             added += 1
+                    if fresh:
+                        # v0.30.58: реальный баг — раньше алерт проверялся ОДИН
+                        # раз, после того как проход по ВСЕМ символам×ТФ
+                        # (может занимать десятки минут реального сетевого
+                        # времени) полностью завершался — события копились
+                        # весь проход, а алерты по ним улетали разом пачкой
+                        # в конце, с задержкой в десятки минут от реального
+                        # момента и с "тишиной" на весь следующий проход.
+                        # Теперь алерт проверяется СРАЗУ по каждой найденной
+                        # записи, внутри цикла — без накопления и без
+                        # привязки к длительности всего прохода.
+                        _stretch_diag_save()
+                        _stretch_diag_maybe_alert_top_combo(fresh)
             if added:
-                _stretch_diag_save()
                 olog(f"[ema_stretch] скан завершён: +{added} новых отрывов "
                      f"(всего в истории {len(_stretch_diag_records)})")
-                _stretch_diag_maybe_alert_top_combo(new_recs)
         except Exception as e:
             olog(f"[ema_stretch] ошибка цикла сканирования: {_explain_error(e)}")
         time.sleep(STRETCH_DIAG_SCAN_POLL_SEC)
