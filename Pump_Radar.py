@@ -1,7 +1,20 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.52 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.53 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.53: по прямому запросу — два новых переключателя.
+  1) Алерт по топ-связке "Отрыв от EMA" в Telegram: каждый скан заново
+  считает текущий рейтинг связок ТФ×EMA (тот же _stretch_diag_summary, что
+  на странице), и если новый отрыв совпал с лидером (не меньше 10
+  оценённых событий — иначе рано делать выводы по горстке случайных) —
+  шлёт алерт. Лидер не зафиксирован — по мере накопления данных может
+  смениться, алерты пойдут уже по нему без ручного вмешательства.
+  2) Выключатель на slow_impulse (часовые EMA-сигналы) — раньше был
+  жёстко закодирован (SLOW_IMPULSE_ENABLED=True, менялся только правкой
+  кода), теперь персистится через тот же scan_settings.json, что и
+  порог объёма/спреда, переключается чекбоксом на главной без
+  редеплоя. Выключение останавливает поиск НОВЫХ касаний — уже открытые
+  сделки резолвер по-прежнему доводит до конца.
 - v0.30.52: по прямому уточнению — "Отрыв от EMA" (v0.30.51) ловил оба
   направления симметрично (вверх/вниз). Нужно было только вверх (цена
   выше EMA) → откат вниз к EMA. Убрано отслеживание отрыва вниз.
@@ -1488,7 +1501,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.52"
+APP_VERSION  = "0.30.53"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3670,6 +3683,24 @@ details[open] summary:before{content:"▾ "}
   </div>
 </div>
 
+<div class="section-card" style="max-width:420px">
+  <label style="display:flex;gap:8px;align-items:center;font-size:13px;color:#c9d1d9;cursor:pointer">
+    <input type="checkbox" id="slowImpulseToggle" onchange="toggleFlag('slow_impulse_enabled','slowImpulseMsg')" style="width:16px;height:16px">
+    Часовые EMA-сигналы (slow_impulse) включены
+  </label>
+  <p style="font-size:11px;color:#6e7681;margin:6px 0 0">Выключатель на уже существующие сигналы — если выключить, новые часовые касания EMA(7/14/28) не ищутся и алерты не шлются (уже открытые сделки резолвер по-прежнему доводит до конца).</p>
+  <span id="slowImpulseMsg" style="font-size:12px;color:#8b949e"></span>
+</div>
+
+<div class="section-card" style="max-width:420px">
+  <label style="display:flex;gap:8px;align-items:center;font-size:13px;color:#c9d1d9;cursor:pointer">
+    <input type="checkbox" id="stretchTopAlertToggle" onchange="toggleFlag('stretch_top_alert_enabled','stretchTopAlertMsg')" style="width:16px;height:16px">
+    Алерт по топ-связке "Отрыв от EMA" в Telegram
+  </label>
+  <p style="font-size:11px;color:#6e7681;margin:6px 0 0">Каждый скан заново считает текущий рейтинг связок ТФ×EMA по среднему откату (см. /ema_stretch) и шлёт алерт, если новый отрыв совпал с лидером рейтинга (не меньше 10 оценённых событий, иначе рано делать выводы). Лидер не зафиксирован навсегда — по мере накопления данных может смениться.</p>
+  <span id="stretchTopAlertMsg" style="font-size:12px;color:#8b949e"></span>
+</div>
+
 <div id="status"></div>
 
 <div id="alertModal">
@@ -3758,7 +3789,20 @@ async function loadScanSettings(){
     document.getElementById('minVolInput').value = d.min_volume_usd;
     document.getElementById('maxSpreadInput').value = d.max_spread_pct;
     document.getElementById('maxCapInput').value = d.max_symbols_cap;
+    document.getElementById('slowImpulseToggle').checked = !!d.slow_impulse_enabled;
+    document.getElementById('stretchTopAlertToggle').checked = !!d.stretch_top_alert_enabled;
   }catch(e){}
+}
+async function toggleFlag(field, msgElId){
+  const msg = document.getElementById(msgElId);
+  const checked = document.getElementById(field === 'slow_impulse_enabled' ? 'slowImpulseToggle' : 'stretchTopAlertToggle').checked;
+  try{
+    const r = await fetch('/scan_settings', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({[field]: checked})});
+    const d = await r.json();
+    msg.style.color = d.ok ? '#3fb950' : '#f85149';
+    msg.innerText = d.ok ? (checked ? 'Включено' : 'Выключено') : (d.msg || 'Ошибка');
+  }catch(e){ msg.style.color = '#f85149'; msg.innerText = 'Ошибка запроса'; }
 }
 async function saveScanSettings(){
   const msg = document.getElementById('scanSettingsMsg');
@@ -4665,7 +4709,8 @@ SCAN_SETTINGS_FILE = os.path.expanduser("~/pumpradar_scan_settings.json")
 # страховочный потолок на случай, если почему-то пройдёт порога
 # аномально много монет (защита от перегрузки), дефолт заведомо выше
 # реального размера всей биржи, чтобы обычно не срабатывал вообще.
-_scan_settings = {"min_volume_usd": 3_000_000, "max_spread_pct": 0.15, "max_symbols_cap": 800}
+_scan_settings = {"min_volume_usd": 3_000_000, "max_spread_pct": 0.15, "max_symbols_cap": 800,
+                  "slow_impulse_enabled": True, "stretch_top_alert_enabled": True}
 _scan_settings_lock = threading.Lock()
 
 
@@ -4682,6 +4727,10 @@ def _load_scan_settings():
                     _scan_settings["max_spread_pct"] = max(0.01, min(10.0, float(saved["max_spread_pct"])))
                 if "max_symbols_cap" in saved:
                     _scan_settings["max_symbols_cap"] = max(10, min(2000, int(saved["max_symbols_cap"])))
+                if "slow_impulse_enabled" in saved:
+                    _scan_settings["slow_impulse_enabled"] = bool(saved["slow_impulse_enabled"])
+                if "stretch_top_alert_enabled" in saved:
+                    _scan_settings["stretch_top_alert_enabled"] = bool(saved["stretch_top_alert_enabled"])
                 # обратная совместимость со старым файлом настроек (top_n) —
                 # если найден только он, трактуем как страховочный потолок
                 elif "top_n" in saved:
@@ -4691,7 +4740,8 @@ def _load_scan_settings():
         olog(f"[scan_settings] ⚠ не смог загрузить: {_explain_error(e)}")
 
 
-def _save_scan_settings(min_volume_usd=None, max_spread_pct=None, max_symbols_cap=None):
+def _save_scan_settings(min_volume_usd=None, max_spread_pct=None, max_symbols_cap=None,
+                        slow_impulse_enabled=None, stretch_top_alert_enabled=None):
     global _scan_settings
     with _scan_settings_lock:
         if min_volume_usd is not None:
@@ -4700,6 +4750,10 @@ def _save_scan_settings(min_volume_usd=None, max_spread_pct=None, max_symbols_ca
             _scan_settings["max_spread_pct"] = max(0.01, min(10.0, float(max_spread_pct)))
         if max_symbols_cap is not None:
             _scan_settings["max_symbols_cap"] = max(10, min(2000, int(max_symbols_cap)))
+        if slow_impulse_enabled is not None:
+            _scan_settings["slow_impulse_enabled"] = bool(slow_impulse_enabled)
+        if stretch_top_alert_enabled is not None:
+            _scan_settings["stretch_top_alert_enabled"] = bool(stretch_top_alert_enabled)
         snapshot = dict(_scan_settings)
     try:
         with open(SCAN_SETTINGS_FILE, "w") as f:
@@ -4707,6 +4761,16 @@ def _save_scan_settings(min_volume_usd=None, max_spread_pct=None, max_symbols_ca
         olog(f"[scan_settings] сохранено и применено: {snapshot}")
     except Exception as e:
         olog(f"[scan_settings] ⚠ не смог сохранить: {_explain_error(e)}")
+
+
+def _get_slow_impulse_enabled():
+    with _scan_settings_lock:
+        return _scan_settings["slow_impulse_enabled"]
+
+
+def _get_stretch_top_alert_enabled():
+    with _scan_settings_lock:
+        return _scan_settings["stretch_top_alert_enabled"]
 
 
 def _get_scan_top_n():
@@ -7276,7 +7340,7 @@ WEEKLY_EMA_ENTRY_FILL_TIMEOUT_SEC = 3 * 86400   # v0.30.41: если цена т
 
 SLOW_IMPULSE_MIN_WEEKLY_CHG_PCT = 15.0   # v0.30.28: по прямому сравнению с внешним референс-ботом — 6 из 8 их сигналов имели |изменение за 7 недельных баров| в диапазоне 18-109%, порог поставлен консервативно ниже этого диапазона
 SLOW_IMPULSE_SCAN_POLL_SEC = 600         # 10 минут — менее срочно, чем быстрые памп/дамп-детекторы, само накопленное движение никуда не убежит за 10 минут
-SLOW_IMPULSE_ENABLED = True              # лёгкий выключатель на будущее, по образцу PUMP_DUMP_ALERTS_ENABLED
+SLOW_IMPULSE_ENABLED = True              # УСТАРЕЛО с v0.30.53 — реальный вкл/выкл теперь через _get_slow_impulse_enabled() (UI-переключатель, персистится в scan_settings), эта константа больше не читается
 SLOW_IMPULSE_MIN_VOLUME_USD = 5_000    # v0.30.38: реальная находка — порог $150к (v0.30.29) СНОВА резал реальный сигнал (BANANA_USDT, объём $21,643) — уже третий раз находим их сигнал на объёме ниже нашего же "низкого" порога. Опущено до почти нулевого уровня (отсеивает только полностью мёртвые листинги) — реальную защиту от проскальзывания даёт проверка СПРЕДА (max_spread_pct, тот же общий порог), это более прямой показатель, чем сырой объём
 SLOW_IMPULSE_MAX_VOLUME_USD = 20_000_000   # v0.30.43: по разбору 20 его сигналов — максимум среди них $17.5М (B_USDT), у 19 из 20 сильно ниже; после гейта по аномалии объёма (v0.30.42) slow_impulse начал стрелять по BTC/ETH/SOL/DOGE (объём — миллиарды), которых референс-бот не даёт НИ РАЗУ — крупные монеты тоже иногда ловят z>=4.0 на общерыночных распродажах, но это другая механика, не то, что он торгует. Потолок с запасом (~15% выше $17.5М) отсекает именно мажоры/крупные альты, не трогая его реальный диапазон
 SLOW_IMPULSE_REQUIRE_SELL_ANOMALY = True   # v0.30.42: по разбору 18 ручных сканов его сигналов (manual_scans) — ВСЕ 18 (кроме ROAM, недостаточно истории) имели доминирующую распродажную (red-candle) аномалию объёма (z>=VOL_PEAK_ZSCORE_THRESHOLD=4.0) на 1h ИЛИ 4h где-то в истории (мин. найденный max_z=5.0, у остальных 6.3-11.4) — этого фильтра у slow_impulse не было вообще, отсюда и разрыв в количестве (мы стреляли по касанию EMA само по себе, без этого условия, почти по всему универсуму). Использует ТУ ЖЕ _manual_scan_find_anomalies, что и ручной скан (тот же порог, те же lookback), просто ТЕПЕРЬ как блокирующий гейт, а не только для диагностики
@@ -7416,7 +7480,7 @@ def _slow_impulse_scan_loop():
     time.sleep(90)
     while True:
         try:
-            if SLOW_IMPULSE_ENABLED:
+            if _get_slow_impulse_enabled():
                 # v0.30.29: не _get_tradeable_symbols() (общий строгий порог
                 # ликвидности $3млн, для быстрых детекторов) — свой, более
                 # низкий порог, см. SLOW_IMPULSE_MIN_VOLUME_USD
@@ -8441,6 +8505,7 @@ def _stretch_diag_scan_loop():
         try:
             symbols = _fetch_all_symbols()
             added = 0
+            new_recs = []
             for symbol in symbols:
                 for tf in STRETCH_DIAG_TIMEFRAMES:
                     try:
@@ -8459,14 +8524,53 @@ def _stretch_diag_scan_loop():
                                 continue
                             _stretch_diag_records.append(rec)
                             open_keys.add(rkey)
+                            new_recs.append(rec)
                             added += 1
             if added:
                 _stretch_diag_save()
                 olog(f"[ema_stretch] скан завершён: +{added} новых отрывов "
                      f"(всего в истории {len(_stretch_diag_records)})")
+                _stretch_diag_maybe_alert_top_combo(new_recs)
         except Exception as e:
             olog(f"[ema_stretch] ошибка цикла сканирования: {_explain_error(e)}")
         time.sleep(STRETCH_DIAG_SCAN_POLL_SEC)
+
+
+STRETCH_TOP_ALERT_MIN_EVENTS = 10   # v0.30.53: не объявляем "топовую связку" по горстке случайных событий — ждём минимум столько оценённых, прежде чем на неё начать алертить
+
+
+def _stretch_diag_maybe_alert_top_combo(new_recs):
+    """По прямому запросу — "алертить топовую связку в тг": каждый скан
+    заново смотрит текущий рейтинг (_stretch_diag_summary, тот же, что
+    видно на странице) и, если СРЕДИ НОВЫХ записей этого прохода есть
+    хотя бы одна с (tf, period), совпадающим с #1 в рейтинге — шлёт
+    алерт. Топ пересчитывается каждый раз заново (не зафиксирован
+    навсегда) — по мере накопления данных лидер может смениться, и
+    алерты будут идти уже по новому лидеру, без ручного вмешательства."""
+    if not _get_stretch_top_alert_enabled():
+        return
+    try:
+        summary = _stretch_diag_summary(min_events=STRETCH_TOP_ALERT_MIN_EVENTS)
+    except Exception as e:
+        olog(f"[ema_stretch] ⚠ не смог посчитать топ связку: {_explain_error(e)}")
+        return
+    if not summary:
+        return   # ещё не набралось достаточно данных ни по одной связке
+    top = summary[0]
+    top_tf, top_period = top["tf"], top["period"]
+    o = top["overall"]
+    for rec in new_recs:
+        if rec["tf"] != top_tf or rec["period"] != top_period:
+            continue
+        msg = (f"📉 <b>{rec['symbol']}</b> — отрыв вверх от EMA{top_period} ({top_tf}), "
+               f"топ связка по откату\n"
+               f"Отрыв: {rec['stretch_pct']:+.2f}% | уровень EMA: {_fmt_px(rec['trigger_ema'])} | "
+               f"цена: {_fmt_px(rec['trigger_price'])}\n"
+               f"По статистике этой связки (n={o['evaluated']}): средний откат "
+               f"{o['avg_retrace_pct_of_stretch']}%, touch rate {o['touch_rate']}%")
+        _send_alert(msg)
+        olog(f"[ema_stretch] {rec['symbol']} {top_tf} EMA{top_period}: "
+             f"алерт по топ-связке отправлен (отрыв {rec['stretch_pct']:+.2f}%)")
 
 
 def _stretch_diag_track_loop():
@@ -10588,6 +10692,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     kwargs["max_symbols_cap"] = v
                 except (TypeError, ValueError) as e:
                     errors.append(f"max_symbols_cap: {_explain_error(e)}")
+            if "slow_impulse_enabled" in body:
+                kwargs["slow_impulse_enabled"] = bool(body.get("slow_impulse_enabled"))
+            if "stretch_top_alert_enabled" in body:
+                kwargs["stretch_top_alert_enabled"] = bool(body.get("stretch_top_alert_enabled"))
             if errors:
                 self._json({"ok": False, "msg": "; ".join(errors)}); return
             _save_scan_settings(**kwargs)
