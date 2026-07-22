@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.58 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.59 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.59: по прямому запросу — к алерту по топ-связке добавлен кусочек
+  графика (последние свечи + горизонтальная линия уровня EMA — это и
+  есть "куда планируется движение", цель возврата). Переиспользован
+  _render_signal_chart_png — уже был в файле, но нигде не был подключён.
+  Если PIL недоступен или рендер не удался — тихий откат на обычный
+  текстовый алерт (как было раньше), ничего не сломается.
 - v0.30.58: реальный баг, найден по прямому вопросу "почему алерты
   пачками и потом тишина" — подтверждено по факту: у лидера (4h EMA20)
   событие AKE_USDT создалось в 10:27:02 UTC, а последний алерт в Telegram
@@ -1556,7 +1562,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.58"
+APP_VERSION  = "0.30.59"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -8645,6 +8651,26 @@ def _stretch_diag_scan_loop():
 STRETCH_TOP_ALERT_MIN_EVENTS = 10   # v0.30.53: не объявляем "топовую связку" по горстке случайных событий — ждём минимум столько оценённых, прежде чем на неё начать алертить
 
 
+def _stretch_render_alert_chart(rec):
+    """v0.30.59: по прямому запросу — "к оповещению добавлять кусочек
+    графика, метку где сработал сигнал и куда планируется движение".
+    Переиспользует _render_signal_chart_png (был в файле, но нигде не
+    подключён) — рисует последние свечи, entry = цена триггера (текущая,
+    это последняя свеча в окне), tp = уровень EMA (это и есть "куда
+    планируется движение" — цель возврата), sl не показываем (тут не
+    сделка, стопа нет)."""
+    try:
+        ctx = _stretch_get_closed_ctx(rec["symbol"], rec["tf"])
+        if not ctx:
+            return None
+        sig = {"entry": rec["trigger_price"], "tp": rec["trigger_ema"], "sl": None,
+               "dir": f"жду возврата к EMA{rec['period']}", "entry_i": ctx["i"]}
+        return _render_signal_chart_png(ctx["candles"], sig, rec["symbol"], rec["tf"])
+    except Exception as e:
+        olog(f"[ema_stretch] ⚠ не смог отрисовать график для алерта: {_explain_error(e)}")
+        return None
+
+
 def _stretch_diag_maybe_alert_top_combo(new_recs):
     """По прямому запросу — "алертить топовую связку в тг": каждый скан
     заново смотрит текущий рейтинг (_stretch_diag_summary, тот же, что
@@ -8674,7 +8700,11 @@ def _stretch_diag_maybe_alert_top_combo(new_recs):
                f"цена: {_fmt_px(rec['trigger_price'])}\n"
                f"По статистике этой связки (n={o['evaluated']}): средний откат "
                f"{o['avg_retrace_pct_of_stretch']}%, touch rate {o['touch_rate']}%")
-        _send_alert(msg)
+        png = _stretch_render_alert_chart(rec)
+        if png:
+            _send_alert_photo(png, msg)
+        else:
+            _send_alert(msg)
         olog(f"[ema_stretch] {rec['symbol']} {top_tf} EMA{top_period}: "
              f"алерт по топ-связке отправлен (отрыв {rec['stretch_pct']:+.2f}%)")
 
