@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.53 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.54 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.54: реальный баг, найден по прямому вопросу "может это круто
+  сработало?" — 11 "тейков" в свежем экспорте оказались НЕ новой часовой
+  стратегией: все 200 записей имели tf="1w", а _migrate_open_signals_to_
+  fixed_take() (v0.30.39, задумана для другого перехода) продолжала на
+  КАЖДЫЙ рестарт слепо перетирать take любой открытой записи под ТЕКУЩЕЕ
+  значение константы — древним зависшим сделкам с недельным ATR-based
+  стопом (до 971% от входа!) тихо подрезало тейк до нового часового 1.8%,
+  что и давало случайные "победы", не имеющие отношения к реальной
+  стратегии. Теперь миграция трогает только записи с tf==SLOW_IMPULSE_TF
+  (актуальная схема) — более старые вместо этого закрываются как
+  "stale_retired" и не резолвятся/не мешаются дальше.
 - v0.30.53: по прямому запросу — два новых переключателя.
   1) Алерт по топ-связке "Отрыв от EMA" в Telegram: каждый скан заново
   считает текущий рейтинг связок ТФ×EMA (тот же _stretch_diag_summary, что
@@ -1501,7 +1512,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.53"
+APP_VERSION  = "0.30.54"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -6810,12 +6821,31 @@ def _migrate_open_signals_to_fixed_take():
     take/rr для ВСЕХ ещё открытых записей по НОВОЙ формуле, используя уже
     сохранённые entry/stop/classic_bias — стоп не трогает (по нему данных
     от референс-бота нет вообще). Запускается один раз при старте,
-    сохраняет результат на диск."""
+    сохраняет результат на диск.
+    v0.30.54: реальный баг — эта миграция продолжала запускаться на
+    КАЖДЫЙ рестарт и слепо перетирала take любой ещё открытой записи под
+    ТЕКУЩЕЕ значение константы, даже когда та изменилась по СОВСЕМ другой
+    причине (переход на часовой ТФ, v0.30.50) — древним зависшим сделкам
+    с tf="1w" (открытым ещё на недельной ATR-based логике, стоп доходил
+    до 971% от входа!) тихо подрезало тейк до нового часового 1.8%,
+    создавая мешанину "новая цель + древний риск", которая давала
+    случайные "победы", не имеющие отношения к реальной стратегии. Теперь
+    трогает только записи с tf == SLOW_IMPULSE_TF (актуальная схема) —
+    более старые (другой ТФ, другое поколение стратегии) вместо этого
+    закрываются как "stale_retired" (см. ниже), не микшируются дальше."""
     global _weekly_ema_recent
     changed = 0
+    retired = 0
+    now = time.time()
     with _weekly_ema_touch_lock:
         for rec in _weekly_ema_recent:
             if rec.get("outcome") != "open":
+                continue
+            if rec.get("tf") != SLOW_IMPULSE_TF:
+                rec["outcome"] = "stale_retired"
+                rec["resolved_at"] = int(now)
+                rec["resolved_price"] = None
+                retired += 1
                 continue
             entry, stop = rec.get("entry"), rec.get("stop")
             classic_bias = rec.get("classic_bias")
@@ -6832,11 +6862,14 @@ def _migrate_open_signals_to_fixed_take():
             rec["take"] = new_take_r
             rec["rr"] = round(abs(new_take - entry) / stop_dist, 3) if stop_dist else None
             changed += 1
-        if changed:
+        if changed or retired:
             _save_weekly_ema_history()
     if changed:
         olog(f"[weekly_ema] пересчитан тейк на фиксированные {EMA_TOUCH_TAKE_FIXED_PCT}% "
-             f"от входа для {changed} открытых сигналов (была ATR-based формула)")
+             f"от входа для {changed} открытых сигналов текущей схемы ({SLOW_IMPULSE_TF})")
+    if retired:
+        olog(f"[weekly_ema] {retired} древних открытых сигналов другого поколения стратегии "
+             f"(tf != {SLOW_IMPULSE_TF}) закрыты как stale_retired — не резолвятся дальше")
     return changed
 
 
