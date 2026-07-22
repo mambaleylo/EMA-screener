@@ -1,7 +1,23 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.61 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.62 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.62: два прямых замечания разом.
+  1) "картинка рисовалась без Pillow в других проектах" — добавлен свой
+  PNG-рендерер на чистом stdlib (struct+zlib, оба всегда доступны, PIL
+  не ставится намертво на Termux — знакомая история). Рисует свечи +
+  линию входа + линию EMA-цели вручную, без текстовых подписей на
+  картинке (нет растрового шрифта без PIL — но все числа и так есть в
+  подписи сообщения). Теперь используется как основной путь, PIL (если
+  вдруг есть) — как более красивый вариант с подписями, а не наоборот.
+  2) "сигналы приходят позже, чем надо" — реальная находка: скан
+  проверял ~700 монет × 4 ТФ ПОСЛЕДОВАТЕЛЬНО. Свечи одного ТФ у всех
+  монет закрываются ОДНОВРЕМЕННО — в момент закрытия почти всем сразу
+  нужен свежий фетч, и последовательный обход этой пачки реально мог
+  занимать много времени — монета в конце очереди обнаруживалась с
+  опозданием на многие минуты после настоящего закрытия свечи. Теперь
+  проверка идёт ПАРАЛЛЕЛЬНО пулом из 24 потоков (ThreadPoolExecutor) —
+  на порядок быстрее последовательного обхода.
 - v0.30.61: по прямому вопросу "нет графика" — раньше любая причина
   провала рендера (PIL не установлен, мало свечей, что угодно) тихо
   схлопывалась в один и тот же None, видимый только в консольных логах,
@@ -1561,6 +1577,7 @@ EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
   Experiment.py от этого не пострадает.
 """
 import os, sys, json, time, math, random, threading, base64, hashlib, subprocess, io, gc, uuid, statistics, re, queue
+import struct, zlib
 import multiprocessing
 import http.server, urllib.request, urllib.parse
 from functools import lru_cache
@@ -1580,7 +1597,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.61"
+APP_VERSION  = "0.30.62"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4604,6 +4621,114 @@ def _send_alert(msg):
 
     _telegram_send_queue.put(_do_telegram)
     threading.Thread(target=_do_ntfy, daemon=True).start()
+
+def _png_encode_rgb(width, height, pixel_rows):
+    """v0.30.62: по прямому запросу — "в других проектах картинка рисовалась
+    без Pillow". Пишет валидный PNG вручную (сигнатура+IHDR+IDAT+IEND) —
+    только struct и zlib (оба в стандартной библиотеке, всегда доступны,
+    даже если PIL на Termux не ставится). pixel_rows — список строк
+    сверху вниз, каждая bytes длиной width*3 (RGB без фильтр-байта, тот
+    добавляется тут же)."""
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data +
+                struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff))
+    sig = b"\x89PNG\r\n\x1a\n"
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    raw = bytearray()
+    for row in pixel_rows:
+        raw.append(0)   # filter type: None
+        raw += row
+    idat = zlib.compress(bytes(raw), 6)
+    return sig + chunk(b"IHDR", ihdr) + chunk(b"IDAT", idat) + chunk(b"IEND", b"")
+
+
+def _render_signal_chart_png_stdlib(candles, sig, sym, tf):
+    """Без-Pillow версия _render_signal_chart_png — тот же смысл (свечи +
+    линия входа + линия цели/EMA), но рисует пиксели вручную в bytearray
+    и кодирует PNG сам. Без текста на картинке (нет доступной растровой
+    шрифтовой библиотеки без PIL) — все числа и так есть в подписи
+    (caption) сообщения, дублировать их пиксельным шрифтом не критично."""
+    try:
+        if not candles:
+            return None
+        entry_i = sig.get("entry_i")
+        if entry_i is None or not (0 <= entry_i < len(candles)):
+            entry_i = len(candles) - 1
+        lo = max(0, entry_i - 50)
+        hi = min(len(candles), entry_i + 16)
+        window = candles[lo:hi]
+        if len(window) < 2:
+            return None
+
+        def _g(c, *keys):
+            for k in keys:
+                if k in c: return c[k]
+            return 0
+
+        highs = [_g(c, "high", "h") for c in window]
+        lows = [_g(c, "low", "l") for c in window]
+        entry, tp = sig.get("entry"), sig.get("tp")
+        vals = highs + lows + [v for v in (entry, tp) if v]
+        vmax, vmin = max(vals), min(vals)
+        if vmax <= vmin:
+            vmax = vmin + max(abs(vmin) * 0.001, 1e-9)
+
+        W, H = 720, 400
+        pad_l, pad_r, pad_t, pad_b = 6, 6, 6, 6
+        bg, grid, green, red, white = (13, 13, 15), (40, 40, 44), (8, 153, 129), (242, 54, 69), (235, 235, 235)
+
+        buf = bytearray(bytes(bg) * (W * H))
+
+        def fill_rect(x0, y0, x1, y1, color):
+            x0 = max(0, min(W, int(x0))); x1 = max(0, min(W, int(x1)))
+            y0 = max(0, min(H, int(y0))); y1 = max(0, min(H, int(y1)))
+            if x1 <= x0 or y1 <= y0:
+                return
+            row = bytes(color) * (x1 - x0)
+            stride = W * 3
+            for y in range(y0, y1):
+                off = y * stride + x0 * 3
+                buf[off:off + len(row)] = row
+
+        def y_of(v):
+            return pad_t + (vmax - v) / (vmax - vmin) * (H - pad_t - pad_b)
+
+        for gy in range(5):
+            yy = pad_t + gy * (H - pad_t - pad_b) / 4
+            fill_rect(pad_l, yy, W - pad_r, yy + 1, grid)
+
+        n = len(window)
+        cw = (W - pad_l - pad_r) / n
+        for i, c in enumerate(window):
+            o, h, l, cl = _g(c, "open", "o"), _g(c, "high", "h"), _g(c, "low", "l"), _g(c, "close", "c")
+            x = pad_l + i * cw
+            w = max(cw * 0.6, 1)
+            color = green if cl >= o else red
+            xc = x + w / 2
+            fill_rect(xc - 1, y_of(h), xc + 1, y_of(l), color)   # фитиль (тонкий прямоугольник вместо линии)
+            ytop, ybot = sorted([y_of(o), y_of(cl)])
+            if ybot - ytop < 1.5:
+                ybot = ytop + 1.5
+            fill_rect(x, ytop, x + w, ybot, color)
+
+        def hline(v, color):
+            if not v:
+                return
+            yy = y_of(v)
+            xseg = pad_l
+            while xseg < W - pad_r:
+                fill_rect(xseg, yy, min(xseg + 8, W - pad_r), yy + 1, color)
+                xseg += 14
+
+        hline(entry, white)
+        hline(tp, green)
+
+        rows = [bytes(buf[y * W * 3:(y + 1) * W * 3]) for y in range(H)]
+        return _png_encode_rgb(W, H, rows)
+    except Exception as e:
+        olog(f"⚠ Рендер скриншота (stdlib): {_explain_error(e)}")
+        return None
+
 
 def _render_signal_chart_png(candles, sig, sym, tf):
     """Скриншот сделки (EMA-сигнал) для Telegram — своя картинка, отдельная
@@ -8618,16 +8743,22 @@ def _stretch_diag_load():
         olog(f"[ema_stretch] ⚠ не смог подхватить историю с диска: {_explain_error(e)}")
 
 
+STRETCH_DIAG_SCAN_WORKERS = 24   # v0.30.62: реальная находка по прямому вопросу "почему сигналы приходят позже, чем надо" — цикл проверял ~700 монет × 4 ТФ ПОСЛЕДОВАТЕЛЬНО, один за другим. Свечи у всех монет одного ТФ закрываются ОДНОВРЕМЕННО — то есть в момент закрытия почти всем сразу нужен свежий фетч (кэш истёк у всех разом), и последовательный обход этой пачки мог занимать реально много времени — монета в конце очереди обнаруживалась с опозданием на многие минуты после настоящего закрытия свечи, хотя алерт уже слался сразу по обнаружении (v0.30.58). Теперь проверка идёт ПАРАЛЛЕЛЬНО пулом потоков — не идеально мгновенно (сеть есть сеть), но на порядок быстрее последовательного обхода
+
+
 def _stretch_diag_scan_loop():
     time.sleep(60)
     while True:
         try:
             symbols = _fetch_all_symbols()
             added = 0
-            for symbol in symbols:
-                for tf in STRETCH_DIAG_TIMEFRAMES:
+            tasks = [(symbol, tf) for symbol in symbols for tf in STRETCH_DIAG_TIMEFRAMES]
+            with ThreadPoolExecutor(max_workers=STRETCH_DIAG_SCAN_WORKERS) as pool:
+                futures = {pool.submit(_stretch_check_symbol, symbol, tf): (symbol, tf) for symbol, tf in tasks}
+                for fut in _as_completed(futures):
+                    symbol, tf = futures[fut]
                     try:
-                        candidates = _stretch_check_symbol(symbol, tf)
+                        candidates = fut.result()
                     except Exception as e:
                         olog(f"[ema_stretch] {symbol} {tf}: ошибка проверки: {_explain_error(e)}")
                         continue
@@ -8686,17 +8817,23 @@ def _stretch_render_alert_chart(rec):
     произошло."""
     try:
         from PIL import Image  # noqa: F401 — только для проверки доступности
+        have_pil = True
     except ImportError:
-        return None, "PIL (Pillow) не установлен — на телефоне: pip install Pillow --break-system-packages"
+        have_pil = False
     try:
         ctx = _stretch_get_closed_ctx(rec["symbol"], rec["tf"])
         if not ctx:
             return None, "не удалось получить контекст свечей для графика (ctx пуст)"
         sig = {"entry": rec["trigger_price"], "tp": rec["trigger_ema"], "sl": None,
                "dir": f"жду возврата к EMA{rec['period']}", "entry_i": ctx["i"]}
-        png = _render_signal_chart_png(ctx["candles"], sig, rec["symbol"], rec["tf"])
+        if have_pil:
+            png = _render_signal_chart_png(ctx["candles"], sig, rec["symbol"], rec["tf"])
+            if png:
+                return png, None
+            # PIL есть, но рендер всё равно не удался — пробуем stdlib-версию
+        png = _render_signal_chart_png_stdlib(ctx["candles"], sig, rec["symbol"], rec["tf"])
         if not png:
-            return None, "рендерер графика вернул пусто (недостаточно свечей в окне или внутренняя ошибка отрисовки)"
+            return None, "оба рендерера графика (PIL и stdlib) вернули пусто — недостаточно свечей в окне или внутренняя ошибка отрисовки"
         return png, None
     except Exception as e:
         return None, _explain_error(e)
