@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.54 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.55 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.55: по прямому уточнению — "Отрыв от EMA" должен триггериться
+  ИМЕННО на закрытии свечи, не на живой цене. Раньше _stretch_check_symbol
+  считал stretch_pct от живой цены на каждом опросе (раз в 3 минуты) —
+  мог поймать внутрисвечной всплеск, откатившийся сам ещё ДО закрытия
+  бара (событие, которого "по свече" не было). Теперь используется цена
+  и EMA именно последней ЗАКРЫТОЙ свечи — ctx закэширован до следующего
+  закрытия, так что повторные опросы внутри одного бара безопасны
+  (вернут то же самое, переоценки не будет). Живая цена осталась только
+  в трек-лупе — там она нужна, чтобы поймать момент возврата к EMA.
+  Отдельно: пока НИ ОДНА связка не набрала 10 оценённых событий для
+  алерта по топ-связке (это не баг — данные копятся первый день).
 - v0.30.54: реальный баг, найден по прямому вопросу "может это круто
   сработало?" — 11 "тейков" в свежем экспорте оказались НЕ новой часовой
   стратегией: все 200 записей имели tf="1w", а _migrate_open_signals_to_
@@ -1512,7 +1523,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.54"
+APP_VERSION  = "0.30.55"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -8471,29 +8482,35 @@ def _stretch_get_closed_ctx(symbol, tf):
 def _stretch_check_symbol(symbol, tf):
     """Возвращает список кандидатов на новую запись (отрыв ≥
     STRETCH_DIAG_MIN_PCT от любой из STRETCH_DIAG_PERIODS) — без дедупа,
-    им занимается вызывающий цикл."""
+    им занимается вызывающий цикл.
+    v0.30.55: реальная находка по прямому уточнению — раньше триггер
+    считался от ЖИВОЙ цены на каждом опросе (раз в 3 минуты), а не строго
+    на ЗАКРЫТИИ свечи — мог поймать внутрисвечной всплеск, который к
+    закрытию сам же откатился (то есть событие, которого "по свече" не
+    было). Теперь используется цена и EMA ИМЕННО последней ЗАКРЫТОЙ свечи
+    (ctx закэширован до следующего закрытия — при повторных опросах
+    внутри одной и той же ещё не закрытой свечи вернёт то же самое, так
+    что переоценки не будет, только настоящий новый бар даёт новую
+    проверку). Живая цена (_gate_get_price) осталась ТОЛЬКО в трек-лупе —
+    там она и должна быть, чтобы поймать момент возврата к EMA, не
+    дожидаясь следующего закрытия."""
     ctx = _stretch_get_closed_ctx(symbol, tf)
     if ctx is None:
         return []
-    live_price = _gate_get_price(symbol)
-    if not live_price:
-        return []
     now = time.time()
+    closed_price = ctx["closes"][ctx["i"]]
     out = []
     for period in STRETCH_DIAG_PERIODS:
         ema_closed = ctx["ema_arrays"][period][ctx["i"]]
         if ema_closed is None:
             continue
-        ema_now = _ema_live_value(ema_closed, live_price, period)
-        if not ema_now:
-            continue
-        stretch_pct = (live_price - ema_now) / ema_now * 100.0
+        stretch_pct = (closed_price - ema_closed) / ema_closed * 100.0
         if stretch_pct < STRETCH_DIAG_MIN_PCT:   # v0.30.52: по прямому запросу — только отрыв ВВЕРХ (цена выше EMA), ожидаем падение к EMA обратно. Отрыв вниз (price < ema) больше не фиксируем — раньше ловили оба направления симметрично
             continue
         out.append({
             "id": f"{symbol}|{tf}|{period}|{int(now)}",
             "ts": int(now), "symbol": symbol, "tf": tf, "period": period,
-            "trigger_price": live_price, "trigger_ema": _round_price(ema_now),
+            "trigger_price": closed_price, "trigger_ema": _round_price(ema_closed),
             "stretch_pct": round(stretch_pct, 3), "side": "above" if stretch_pct > 0 else "below",
             "touched": False, "touched_at": None, "time_to_touch_sec": None,
             "closest_stretch_pct": round(stretch_pct, 3),
