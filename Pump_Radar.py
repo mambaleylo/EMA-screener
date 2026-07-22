@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.65 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.66 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.66: по прямому вопросу "сколько времени уходит на цикл" — раньше
+  никак не измерялось, только косвенно оценивалось по лагу. Добавлен
+  честный замер длительности каждого полного скана (в секундах), пишется
+  в лог ("скан завершён за Xс") и видно прямо на странице /ema_stretch
+  ("последний скан занял Xс") — не нужно больше гадать.
 - v0.30.65: по прямому запросу — вернул STRETCH_DIAG_SCAN_WORKERS обратно
   на 24 (было 8 в v0.30.64). Честно: измерил реальный лаг по bar_close_ts
   (добавлено в v0.30.63) на присланном экспорте — медиана 4.9 мин на 15m,
@@ -1631,7 +1636,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.65"
+APP_VERSION  = "0.30.66"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -8782,9 +8787,14 @@ def _stretch_diag_load():
 STRETCH_DIAG_SCAN_WORKERS = 24   # v0.30.65: по прямому запросу — вернули обратно с 8. Честно: не подтверждено, что рейт-лимит был реальной причиной 5-6-минутных задержек (не было прямого доступа к живым логам, чтобы увидеть 429) — измеренный по bar_close_ts реальный лаг (v0.30.63) показал МЕДИАНУ 4.9 мин на 15m, но 80+ МИНУТ на 4h (когда 15m/30m/1h/4h закрываются одновременно у всех монет разом, раз в 4 часа) — характерный признак затора именно на самых массовых одновременных всплесках запросов. Если после возврата на 24 лаг на 4h не уменьшится или вырастет ещё — это будет подтверждением, что дело в лимите, и тогда правильный фикс не "потоки туда-сюда", а не долбить API одновременно по всем 700 монетам разом, а размазывать запросы по времени (джиттер) или проверять только то, что реально скоро закроется
 
 
+_stretch_diag_last_cycle_sec = None   # v0.30.66: по прямому вопросу "сколько времени уходит на цикл" — раньше никак не измерялось, только гадали по косвенным признакам (лагу). Теперь честный замер.
+
+
 def _stretch_diag_scan_loop():
+    global _stretch_diag_last_cycle_sec
     time.sleep(60)
     while True:
+        cycle_start = time.time()
         try:
             symbols = _fetch_all_symbols()
             added = 0
@@ -8825,9 +8835,10 @@ def _stretch_diag_scan_loop():
                         # привязки к длительности всего прохода.
                         _stretch_diag_save()
                         _stretch_diag_maybe_alert_top_combo(fresh)
-            if added:
-                olog(f"[ema_stretch] скан завершён: +{added} новых отрывов "
-                     f"(всего в истории {len(_stretch_diag_records)})")
+            cycle_sec = round(time.time() - cycle_start, 1)
+            _stretch_diag_last_cycle_sec = cycle_sec
+            olog(f"[ema_stretch] скан завершён за {cycle_sec}с: +{added} новых отрывов "
+                 f"(задач {len(tasks)}, всего в истории {len(_stretch_diag_records)})")
         except Exception as e:
             olog(f"[ema_stretch] ошибка цикла сканирования: {_explain_error(e)}")
         time.sleep(STRETCH_DIAG_SCAN_POLL_SEC)
@@ -10248,7 +10259,7 @@ async function loadSummary(){
   try{
     const r = await fetch('/ema_stretch_status'); const d = await r.json();
     const tbody = document.querySelector('#summaryTable tbody'); tbody.innerHTML = '';
-    statusEl.innerText = `Всего событий в истории: ${d.count}`;
+    statusEl.innerText = `Всего событий в истории: ${d.count}` + (d.last_cycle_sec != null ? ` · последний скан занял ${d.last_cycle_sec}с` : '');
     for(const e of (d.summary || [])){
       const o = e.overall;
       const tr = document.createElement('tr');
@@ -10950,6 +10961,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             with _stretch_diag_lock:
                 items = list(_stretch_diag_records)
             self._json({"summary": _stretch_diag_summary(), "count": len(items),
+                        "last_cycle_sec": _stretch_diag_last_cycle_sec,
                         "recent": items[-100:]})
         elif self.path == "/ema_stretch_export":
             with _stretch_diag_lock:
