@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.71 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.72 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.72: по прямому запросу — "нужно точно понять, откуда задержка,
+  9 минут это много!!". Хватит гадать (rate limit? очередь? рестарт?) —
+  добавлена честная разбивка задержки по стадиям вместо одного общего
+  числа. Три новых поля в каждой записи: debug_queue_wait_sec (сколько
+  ждала своей очереди у 24 потоков после того как задача понадобилась),
+  debug_gate_wait_sec (сколько ждала в ограничителе скорости 8 запросов/
+  сек), debug_fetch_sec (сколько занял сам сетевой запрос к Gate.io).
+  Сумма трёх плюс исходное "ожидание закрытия свечи до начала цикла"
+  и даёт итоговую задержку — теперь видно, какая стадия реально виновата,
+  не приходится сравнивать косвенные признаки между экспортами. Показано
+  и в тексте алерта Telegram, и в сыром экспорте JSON.
 - v0.30.71: по прямому вопросу "10 минут задержки, надо решать" — оба
   сигнала (AIO_USDT/ZEST_USDT) пришли почти одновременно, оба с ~11мин
   задержкой: явный признак затора именно в момент, когда ~700 15m-свечей
@@ -1695,7 +1706,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.71"
+APP_VERSION  = "0.30.72"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -8791,7 +8802,9 @@ def _stretch_rate_gate():
     """Блокирует вызывающий поток, пока не освободится место в лимите
     STRETCH_RATE_LIMIT_PER_SEC запросов/сек — общий для всех потоков
     пула, не даёт всплеску одновременных задач превратиться в залп по
-    API разом."""
+    API разом. Возвращает, сколько секунд реально прождал (для честной
+    разбивки задержки по стадиям, v0.30.72)."""
+    wait_start = time.time()
     while True:
         with _stretch_rate_lock:
             now = time.time()
@@ -8799,22 +8812,28 @@ def _stretch_rate_gate():
                 _stretch_rate_window.pop(0)
             if len(_stretch_rate_window) < STRETCH_RATE_LIMIT_PER_SEC:
                 _stretch_rate_window.append(now)
-                return
+                return round(now - wait_start, 3)
         time.sleep(0.05)
 
 
 def _stretch_get_closed_ctx(symbol, tf):
     """Аналог _diag_get_closed_ctx, но свои периоды (5/10/20) и свой кэш —
-    не пересчитывает EMA7/14/28, которые тут не нужны."""
+    не пересчитывает EMA7/14/28, которые тут не нужны.
+    v0.30.72: по прямому запросу — "нужно точно понять, откуда задержка"
+    — теперь замеряет и сохраняет в ctx время ожидания в рейт-лимите и
+    время самого сетевого запроса, чтобы честно разложить задержку по
+    стадиям, а не гадать."""
     key = f"{symbol}|{tf}"
     now = time.time()
     with _stretch_diag_ctx_cache_lock:
         cached = _stretch_diag_ctx_cache.get(key)
     if cached and now < cached["next_close_t"]:
         return None if cached.get("insufficient") else cached
-    _stretch_rate_gate()
+    gate_wait_sec = _stretch_rate_gate()
     fetch_days = STRETCH_DIAG_FETCH_DAYS.get(tf, 15)
+    fetch_t0 = time.time()
     candles = _fetch_candles(symbol, tf, fetch_days)
+    fetch_sec = round(time.time() - fetch_t0, 3)
     min_bars = max(STRETCH_DIAG_PERIODS) + 5
     if len(candles) < min_bars:
         with _stretch_diag_ctx_cache_lock:
@@ -8834,13 +8853,14 @@ def _stretch_get_closed_ctx(symbol, tf):
         return None
     interval_sec = TF_SECONDS.get(tf, 900)
     ctx = {"candles": candles, "closes": closes, "i": i, "ema_arrays": ema_arrays,
-           "next_close_t": candles[i]["t"] + interval_sec + 5}
+           "next_close_t": candles[i]["t"] + interval_sec + 5,
+           "_debug_gate_wait_sec": gate_wait_sec, "_debug_fetch_sec": fetch_sec}
     with _stretch_diag_ctx_cache_lock:
         _stretch_diag_ctx_cache[key] = ctx
     return ctx
 
 
-def _stretch_check_symbol(symbol, tf):
+def _stretch_check_symbol(symbol, tf, submitted_ts=None):
     """Возвращает список кандидатов на новую запись (отрыв ≥
     STRETCH_DIAG_MIN_PCT от любой из STRETCH_DIAG_PERIODS) — без дедупа,
     им занимается вызывающий цикл.
@@ -8854,7 +8874,12 @@ def _stretch_check_symbol(symbol, tf):
     что переоценки не будет, только настоящий новый бар даёт новую
     проверку). Живая цена (_gate_get_price) осталась ТОЛЬКО в трек-лупе —
     там она и должна быть, чтобы поймать момент возврата к EMA, не
-    дожидаясь следующего закрытия."""
+    дожидаясь следующего закрытия.
+    v0.30.72: submitted_ts (когда задача попала в пул) — для честной
+    разбивки задержки на "ждала своей очереди у потоков" отдельно от
+    "ждала в рейт-лимите" и "сам сетевой запрос"."""
+    picked_ts = time.time()
+    queue_wait_sec = round(picked_ts - submitted_ts, 3) if submitted_ts else None
     ctx = _stretch_get_closed_ctx(symbol, tf)
     if ctx is None:
         return []
@@ -8876,6 +8901,9 @@ def _stretch_check_symbol(symbol, tf):
             "id": f"{symbol}|{tf}|{period}|{int(now)}",
             "ts": int(now), "symbol": symbol, "tf": tf, "period": period,
             "bar_close_ts": bar_close_ts,   # v0.30.63: по прямому запросу — прозрачность задержки: реальный момент закрытия свечи, не момент обнаружения
+            "debug_queue_wait_sec": queue_wait_sec,     # v0.30.72: сколько ждала своей очереди у 24 потоков
+            "debug_gate_wait_sec": ctx.get("_debug_gate_wait_sec"),   # сколько ждала в ограничителе скорости (8 запросов/сек)
+            "debug_fetch_sec": ctx.get("_debug_fetch_sec"),           # сколько занял сам сетевой запрос к Gate.io
             "trigger_price": closed_price, "trigger_ema": _round_price(ema_closed),
             "entry": entry, "stop": stop, "take": take,
             "stretch_pct": round(stretch_pct, 3), "side": "above" if stretch_pct > 0 else "below",
@@ -8950,8 +8978,9 @@ def _stretch_diag_scan_loop():
                         if not cached or now0 >= cached["next_close_t"]:
                             due_tasks.append((symbol, tf))
             tasks = due_tasks
+            submitted_ts = time.time()
             with ThreadPoolExecutor(max_workers=STRETCH_DIAG_SCAN_WORKERS) as pool:
-                futures = {pool.submit(_stretch_check_symbol, symbol, tf): (symbol, tf) for symbol, tf in tasks}
+                futures = {pool.submit(_stretch_check_symbol, symbol, tf, submitted_ts): (symbol, tf) for symbol, tf in tasks}
                 for fut in _as_completed(futures):
                     symbol, tf = futures[fut]
                     try:
@@ -9063,12 +9092,15 @@ def _stretch_diag_maybe_alert_top_combo(new_recs):
             continue
         lag_sec = max(0, int(time.time() - rec.get("bar_close_ts", rec["ts"])))
         lag_txt = f"{lag_sec}с" if lag_sec < 60 else f"{lag_sec // 60}м{lag_sec % 60}с"
+        qw, gw, fs = rec.get("debug_queue_wait_sec"), rec.get("debug_gate_wait_sec"), rec.get("debug_fetch_sec")
+        debug_txt = (f" (очередь {qw}с, рейт-лимит {gw}с, запрос {fs}с)"
+                     if qw is not None or gw is not None or fs is not None else "")
         msg = (f"📉 <b>{rec['symbol']}</b> — SHORT на возврат к EMA{top_period} ({top_tf}), "
                f"топ связка по устойчивости к стопу (10х)\n"
                f"Вход: {_fmt_px(rec['entry'])} | Стоп: {_fmt_px(rec['stop'])} ({STRETCH_REF_STOP_PCT}%) | "
                f"Тейк: {_fmt_px(rec['take'])} (уровень EMA{top_period})\n"
                f"Отрыв: {rec['stretch_pct']:+.2f}%\n"
-               f"Задержка от закрытия свечи: {lag_txt}\n"
+               f"Задержка от закрытия свечи: {lag_txt}{debug_txt}\n"
                f"По статистике этой связки (n={o['evaluated']}, риск-выборка n={o['stop_survival_n']}): "
                f"выживает при стопе {STRETCH_REF_STOP_PCT}% — {o['stop_survival_rate']}%, "
                f"винрейт тейк/стоп (n={o['signal_resolved_n']}) — {o['signal_win_rate']}%")
