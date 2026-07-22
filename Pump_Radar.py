@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.55 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.56 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.56: по прямому запросу — "Отрыв от EMA" раньше показывал только
+  шанс вернуться (closest_stretch_pct/retrace%), но не худший случай на
+  пути. Добавлено новое поле max_adverse_stretch_pct (пик удаления от
+  EMA, пока не откатилась) — считается по ВСЕМ записям (не только
+  оценённым, это живой риск-профиль). В сводке — avg/max
+  extra_adverse_pct (насколько % ДАЛЬШЕ в среднем/по максимуму ушло от
+  исходного отрыва, прежде чем откатиться или протухнуть). Показано и в
+  таблице сводки, и в сырых записях на странице. Цель — видеть не только
+  "вернулась ли", но и "насколько плохо было по пути", раз уже сама идея
+  ловли затухания импульса требует понимать оба хвоста, не только
+  благоприятный.
 - v0.30.55: по прямому уточнению — "Отрыв от EMA" должен триггериться
   ИМЕННО на закрытии свечи, не на живой цене. Раньше _stretch_check_symbol
   считал stretch_pct от живой цены на каждом опросе (раз в 3 минуты) —
@@ -1523,7 +1534,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.55"
+APP_VERSION  = "0.30.56"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -8515,6 +8526,7 @@ def _stretch_check_symbol(symbol, tf):
             "touched": False, "touched_at": None, "time_to_touch_sec": None,
             "closest_stretch_pct": round(stretch_pct, 3),
             "max_retrace_pct_of_stretch": 0.0,
+            "max_adverse_stretch_pct": round(stretch_pct, 3),
             "last_checked_ts": int(now),
             "track_until": now + STRETCH_DIAG_TRACK_WINDOW_SEC.get(tf, 6 * 3600), "track_done": False,
         })
@@ -8656,6 +8668,8 @@ def _stretch_diag_track_loop():
                         crossed = (current_stretch > 0) != (rec["stretch_pct"] > 0)
                         if abs(current_stretch) < abs(rec["closest_stretch_pct"]):
                             rec["closest_stretch_pct"] = round(current_stretch, 3)
+                        if not crossed and abs(current_stretch) > abs(rec.get("max_adverse_stretch_pct", rec["stretch_pct"])):
+                            rec["max_adverse_stretch_pct"] = round(current_stretch, 3)   # v0.30.56: по прямому запросу — сколько ДАЛЬШЕ от EMA ушло, прежде чем откатиться (или так и не откатилось): видим не только шанс на возврат, но и худший случай на пути
                         retrace = 100.0 * (1 - abs(current_stretch) / abs(rec["stretch_pct"])) if rec["stretch_pct"] else 0.0
                         if retrace > rec["max_retrace_pct_of_stretch"]:
                             rec["max_retrace_pct_of_stretch"] = round(retrace, 1)
@@ -8696,12 +8710,22 @@ def _stretch_diag_summary(min_events=3):
         touched = sum(1 for r in evaluated if r.get("touched"))
         retrace_vals = [r["max_retrace_pct_of_stretch"] for r in evaluated]
         touch_times = [r["time_to_touch_sec"] for r in evaluated if r.get("touched") and r.get("time_to_touch_sec")]
+        # v0.30.56: по прямому запросу — не только "вернулась ли", но и
+        # "насколько хуже стало по пути" — excess = на сколько % ДАЛЬШЕ от
+        # исходного отрыва ушла цена, прежде чем откатиться (0, если сразу
+        # пошла в откат без дальнейшего ухудшения). Считаем по ВСЕМ
+        # записям (не только оценённым) — это живой риск-профиль, важен
+        # даже для ещё не решённых
+        excess_vals = [max(0.0, abs(r.get("max_adverse_stretch_pct", r["stretch_pct"])) - abs(r["stretch_pct"]))
+                       for r in items]
         return {
             "total": total, "evaluated": len(evaluated), "touched": touched,
             "touch_rate": round(touched / len(evaluated) * 100, 1) if evaluated else None,
             "avg_retrace_pct_of_stretch": round(sum(retrace_vals) / len(retrace_vals), 1) if retrace_vals else None,
             "median_retrace_pct_of_stretch": round(statistics.median(retrace_vals), 1) if retrace_vals else None,
             "avg_time_to_touch_min": round(sum(touch_times) / len(touch_times) / 60, 1) if touch_times else None,
+            "avg_extra_adverse_pct": round(sum(excess_vals) / len(excess_vals), 2) if excess_vals else None,
+            "max_extra_adverse_pct": round(max(excess_vals), 2) if excess_vals else None,
         }
 
     result = []
@@ -9867,7 +9891,7 @@ select,input{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-ra
   <div id="summaryStatus" class="summary-line">загрузка...</div>
   <div class="table-scroll">
     <table id="summaryTable">
-      <thead><tr><th>ТФ</th><th>EMA</th><th>Событий</th><th>Оценено</th><th>Touch rate</th><th>Avg откат%</th><th>Med откат%</th><th>Avg время до касания</th><th>1-3% events</th><th>3-6% events</th><th>6%+ events</th></tr></thead>
+      <thead><tr><th>ТФ</th><th>EMA</th><th>Событий</th><th>Оценено</th><th>Touch rate</th><th>Avg откат%</th><th>Med откат%</th><th>Avg время до касания</th><th>Avg хуже на%</th><th>Худший случай</th><th>1-3% events</th><th>3-6% events</th><th>6%+ events</th></tr></thead>
       <tbody></tbody>
     </table>
   </div>
@@ -9896,7 +9920,7 @@ select,input{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-ra
   <div id="rawStatus" class="summary-line"></div>
   <div class="table-scroll">
     <table id="rawTable">
-      <thead><tr><th>Монета</th><th>ТФ</th><th>EMA</th><th>Сторона</th><th>Отрыв%</th><th>Ближайший подход%</th><th>Откат%</th><th>Коснулась?</th><th>Время до касания</th><th>Статус</th><th>Когда</th></tr></thead>
+      <thead><tr><th>Монета</th><th>ТФ</th><th>EMA</th><th>Сторона</th><th>Отрыв%</th><th>Ближайший подход%</th><th>Худший заход%</th><th>Откат%</th><th>Коснулась?</th><th>Время до касания</th><th>Статус</th><th>Когда</th></tr></thead>
       <tbody></tbody>
     </table>
   </div>
@@ -9924,6 +9948,7 @@ async function loadSummary(){
       tr.innerHTML = `<td>${e.tf}</td><td>EMA${e.period}</td><td>${o.total}</td><td>${o.evaluated}</td>`+
         `<td>${o.touch_rate ?? '—'}%</td><td>${o.avg_retrace_pct_of_stretch ?? '—'}%</td>`+
         `<td>${o.median_retrace_pct_of_stretch ?? '—'}%</td><td>${o.avg_time_to_touch_min ?? '—'} мин</td>`+
+        `<td>${o.avg_extra_adverse_pct ?? '—'}%</td><td>${o.max_extra_adverse_pct ?? '—'}%</td>`+
         `<td>${b13 ? b13.evaluated+' / '+(b13.avg_retrace_pct_of_stretch??'—')+'%' : '—'}</td>`+
         `<td>${b36 ? b36.evaluated+' / '+(b36.avg_retrace_pct_of_stretch??'—')+'%' : '—'}</td>`+
         `<td>${b6p ? b6p.evaluated+' / '+(b6p.avg_retrace_pct_of_stretch??'—')+'%' : '—'}</td>`;
@@ -9950,6 +9975,7 @@ async function loadRaw(){
                      (it.track_done ? '<span style="color:#f85149">таймаут</span>' : 'следим...');
       tr.innerHTML = `<td>${it.symbol}</td><td>${it.tf}</td><td>EMA${it.period}</td><td>${it.side}</td>`+
         `<td>${it.stretch_pct>0?'+':''}${it.stretch_pct}%</td><td>${it.closest_stretch_pct}%</td>`+
+        `<td>${it.max_adverse_stretch_pct ?? it.stretch_pct}%</td>`+
         `<td>${it.max_retrace_pct_of_stretch}%</td><td>${it.touched?'да':'нет'}</td>`+
         `<td>${timeToTouch}</td><td>${status}</td><td>${fmtAgo(it.ts)}</td>`;
       tbody.appendChild(tr);
