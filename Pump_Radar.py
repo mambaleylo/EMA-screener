@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.50 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.51 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.51: по прямому запросу — новая кнопка "Отрыв от EMA" (/ema_stretch).
+  Отдельный, независимый от EMA Diagnostics/slow_impulse движок: триггер —
+  ОТРЫВ цены от короткой EMA (5/10/20) на закрытии свечи на ≥1%, ТФ
+  15м/30м/1h/4h. Дальше следит либо до касания той же EMA обратно (как и
+  предложили — логичнее фиксированного окна), либо до таймаута (свой на
+  каждый ТФ), считает % отката от исходного отрыва. Сводка разбита по
+  ТФ×период EMA И по величине самого отрыва (1-3%/3-6%/6%+) — цель ровно
+  та, что просили: "какой фрейм и EMA лучше всего откатывает". Два новых
+  фоновых цикла (_stretch_diag_scan_loop, _stretch_diag_track_loop), своя
+  история на диске (~/pumpradar_ema_stretch_diag.json), свой export.
+  Полностью параллельно существующим движкам — ничего из slow_impulse/
+  EMA Diagnostics/бэктеста не тронуто.
 - v0.30.50: перевёл slow_impulse с недельного ТФ на часовой (SLOW_IMPULSE_TF
   = "1h") — по находке v0.30.49: единственный ТФ, где во всех 3 периодах
   avg_mfe>avg_mae в своей диагностике. По пути нашёл и починил реальный
@@ -1473,7 +1485,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.50"
+APP_VERSION  = "0.30.51"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3612,6 +3624,7 @@ details[open] summary:before{content:"▾ "}
   <a href="/ema" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#127968; Главная</a>
   <a href="/manual_scan" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128269; Ручной скан</a>
   <a href="/ema_diag" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128202; EMA Диагностика</a>
+  <a href="/ema_stretch" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128201; Отрыв от EMA</a>
   <a href="/pump_match" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#127919; Pump Match</a>
   <a href="/weekly_ema_backtest" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128200; Бэктест EMA</a>
 </div>
@@ -3622,6 +3635,7 @@ details[open] summary:before{content:"▾ "}
 <a href="/pump_match" style="text-decoration:none"><button style="background:#8250df">&#127919; Pump Match (подбор параметров отрисовки)</button></a>
 <a href="/weekly_ema_backtest" style="text-decoration:none"><button style="background:#8250df">&#128202; Weekly EMA Backtest</button></a>
 <a href="/ema_diag" style="text-decoration:none"><button style="background:#8250df">&#128300; EMA Diagnostics</button></a>
+<a href="/ema_stretch" style="text-decoration:none"><button style="background:#8250df">&#128201; Отрыв от EMA</button></a>
 <button onclick="startScreensaver()" style="background:#21262d;border:1px solid #30363d">&#128421; Скринсейвер</button>
 <div id="screensaverOverlay" style="display:none;position:fixed;inset:0;background:#000;z-index:9999" onclick="stopScreensaver()"></div>
 <div class="section-card" style="max-width:420px">
@@ -8299,6 +8313,255 @@ def _diag_summary(min_touches=3):
 
 # ─── конец EMA Diagnostics ───────────────────────────────────────────────────
 
+# ─── EMA Stretch/Retrace Diagnostics ────────────────────────────────────────
+# По прямому запросу — "цена уходит на % от EMA5 после закрытия свечи, часто
+# хочет откат". В отличие от EMA Diagnostics выше (триггер — БЛИЗОСТЬ к EMA,
+# касание), здесь триггер — ОТРЫВ от короткой EMA на X%, а дальше следим,
+# сколько происходит отката — ЛИБО до полного возврата (касания той же EMA
+# обратно), ЛИБО до таймаута. Периоды короче обычных (5/10/20, не 7/14/28) —
+# по прямому уточнению, отрыв смотрим именно от короткой EMA. ТФ от 15 минут.
+STRETCH_DIAG_PERIODS = [5, 10, 20]
+STRETCH_DIAG_TIMEFRAMES = ["15m", "30m", "1h", "4h"]
+STRETCH_DIAG_FETCH_DAYS = {"15m": 10, "30m": 15, "1h": 30, "4h": 60}
+STRETCH_DIAG_MIN_PCT = 1.0          # минимальный % отрыва, чтобы вообще зафиксировать событие — иначе шум почти на каждой свече
+STRETCH_DIAG_TOUCH_TOL_PCT = 0.1    # ближе этого к EMA (или пересечение на другую сторону) считается "коснулась снова"
+STRETCH_DIAG_SCAN_POLL_SEC = 180    # почаще обычного — самый быстрый ТФ (15м) требует нередкого опроса, не пропустить момент отрыва
+STRETCH_DIAG_TRACK_POLL_SEC = 60
+STRETCH_DIAG_TRACK_WINDOW_SEC = {"15m": 6 * 3600, "30m": 12 * 3600, "1h": 24 * 3600, "4h": 4 * 86400}   # с запасом под масштаб ТФ
+STRETCH_DIAG_FILE = os.path.expanduser("~/pumpradar_ema_stretch_diag.json")
+STRETCH_DIAG_MAX_RECORDS = 5000
+STRETCH_DIAG_BUCKETS = [(1, 3, "1-3%"), (3, 6, "3-6%"), (6, 999, "6%+")]   # для сводки — какой % отрыва даёт какой средний откат
+
+_stretch_diag_lock = threading.Lock()
+_stretch_diag_records = []
+_stretch_diag_ctx_cache = {}
+_stretch_diag_ctx_cache_lock = threading.Lock()
+
+
+def _stretch_get_closed_ctx(symbol, tf):
+    """Аналог _diag_get_closed_ctx, но свои периоды (5/10/20) и свой кэш —
+    не пересчитывает EMA7/14/28, которые тут не нужны."""
+    key = f"{symbol}|{tf}"
+    now = time.time()
+    with _stretch_diag_ctx_cache_lock:
+        cached = _stretch_diag_ctx_cache.get(key)
+    if cached and now < cached["next_close_t"]:
+        return None if cached.get("insufficient") else cached
+    fetch_days = STRETCH_DIAG_FETCH_DAYS.get(tf, 15)
+    candles = _fetch_candles(symbol, tf, fetch_days)
+    min_bars = max(STRETCH_DIAG_PERIODS) + 5
+    if len(candles) < min_bars:
+        with _stretch_diag_ctx_cache_lock:
+            _stretch_diag_ctx_cache[key] = {"insufficient": True,
+                                             "next_close_t": now + EMA_TOUCH_INSUFFICIENT_HISTORY_RECHECK_SEC}
+        return None
+    closes = [c["close"] for c in candles]
+    i = len(candles) - 1
+    ema_arrays = {p: _ema(closes, p) for p in STRETCH_DIAG_PERIODS}
+    if any(arr[i] is None for arr in ema_arrays.values()):
+        return None
+    interval_sec = TF_SECONDS.get(tf, 900)
+    ctx = {"candles": candles, "closes": closes, "i": i, "ema_arrays": ema_arrays,
+           "next_close_t": candles[i]["t"] + interval_sec + 5}
+    with _stretch_diag_ctx_cache_lock:
+        _stretch_diag_ctx_cache[key] = ctx
+    return ctx
+
+
+def _stretch_check_symbol(symbol, tf):
+    """Возвращает список кандидатов на новую запись (отрыв ≥
+    STRETCH_DIAG_MIN_PCT от любой из STRETCH_DIAG_PERIODS) — без дедупа,
+    им занимается вызывающий цикл."""
+    ctx = _stretch_get_closed_ctx(symbol, tf)
+    if ctx is None:
+        return []
+    live_price = _gate_get_price(symbol)
+    if not live_price:
+        return []
+    now = time.time()
+    out = []
+    for period in STRETCH_DIAG_PERIODS:
+        ema_closed = ctx["ema_arrays"][period][ctx["i"]]
+        if ema_closed is None:
+            continue
+        ema_now = _ema_live_value(ema_closed, live_price, period)
+        if not ema_now:
+            continue
+        stretch_pct = (live_price - ema_now) / ema_now * 100.0
+        if abs(stretch_pct) < STRETCH_DIAG_MIN_PCT:
+            continue
+        out.append({
+            "id": f"{symbol}|{tf}|{period}|{int(now)}",
+            "ts": int(now), "symbol": symbol, "tf": tf, "period": period,
+            "trigger_price": live_price, "trigger_ema": _round_price(ema_now),
+            "stretch_pct": round(stretch_pct, 3), "side": "above" if stretch_pct > 0 else "below",
+            "touched": False, "touched_at": None, "time_to_touch_sec": None,
+            "closest_stretch_pct": round(stretch_pct, 3),
+            "max_retrace_pct_of_stretch": 0.0,
+            "last_checked_ts": int(now),
+            "track_until": now + STRETCH_DIAG_TRACK_WINDOW_SEC.get(tf, 6 * 3600), "track_done": False,
+        })
+    return out
+
+
+def _stretch_diag_save():
+    try:
+        with _stretch_diag_lock:
+            trimmed = _stretch_diag_records[-STRETCH_DIAG_MAX_RECORDS:]
+        tmp_path = STRETCH_DIAG_FILE + f".tmp{os.getpid()}"
+        with open(tmp_path, "w") as f:
+            json.dump(trimmed, f)
+        os.replace(tmp_path, STRETCH_DIAG_FILE)
+    except Exception as e:
+        olog(f"[ema_stretch] ⚠ не смог сохранить {STRETCH_DIAG_FILE}: {_explain_error(e)}")
+
+
+def _stretch_diag_load():
+    global _stretch_diag_records
+    try:
+        if os.path.exists(STRETCH_DIAG_FILE):
+            with open(STRETCH_DIAG_FILE) as f:
+                loaded = json.load(f)
+            if isinstance(loaded, list):
+                with _stretch_diag_lock:
+                    _stretch_diag_records = loaded
+                still_open = sum(1 for r in loaded if not r.get("track_done", True))
+                olog(f"[ema_stretch] история подхвачена с диска: {len(loaded)} записей, "
+                     f"из них ещё отслеживается {still_open}")
+    except Exception as e:
+        olog(f"[ema_stretch] ⚠ не смог подхватить историю с диска: {_explain_error(e)}")
+
+
+def _stretch_diag_scan_loop():
+    time.sleep(60)
+    while True:
+        try:
+            symbols = _fetch_all_symbols()
+            added = 0
+            for symbol in symbols:
+                for tf in STRETCH_DIAG_TIMEFRAMES:
+                    try:
+                        candidates = _stretch_check_symbol(symbol, tf)
+                    except Exception as e:
+                        olog(f"[ema_stretch] {symbol} {tf}: ошибка проверки: {_explain_error(e)}")
+                        continue
+                    if not candidates:
+                        continue
+                    with _stretch_diag_lock:
+                        open_keys = {f"{r['symbol']}|{r['tf']}|{r['period']}"
+                                     for r in _stretch_diag_records if not r.get("track_done", True)}
+                        for rec in candidates:
+                            rkey = f"{rec['symbol']}|{rec['tf']}|{rec['period']}"
+                            if rkey in open_keys:   # уже отслеживаем отрыв по этой же связке — не дублируем
+                                continue
+                            _stretch_diag_records.append(rec)
+                            open_keys.add(rkey)
+                            added += 1
+            if added:
+                _stretch_diag_save()
+                olog(f"[ema_stretch] скан завершён: +{added} новых отрывов "
+                     f"(всего в истории {len(_stretch_diag_records)})")
+        except Exception as e:
+            olog(f"[ema_stretch] ошибка цикла сканирования: {_explain_error(e)}")
+        time.sleep(STRETCH_DIAG_SCAN_POLL_SEC)
+
+
+def _stretch_diag_track_loop():
+    """Раз в STRETCH_DIAG_TRACK_POLL_SEC пересчитывает живую EMA и цену для
+    каждой ещё открытой записи, обновляет ближайший подход к EMA
+    (closest_stretch_pct, знак может смениться — тогда это уже
+    "проскочила через EMA", тоже считаем как touched) и % отката от
+    исходного отрыва. Останавливает слежение либо по факту касания, либо
+    по таймауту (свой на каждый ТФ, шире для медленных)."""
+    time.sleep(90)
+    while True:
+        try:
+            with _stretch_diag_lock:
+                open_recs = [r for r in _stretch_diag_records if not r.get("track_done", True)]
+            if open_recs:
+                changed = False
+                now = time.time()
+                for rec in open_recs:
+                    try:
+                        ctx = _stretch_get_closed_ctx(rec["symbol"], rec["tf"])
+                        live_price = _gate_get_price(rec["symbol"])
+                        if not ctx or not live_price:
+                            if now >= rec.get("track_until", 0):
+                                rec["track_done"] = True
+                                changed = True
+                            continue
+                        ema_closed = ctx["ema_arrays"][rec["period"]][ctx["i"]]
+                        ema_now = _ema_live_value(ema_closed, live_price, rec["period"]) if ema_closed else None
+                        if not ema_now:
+                            continue
+                        current_stretch = (live_price - ema_now) / ema_now * 100.0
+                        original_side = 1 if rec["stretch_pct"] > 0 else -1
+                        crossed = (current_stretch > 0) != (rec["stretch_pct"] > 0)
+                        if abs(current_stretch) < abs(rec["closest_stretch_pct"]):
+                            rec["closest_stretch_pct"] = round(current_stretch, 3)
+                        retrace = 100.0 * (1 - abs(current_stretch) / abs(rec["stretch_pct"])) if rec["stretch_pct"] else 0.0
+                        if retrace > rec["max_retrace_pct_of_stretch"]:
+                            rec["max_retrace_pct_of_stretch"] = round(retrace, 1)
+                        rec["last_checked_ts"] = int(now)
+                        changed = True
+                        if crossed or abs(current_stretch) <= STRETCH_DIAG_TOUCH_TOL_PCT:
+                            rec["touched"] = True
+                            rec["touched_at"] = int(now)
+                            rec["time_to_touch_sec"] = int(now - rec["ts"])
+                            rec["max_retrace_pct_of_stretch"] = 100.0
+                            rec["track_done"] = True
+                        elif now >= rec.get("track_until", 0):
+                            rec["track_done"] = True
+                    except Exception as e:
+                        olog(f"[ema_stretch_track] ⚠ пропущена битая запись "
+                             f"({rec.get('symbol','?')}): {_explain_error(e)}")
+                        continue
+                if changed:
+                    _stretch_diag_save()
+        except Exception as e:
+            olog(f"[ema_stretch_track] ошибка цикла: {_explain_error(e)}")
+        time.sleep(STRETCH_DIAG_TRACK_POLL_SEC)
+
+
+def _stretch_diag_summary(min_events=3):
+    """Сводка по каждой связке (ТФ × период), плюс разбивка по величине
+    исходного отрыва (STRETCH_DIAG_BUCKETS) — цель ровно та, что просили:
+    "какой фрейм и период EMA лучше всего по проценту отката"."""
+    with _stretch_diag_lock:
+        records = list(_stretch_diag_records)
+    groups = {}
+    for r in records:
+        groups.setdefault((r["tf"], r["period"]), []).append(r)
+
+    def _agg(items):
+        total = len(items)
+        evaluated = [r for r in items if r.get("track_done")]
+        touched = sum(1 for r in evaluated if r.get("touched"))
+        retrace_vals = [r["max_retrace_pct_of_stretch"] for r in evaluated]
+        touch_times = [r["time_to_touch_sec"] for r in evaluated if r.get("touched") and r.get("time_to_touch_sec")]
+        return {
+            "total": total, "evaluated": len(evaluated), "touched": touched,
+            "touch_rate": round(touched / len(evaluated) * 100, 1) if evaluated else None,
+            "avg_retrace_pct_of_stretch": round(sum(retrace_vals) / len(retrace_vals), 1) if retrace_vals else None,
+            "median_retrace_pct_of_stretch": round(statistics.median(retrace_vals), 1) if retrace_vals else None,
+            "avg_time_to_touch_min": round(sum(touch_times) / len(touch_times) / 60, 1) if touch_times else None,
+        }
+
+    result = []
+    for (tf, period), items in groups.items():
+        if len(items) < min_events:
+            continue
+        entry = {"tf": tf, "period": period, "overall": _agg(items)}
+        for lo, hi, label in STRETCH_DIAG_BUCKETS:
+            subset = [r for r in items if lo <= abs(r["stretch_pct"]) < hi]
+            if subset:
+                entry[f"stretch_{label}"] = _agg(subset)
+        result.append(entry)
+    result.sort(key=lambda e: (e["overall"]["avg_retrace_pct_of_stretch"] or 0), reverse=True)
+    return result
+
+# ─── конец EMA Stretch/Retrace Diagnostics ──────────────────────────────────
+
 
 
 def _load_alert_cfg():
@@ -9110,6 +9373,7 @@ th,td{padding:6px 8px;text-align:left;border-bottom:1px solid #21262d}
   <a href="/ema" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#127968; Главная</a>
   <a href="/manual_scan" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128269; Ручной скан</a>
   <a href="/ema_diag" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128202; EMA Диагностика</a>
+  <a href="/ema_stretch" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128201; Отрыв от EMA</a>
   <a href="/pump_match" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#127919; Pump Match</a>
   <a href="/weekly_ema_backtest" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128200; Бэктест EMA</a>
 </div>
@@ -9231,6 +9495,7 @@ select,input{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-ra
   <a href="/ema" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#127968; Главная</a>
   <a href="/manual_scan" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128269; Ручной скан</a>
   <a href="/ema_diag" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128202; EMA Диагностика</a>
+  <a href="/ema_stretch" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128201; Отрыв от EMA</a>
   <a href="/pump_match" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#127919; Pump Match</a>
   <a href="/weekly_ema_backtest" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128200; Бэктест EMA</a>
 </div>
@@ -9405,6 +9670,142 @@ setInterval(loadRaw, 30000);
 </script></body></html>"""
 
 
+EMA_STRETCH_HTML_PAGE = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>EMA Stretch/Retrace</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font-family:system-ui,sans-serif;margin:0;padding:16px}
+h1{font-size:20px}
+h3{font-size:15px;margin:0}
+button{background:#238636;color:#fff;border:0;padding:8px 14px;border-radius:6px;font-size:13px;margin:4px 6px 4px 0;cursor:pointer}
+.btn-danger-sm{background:#3a1414;border:1px solid #f85149;color:#f85149;padding:4px 10px;font-size:12px;border-radius:6px;margin:0}
+table{width:100%;border-collapse:collapse;margin-top:10px;font-size:12px}
+th,td{padding:5px 7px;text-align:left;border-bottom:1px solid #21262d;white-space:nowrap}
+th{color:#8b949e;position:sticky;top:0;background:#161b22}
+tbody tr:hover{background:#1c2128}
+.section-card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:14px;margin-top:14px}
+.section-head{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px}
+.table-scroll{overflow-x:auto}
+.wr-hi{color:#3fb950;font-weight:bold}
+.wr-lo{color:#f85149;font-weight:bold}
+select,input{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px;font-size:13px}
+.summary-line{font-size:13px;color:#8b949e;margin-top:6px}
+</style></head><body>
+<div style="background:#161b22;border-bottom:1px solid #30363d;padding:8px 12px;display:flex;gap:6px;flex-wrap:wrap;font-size:12px">
+  <a href="/ema" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#127968; Главная</a>
+  <a href="/manual_scan" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128269; Ручной скан</a>
+  <a href="/ema_diag" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128202; EMA Диагностика</a>
+  <a href="/ema_stretch" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128201; Отрыв от EMA</a>
+  <a href="/weekly_ema_backtest" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128200; Бэктест EMA</a>
+</div>
+
+<h1>&#128201; Отрыв от EMA — сколько в среднем откатывает</h1>
+<p style="color:#8b949e;font-size:13px;max-width:520px">Триггер — отрыв цены от короткой EMA (5/10/20) на ЗАКРЫТИИ свечи, ≥1%, на ТФ 15м/30м/1h/4h. Дальше следим ЛИБО до касания той же EMA обратно, ЛИБО до таймаута (свой на каждый ТФ) — и считаем % отката от исходного отрыва (100% = полностью коснулась). Сводка разбита ещё и по величине самого отрыва (1-3% / 3-6% / 6%+), чтобы видеть, растёт ли шанс отката вместе с силой отрыва.</p>
+
+<div class="section-card">
+  <div class="section-head">
+    <h3>&#128202; Сводка: какой ТФ/период откатывает лучше всего</h3>
+    <button onclick="loadSummary()">&#128260; Обновить</button>
+  </div>
+  <div id="summaryStatus" class="summary-line">загрузка...</div>
+  <div class="table-scroll">
+    <table id="summaryTable">
+      <thead><tr><th>ТФ</th><th>EMA</th><th>Событий</th><th>Оценено</th><th>Touch rate</th><th>Avg откат%</th><th>Med откат%</th><th>Avg время до касания</th><th>1-3% events</th><th>3-6% events</th><th>6%+ events</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="section-card">
+  <div class="section-head">
+    <h3>&#128203; Последние отрывы (сырые)</h3>
+    <div>
+      <select id="filterTf" onchange="loadRaw()">
+        <option value="">Все ТФ</option>
+        <option value="15m">15m</option>
+        <option value="30m">30m</option>
+        <option value="1h">1h</option>
+        <option value="4h">4h</option>
+      </select>
+      <select id="filterPeriod" onchange="loadRaw()">
+        <option value="">Все EMA</option>
+        <option value="5">EMA5</option>
+        <option value="10">EMA10</option>
+        <option value="20">EMA20</option>
+      </select>
+      <a href="/ema_stretch_export" style="text-decoration:none"><button>&#128190; Скачать JSON</button></a>
+    </div>
+  </div>
+  <div id="rawStatus" class="summary-line"></div>
+  <div class="table-scroll">
+    <table id="rawTable">
+      <thead><tr><th>Монета</th><th>ТФ</th><th>EMA</th><th>Сторона</th><th>Отрыв%</th><th>Ближайший подход%</th><th>Откат%</th><th>Коснулась?</th><th>Время до касания</th><th>Статус</th><th>Когда</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+function fmtAgo(ts){
+  const s = Math.floor(Date.now()/1000) - ts;
+  if(s < 3600) return Math.floor(s/60)+'м назад';
+  if(s < 86400) return Math.floor(s/3600)+'ч назад';
+  return Math.floor(s/86400)+'д назад';
+}
+
+async function loadSummary(){
+  const statusEl = document.getElementById('summaryStatus');
+  statusEl.innerText = 'Загрузка...';
+  try{
+    const r = await fetch('/ema_stretch_status'); const d = await r.json();
+    const tbody = document.querySelector('#summaryTable tbody'); tbody.innerHTML = '';
+    statusEl.innerText = `Всего событий в истории: ${d.count}`;
+    for(const e of (d.summary || [])){
+      const o = e.overall;
+      const tr = document.createElement('tr');
+      const b13 = e['stretch_1-3%'], b36 = e['stretch_3-6%'], b6p = e['stretch_6%+'];
+      tr.innerHTML = `<td>${e.tf}</td><td>EMA${e.period}</td><td>${o.total}</td><td>${o.evaluated}</td>`+
+        `<td>${o.touch_rate ?? '—'}%</td><td>${o.avg_retrace_pct_of_stretch ?? '—'}%</td>`+
+        `<td>${o.median_retrace_pct_of_stretch ?? '—'}%</td><td>${o.avg_time_to_touch_min ?? '—'} мин</td>`+
+        `<td>${b13 ? b13.evaluated+' / '+(b13.avg_retrace_pct_of_stretch??'—')+'%' : '—'}</td>`+
+        `<td>${b36 ? b36.evaluated+' / '+(b36.avg_retrace_pct_of_stretch??'—')+'%' : '—'}</td>`+
+        `<td>${b6p ? b6p.evaluated+' / '+(b6p.avg_retrace_pct_of_stretch??'—')+'%' : '—'}</td>`;
+      tbody.appendChild(tr);
+    }
+  }catch(e){ statusEl.innerText = 'Ошибка загрузки'; }
+}
+
+async function loadRaw(){
+  const statusEl = document.getElementById('rawStatus');
+  try{
+    const r = await fetch('/ema_stretch_status'); const d = await r.json();
+    const tf = document.getElementById('filterTf').value;
+    const period = document.getElementById('filterPeriod').value;
+    let items = (d.recent || []).slice().reverse();
+    if(tf) items = items.filter(x => x.tf === tf);
+    if(period) items = items.filter(x => String(x.period) === period);
+    statusEl.innerText = `Показано ${items.length} из ${d.count}`;
+    const tbody = document.querySelector('#rawTable tbody'); tbody.innerHTML = '';
+    for(const it of items.slice(0,100)){
+      const tr = document.createElement('tr');
+      const timeToTouch = it.time_to_touch_sec ? Math.round(it.time_to_touch_sec/60)+' мин' : '—';
+      const status = it.touched ? '<span style="color:#3fb950">коснулась</span>' :
+                     (it.track_done ? '<span style="color:#f85149">таймаут</span>' : 'следим...');
+      tr.innerHTML = `<td>${it.symbol}</td><td>${it.tf}</td><td>EMA${it.period}</td><td>${it.side}</td>`+
+        `<td>${it.stretch_pct>0?'+':''}${it.stretch_pct}%</td><td>${it.closest_stretch_pct}%</td>`+
+        `<td>${it.max_retrace_pct_of_stretch}%</td><td>${it.touched?'да':'нет'}</td>`+
+        `<td>${timeToTouch}</td><td>${status}</td><td>${fmtAgo(it.ts)}</td>`;
+      tbody.appendChild(tr);
+    }
+  }catch(e){ statusEl.innerText = 'Ошибка загрузки'; }
+}
+
+loadSummary();
+loadRaw();
+setInterval(loadRaw, 30000);
+</script></body></html>"""
+
+
 WEEKLY_EMA_BACKTEST_HTML_PAGE = """<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Weekly EMA Backtest</title>
@@ -9429,6 +9830,7 @@ tbody tr:hover{background:#1c2128}
   <a href="/ema" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#127968; Главная</a>
   <a href="/manual_scan" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128269; Ручной скан</a>
   <a href="/ema_diag" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128202; EMA Диагностика</a>
+  <a href="/ema_stretch" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128201; Отрыв от EMA</a>
   <a href="/pump_match" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#127919; Pump Match</a>
   <a href="/weekly_ema_backtest" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128200; Бэктест EMA</a>
 </div>
@@ -9623,6 +10025,7 @@ details summary{cursor:pointer;font-size:13px;color:#8b949e;margin-top:12px}
   <a href="/ema" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#127968; Главная</a>
   <a href="/manual_scan" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128269; Ручной скан</a>
   <a href="/ema_diag" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128202; EMA Диагностика</a>
+  <a href="/ema_stretch" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128201; Отрыв от EMA</a>
   <a href="/pump_match" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#127919; Pump Match</a>
   <a href="/weekly_ema_backtest" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128200; Бэктест EMA</a>
 </div>
@@ -10037,6 +10440,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
                        "summary": _diag_summary(), "records": items}
             body = json.dumps(payload, ensure_ascii=False, indent=2).encode()
             fname = f"ema_diagnostics_{time.strftime('%Y%m%d_%H%M')}.json"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
+            self.send_header("Content-Length", len(body))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/ema_stretch" or self.path == "/ema_stretch.html":
+            body = EMA_STRETCH_HTML_PAGE.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", len(body))
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/ema_stretch_status":
+            with _stretch_diag_lock:
+                items = list(_stretch_diag_records)
+            self._json({"summary": _stretch_diag_summary(), "count": len(items),
+                        "recent": items[-100:]})
+        elif self.path == "/ema_stretch_export":
+            with _stretch_diag_lock:
+                items = list(_stretch_diag_records)
+            payload = {"exported_at": int(time.time()), "count": len(items),
+                       "summary": _stretch_diag_summary(), "records": items}
+            body = json.dumps(payload, ensure_ascii=False, indent=2).encode()
+            fname = f"ema_stretch_diag_{time.strftime('%Y%m%d_%H%M')}.json"
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
@@ -10466,6 +10895,7 @@ def main():
     _migrate_open_signals_to_fixed_take()
     _load_scan_settings()
     _diag_load()
+    _stretch_diag_load()
     threading.Thread(target=_watchdog_loop, daemon=True).start()
     threading.Thread(target=_telegram_sender_worker, daemon=True).start()
     threading.Thread(target=_heartbeat_loop, daemon=True).start()
@@ -10479,6 +10909,8 @@ def main():
     threading.Thread(target=_slow_impulse_scan_loop, daemon=True).start()
     threading.Thread(target=_diag_scan_loop, daemon=True).start()
     threading.Thread(target=_diag_track_loop, daemon=True).start()
+    threading.Thread(target=_stretch_diag_scan_loop, daemon=True).start()
+    threading.Thread(target=_stretch_diag_track_loop, daemon=True).start()
     # v0.30.47: по прямому запросу — убрано всё лишнее относительно цели
     # "скопировать его бота". Проверено по ВСЕМ собранным сравнениям: ни
     # один из его 22+ сигналов ни разу не пришёл через памп/дамп или
