@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.51 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.52 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.52: по прямому уточнению — "Отрыв от EMA" (v0.30.51) ловил оба
+  направления симметрично (вверх/вниз). Нужно было только вверх (цена
+  выше EMA) → откат вниз к EMA. Убрано отслеживание отрыва вниз.
 - v0.30.51: по прямому запросу — новая кнопка "Отрыв от EMA" (/ema_stretch).
   Отдельный, независимый от EMA Diagnostics/slow_impulse движок: триггер —
   ОТРЫВ цены от короткой EMA (5/10/20) на закрытии свечи на ≥1%, ТФ
@@ -1485,7 +1488,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.51"
+APP_VERSION  = "0.30.52"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -8323,7 +8326,7 @@ def _diag_summary(min_touches=3):
 STRETCH_DIAG_PERIODS = [5, 10, 20]
 STRETCH_DIAG_TIMEFRAMES = ["15m", "30m", "1h", "4h"]
 STRETCH_DIAG_FETCH_DAYS = {"15m": 10, "30m": 15, "1h": 30, "4h": 60}
-STRETCH_DIAG_MIN_PCT = 1.0          # минимальный % отрыва, чтобы вообще зафиксировать событие — иначе шум почти на каждой свече
+STRETCH_DIAG_MIN_PCT = 1.0          # минимальный % отрыва ВВЕРХ от EMA, чтобы зафиксировать событие (v0.30.52: только вверх, см. _stretch_check_symbol) — иначе шум почти на каждой свече
 STRETCH_DIAG_TOUCH_TOL_PCT = 0.1    # ближе этого к EMA (или пересечение на другую сторону) считается "коснулась снова"
 STRETCH_DIAG_SCAN_POLL_SEC = 180    # почаще обычного — самый быстрый ТФ (15м) требует нередкого опроса, не пропустить момент отрыва
 STRETCH_DIAG_TRACK_POLL_SEC = 60
@@ -8388,7 +8391,7 @@ def _stretch_check_symbol(symbol, tf):
         if not ema_now:
             continue
         stretch_pct = (live_price - ema_now) / ema_now * 100.0
-        if abs(stretch_pct) < STRETCH_DIAG_MIN_PCT:
+        if stretch_pct < STRETCH_DIAG_MIN_PCT:   # v0.30.52: по прямому запросу — только отрыв ВВЕРХ (цена выше EMA), ожидаем падение к EMA обратно. Отрыв вниз (price < ema) больше не фиксируем — раньше ловили оба направления симметрично
             continue
         out.append({
             "id": f"{symbol}|{tf}|{period}|{int(now)}",
@@ -9700,7 +9703,7 @@ select,input{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-ra
 </div>
 
 <h1>&#128201; Отрыв от EMA — сколько в среднем откатывает</h1>
-<p style="color:#8b949e;font-size:13px;max-width:520px">Триггер — отрыв цены от короткой EMA (5/10/20) на ЗАКРЫТИИ свечи, ≥1%, на ТФ 15м/30м/1h/4h. Дальше следим ЛИБО до касания той же EMA обратно, ЛИБО до таймаута (свой на каждый ТФ) — и считаем % отката от исходного отрыва (100% = полностью коснулась). Сводка разбита ещё и по величине самого отрыва (1-3% / 3-6% / 6%+), чтобы видеть, растёт ли шанс отката вместе с силой отрыва.</p>
+<p style="color:#8b949e;font-size:13px;max-width:520px">Триггер — отрыв цены ВВЕРХ от короткой EMA (5/10/20) на ЗАКРЫТИИ свечи, ≥1%, на ТФ 15м/30м/1h/4h (только вверх — ожидаем падение к EMA обратно, отрыв вниз не отслеживается). Дальше следим ЛИБО до касания той же EMA обратно, ЛИБО до таймаута (свой на каждый ТФ) — и считаем % отката от исходного отрыва (100% = полностью коснулась). Сводка разбита ещё и по величине самого отрыва (1-3% / 3-6% / 6%+), чтобы видеть, растёт ли шанс отката вместе с силой отрыва.</p>
 
 <div class="section-card">
   <div class="section-head">
