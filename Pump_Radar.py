@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.68 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.69 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.69: по прямому запросу — "отсеивать монеты, где супер неликвид".
+  Две новых проверки в _stretch_get_closed_ctx (до любых расчётов): (1)
+  цена стоит на месте последние 8 закрытых баров (диапазон <0.02%) —
+  почти наверняка мёртвая котировка, не настоящий отрыв; (2) разрыв между
+  соседними барами больше 1.5×ожидаемого интервала (свеча не смогла
+  закрыться, потому что сделок не было вообще) — тонкий рынок, дыры в
+  истории. Обе переиспользуют тот же механизм, что и "недостаточно
+  истории" (кэшируется как insufficient, перепроверяется через
+  EMA_TOUCH_INSUFFICIENT_HISTORY_RECHECK_SEC) — хорошо сочетается с
+  фильтром "не проверять раньше срока" из v0.30.68, лишние проверки не
+  добавляются.
 - v0.30.68: по прямому возражению — "тогда почти все сигналы будут
   исключены, это не решение" (справедливо: реальная медиана задержки на
   15m — 5.1 мин, порог в 3-5 мин резал бы 50-89% сигналов). Убрал идею
@@ -1665,7 +1676,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.68"
+APP_VERSION  = "0.30.69"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -8711,6 +8722,34 @@ _stretch_diag_ctx_cache = {}
 _stretch_diag_ctx_cache_lock = threading.Lock()
 
 
+STRETCH_LIQUIDITY_FLAT_BARS = 8         # v0.30.69: по прямому запросу — если цена не двигалась вообще последние N закрытых баров, это явный признак отсутствия реальной торговли (даже если формальный объём не нулевой) — не настоящий "отрыв", а мёртвая котировка
+STRETCH_LIQUIDITY_FLAT_TOL_PCT = 0.02   # допуск на "почти одинаковую" цену — 0.02% это практически ноль движения
+STRETCH_LIQUIDITY_GAP_CHECK_BARS = 30   # сколько последних баров смотрим на предмет пропусков по времени
+STRETCH_LIQUIDITY_GAP_MULT = 1.5        # разрыв между соседними барами больше interval×это — считаем дырой (биржа не смогла закрыть свечу, сделок не было вообще)
+
+
+def _stretch_liquidity_issue(candles, tf):
+    """Возвращает текст причины, если монета выглядит неликвидной, иначе
+    None. Две независимые проверки: (1) цена стоит на месте несколько
+    баров подряд — почти наверняка мёртвый рынок, а не реальный отрыв;
+    (2) большие временные разрывы между соседними барами — тонкий рынок,
+    дыры в истории торгов."""
+    if len(candles) < STRETCH_LIQUIDITY_FLAT_BARS:
+        return None
+    tail = candles[-STRETCH_LIQUIDITY_FLAT_BARS:]
+    closes_tail = [c["close"] for c in tail]
+    lo, hi = min(closes_tail), max(closes_tail)
+    if lo > 0 and (hi - lo) / lo * 100 < STRETCH_LIQUIDITY_FLAT_TOL_PCT:
+        return f"цена стоит на месте последние {STRETCH_LIQUIDITY_FLAT_BARS} баров (диапазон {(hi - lo) / lo * 100:.4f}%)"
+    interval_sec = TF_SECONDS.get(tf, 900)
+    gap_window = candles[-STRETCH_LIQUIDITY_GAP_CHECK_BARS:]
+    for a, b in zip(gap_window, gap_window[1:]):
+        gap = b["t"] - a["t"]
+        if gap > interval_sec * STRETCH_LIQUIDITY_GAP_MULT:
+            return f"разрыв {gap / 60:.0f} мин между свечами (ожидалось {interval_sec / 60:.0f} мин)"
+    return None
+
+
 def _stretch_get_closed_ctx(symbol, tf):
     """Аналог _diag_get_closed_ctx, но свои периоды (5/10/20) и свой кэш —
     не пересчитывает EMA7/14/28, которые тут не нужны."""
@@ -8724,6 +8763,12 @@ def _stretch_get_closed_ctx(symbol, tf):
     candles = _fetch_candles(symbol, tf, fetch_days)
     min_bars = max(STRETCH_DIAG_PERIODS) + 5
     if len(candles) < min_bars:
+        with _stretch_diag_ctx_cache_lock:
+            _stretch_diag_ctx_cache[key] = {"insufficient": True,
+                                             "next_close_t": now + EMA_TOUCH_INSUFFICIENT_HISTORY_RECHECK_SEC}
+        return None
+    liquidity_issue = _stretch_liquidity_issue(candles, tf)
+    if liquidity_issue:
         with _stretch_diag_ctx_cache_lock:
             _stretch_diag_ctx_cache[key] = {"insufficient": True,
                                              "next_close_t": now + EMA_TOUCH_INSUFFICIENT_HISTORY_RECHECK_SEC}
