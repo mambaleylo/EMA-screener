@@ -1,7 +1,29 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.49 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.50 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.50: перевёл slow_impulse с недельного ТФ на часовой (SLOW_IMPULSE_TF
+  = "1h") — по находке v0.30.49: единственный ТФ, где во всех 3 периодах
+  avg_mfe>avg_mae в своей диагностике. По пути нашёл и починил реальный
+  баг в _ema_touch_get_closed_ctx — функция ВСЕГДА фетчила ДНЕВНЫЕ свечи и
+  для любого tf кроме "1w" просто использовала их как есть (не ресемплила
+  и не фетчила нужный интервал) — то есть при простой смене tf="1h" код
+  молча посчитал бы EMA/ATR по дневным барам, выдавая их за часовые.
+  Теперь для tf не "1w"/"1d" фетчится РЕАЛЬНЫЙ нативный интервал через
+  Gate.io API (уже используется в других местах, напр. поиск аномалий).
+  Заодно поправил interval_sec для кэша (был захардкожен на 86400 сек для
+  всего, кроме 1w — контекст обновлялся бы раз в сутки вместо раза в час).
+  Take/stop пересчитаны под часовой масштаб (EMA_TOUCH_TAKE_FIXED_PCT=1.8%,
+  EMA_TOUCH_STOP_FIXED_PCT=1.5%, RR=1.2 — по avg_mfe/avg_mae на 1h).
+  Кулдаун — новый SLOW_IMPULSE_TOUCH_COOLDOWN_SEC=4ч (старые 24ч были под
+  недельные бары, для часовых неоправданно редко) — не откалиброван по
+  диагностике, осторожный компромисс, можно пересмотреть по факту.
+  Известный нерешённый вопрос: гейт по аномалии объёма (14-30 дней
+  lookback) был откалиброван под НЕДЕЛЬНЫЙ масштаб (искали "было ли
+  когда-нибудь давление продаж" за пару недель до недельного касания) —
+  для часового сетапа это может быть слишком широкое окно (почти всегда
+  найдётся хоть один всплеск за 30 дней). Не трогаю сейчас — сначала
+  смотрим, что реально даёт часовой ТФ на практике, потом пересматриваем.
 - v0.30.49: перестали гнаться исключительно за копированием референс-бота,
   посчитали свою статистику. Реальная находка #1 — RR: по всем 200 живым
   сигналам медианный RR оказался 0.103 (ни одного ≥0.5!) — стоп ATR-based
@@ -1451,7 +1473,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.49"
+APP_VERSION  = "0.30.50"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3595,7 +3617,7 @@ details[open] summary:before{content:"▾ "}
 </div>
 
 <h1>&#128225; Pump Radar <span style="font-size:12px;color:#8b949e;font-weight:normal">v__APP_VERSION__</span></h1>
-<p style="color:#8b949e;font-size:13px;max-width:480px">Ищет недельные касания EMA(7/14/28) с гейтом по распродажной аномалии объёма — цель: повторить сигналы стороннего референс-бота. Памп/дамп-детектор и Volume Peak Watcher отключены (ни разу не совпали с его сигналами за всё время сравнения) — код остался в файле, просто не запускается.</p>
+<p style="color:#8b949e;font-size:13px;max-width:480px">Ищет часовые касания EMA(7/14/28) с гейтом по распродажной аномалии объёма — своя стратегия, откалиброванная по собственной диагностике (часовой ТФ показал реальный edge: avg MFE>avg MAE во всех 3 периодах, в отличие от недельного). Памп/дамп-детектор и Volume Peak Watcher отключены — код остался в файле, просто не запускается.</p>
 <button onclick="openAlertSettings()" style="background:#21262d;border:1px solid #30363d">&#128276; Алерты</button>
 <a href="/pump_match" style="text-decoration:none"><button style="background:#8250df">&#127919; Pump Match (подбор параметров отрисовки)</button></a>
 <a href="/weekly_ema_backtest" style="text-decoration:none"><button style="background:#8250df">&#128202; Weekly EMA Backtest</button></a>
@@ -5985,7 +6007,7 @@ def _manual_symbol_scan(symbol, at_ts=None, side=None, ref_entry=None, ref_stop=
         result["live_engine_check"] = {"note": "не считается для исторического скана (at_ts задан)"}
     else:
         try:
-            live_touches = _ema_touch_check_symbol(symbol, "1w")
+            live_touches = _ema_touch_check_symbol(symbol, SLOW_IMPULSE_TF)
             live_out = []
             max_z = None
             for tf_a in MANUAL_SCAN_TIMEFRAMES:
@@ -5999,10 +6021,10 @@ def _manual_symbol_scan(symbol, at_ts=None, side=None, ref_entry=None, ref_stop=
             vol24 = (result["contract"] or {}).get("volume_24h_usd")
             volume_ok = vol24 is not None and SLOW_IMPULSE_MIN_VOLUME_USD <= vol24 <= SLOW_IMPULSE_MAX_VOLUME_USD
             for t in live_touches:
-                k = f"{symbol}|1w|{t['period']}"
+                k = f"{symbol}|{SLOW_IMPULSE_TF}|{t['period']}"
                 with _weekly_ema_touch_lock:
                     last_fire = _weekly_ema_touch_state.get(k, 0)
-                cooldown_left = max(0, round(WEEKLY_EMA_TOUCH_COOLDOWN_SEC - (time.time() - last_fire)))
+                cooldown_left = max(0, round(SLOW_IMPULSE_TOUCH_COOLDOWN_SEC - (time.time() - last_fire)))
                 live_out.append({"period": t["period"], "dist_atr": t["dist_atr"],
                                   "side": t["side"], "classic_bias": t["classic_bias"],
                                   "cooldown_remaining_sec": cooldown_left})
@@ -6613,9 +6635,11 @@ WEEKLY_EMA_TOUCH_ATR = 0.25       # тот же допуск касания на
 # точные цифры — мы не знаем их формулу, ATR-based даёт масштаб под
 # конкретную волатильность монеты вместо фиксированного % для всех.
 EMA_TOUCH_STOP_ATR_MULT = 1.5     # УСТАРЕЛО с v0.30.49, оставлено только как исторический дефолт для старых записей — см. EMA_TOUCH_STOP_FIXED_PCT
-EMA_TOUCH_STOP_FIXED_PCT = 3.0     # v0.30.49: реальная находка — ATR-based стоп на недельном ТФ давал медианный RR=0.103 по всем 200 живым сигналам (ни одного ≥0.5!) — недельный ATR на волатильных альтах сам по себе огромный (стоп улетал на 30-70%+ от входа), при таком RR брейкивен требует ~90%+ винрейта, а по своей же диагностике (ema_diagnostics) bounce_rate на 1w — 36-43%. Заменено на фикс. % (по образцу тейка) — своя находка, не копирование (стоп референс-бота ни разу не был виден). Калибровано по своей диагностике: median_mae_pct на 1w — 0.77-1.07% в зависимости от периода (avg_mae 1.7-2.2%, распределение с хвостом), 3% — с запасом выше медианы, но заметно уже старого ATR-based. RR = 4.5/3 = 1.5
+EMA_TOUCH_STOP_FIXED_PCT = 1.5     # v0.30.50: пересчитано под ЧАСОВОЙ масштаб (см. SLOW_IMPULSE_TF ниже) — калибровано по своей диагностике: avg_mae на 1h — 1.41-1.64% по трём периодам (median 0.64-0.76%, использую avg, не median — важно среднее ожидание, не типичная сделка). Старое значение 3.0% было откалибровано под НЕДЕЛЬНЫЙ масштаб (v0.30.49) — на часовом это было бы неоправданно широко
 EMA_TOUCH_RR = 1.5                # тейк = стоп-дистанция × RR в прибыльную сторону — v0.30.39: больше не используется для расчёта тейка (см. EMA_TOUCH_TAKE_FIXED_PCT), оставлен только как исторический дефолт для старых записей без rr
-EMA_TOUCH_TAKE_FIXED_PCT = 4.5    # v0.30.39: подтверждено на 23 чистых наблюдениях внешнего референс-бота (4.499%-4.503% от входа, практически идеально, не совпадение) — тейк у него ВСЕГДА фиксированный % от входа, не ATR-based, как было у нас. Стоп остаётся ATR-based — данных на его стоп нет вообще (ref_stop ни разу не был виден на скринах)
+EMA_TOUCH_TAKE_FIXED_PCT = 1.8    # v0.30.50: пересчитано под часовой масштаб — avg_mfe на 1h 1.76-1.84% по трём периодам. RR = 1.8/1.5 = 1.2. Старое значение 4.5% было калибровано под недельный тейк референс-бота (v0.30.39) — больше не актуально, переходим на свою, часовую стратегию
+SLOW_IMPULSE_TF = "1h"            # v0.30.50: реальная находка по своей диагностике (ema_diagnostics, 8180 касаний) — недельный ТФ (все 3 периода) статистически ХУДШИЙ, avg_mae>avg_mfe везде; часовой — ЕДИНСТВЕННЫЙ ТФ, где во всех 3 периодах avg_mfe>avg_mae (1h p7: 1.84>1.41, p14: 1.78>1.43, p28: 1.76>1.64, bounce_rate 40-44%, n=604-855 — приличная выборка). Больше не гонимся исключительно за копированием референс-бота (он был на 1w) — переходим на то, что показывает реальный edge в своих же данных
+SLOW_IMPULSE_TOUCH_COOLDOWN_SEC = 4 * 3600   # v0.30.50: старый WEEKLY_EMA_TOUCH_COOLDOWN_SEC=24ч был откалиброван под недельные бары — на часовых это неоправданно редко (пропустим много валидных повторных касаний). Диагностика не даёт готового ответа на "какой кулдаун оптимален" — 4ч осторожный компромисс (не спамить на каждый час, но не пропускать сутки), можно потом пересмотреть по реальным исходам
 VOL_RATIO_CONFIDENCE_THRESHOLD = 1.2   # v0.30.8: порог из диагностики (5000 записей) — выше него отскок заметно надёжнее
 # v0.11.0: раньше опрос был раз в 30 минут — по прямому фидбеку со скрина
 # ("сигнал приходит не тогда, когда надо, цена уже упала") это было СЛИШКОМ
@@ -6630,6 +6654,7 @@ WEEKLY_EMA_SCAN_POLL_SEC = 60     # раз в минуту — дорогая ч
 WEEKLY_EMA_SCAN_TOP_N = 100
 WEEKLY_EMA_FETCH_DAYS = 400       # с запасом под EMA28 на неделях (~28 недель=196 дней) + история ATR
 DAILY_EMA_FETCH_DAYS = 120        # с запасом под EMA28 на днях (28 дней) + история ATR — намного короче
+SLOW_IMPULSE_HOURLY_FETCH_DAYS = 30   # v0.30.50: с запасом под EMA28 на часах (28ч=~1.2дня) + стабильный ATR(14) — 30 дней = 720 часовых баров, разумный компромисс между качеством EMA и объёмом фетча (Gate.io отдаёт до 999 баров за запрос)
 WEEKLY_EMA_TOUCH_COOLDOWN_SEC = 24 * 3600   # недельный ТФ: не спамить чаще раза в сутки по той же связке
 DAILY_EMA_TOUCH_COOLDOWN_SEC = 8 * 3600     # дневной ТФ движется быстрее — кулдаун короче
 EMA_TOUCH_TIMEFRAMES = ["1w", "1d"]         # какие ТФ сканирует live-вотчер
@@ -6756,9 +6781,21 @@ def _ema_touch_get_closed_ctx(symbol, tf):
         cached = _ema_touch_ctx_cache.get(key)
     if cached and now < cached["next_close_t"]:
         return None if cached.get("insufficient") else cached
-    fetch_days = WEEKLY_EMA_FETCH_DAYS if tf == "1w" else DAILY_EMA_FETCH_DAYS
-    raw = _fetch_candles(symbol, "1d", fetch_days)
-    candles = _resample_to_weekly(raw) if tf == "1w" else raw
+    fetch_days = WEEKLY_EMA_FETCH_DAYS if tf == "1w" else (SLOW_IMPULSE_HOURLY_FETCH_DAYS if tf == "1h" else DAILY_EMA_FETCH_DAYS)
+    # v0.30.50: реальный баг — тут ВСЕГДА тянулись ДНЕВНЫЕ свечи
+    # (_fetch_candles(symbol, "1d", ...)), а для любого tf, кроме "1w"
+    # (ресемпл), просто использовались как есть — то есть при переходе
+    # slow_impulse на "1h" код бы молча посчитал EMA/ATR по ДНЕВНЫМ барам,
+    # выдавая их за часовые. Gate.io API и так поддерживает нативный
+    # интервал "1h" (используется в других местах, напр. поиск аномалий
+    # объёма) — просто нужно было фетчить ЕГО, а не подменять.
+    if tf == "1w":
+        raw = _fetch_candles(symbol, "1d", fetch_days)
+        candles = _resample_to_weekly(raw)
+    elif tf == "1d":
+        candles = _fetch_candles(symbol, "1d", fetch_days)
+    else:
+        candles = _fetch_candles(symbol, tf, fetch_days)   # нативный фетч этого интервала (1h и т.п.)
     min_bars = max(WEEKLY_EMA_PERIODS) + 5
     if len(candles) < min_bars:
         with _ema_touch_ctx_lock:
@@ -6780,7 +6817,7 @@ def _ema_touch_get_closed_ctx(symbol, tf):
     ema_arrays = {p: _ema(closes, p) for p in WEEKLY_EMA_PERIODS}
     if any(arr[i] is None for arr in ema_arrays.values()):
         return None
-    interval_sec = 86400 * 7 if tf == "1w" else 86400
+    interval_sec = 86400 * 7 if tf == "1w" else TF_SECONDS.get(tf, 86400)   # v0.30.50: было 86400 (сутки) для ВСЕГО не-1w, включая часовой — контекст обновлялся бы раз в сутки вместо раза в час
     ctx = {"candles": candles, "closes": closes, "atr_v": atr_v, "i": i,
            "ema_arrays": ema_arrays, "next_close_t": candles[i]["t"] + interval_sec + 5}
     with _ema_touch_ctx_lock:
@@ -7263,7 +7300,7 @@ def _slow_impulse_maybe_trigger_ema_signal(symbol):
     прошли), момент — нет. Убран как БЛОКИРУЮЩИЙ фильтр, оставлен только
     как информационная пометка в тексте алерта, когда он есть."""
     try:
-        ctx = _ema_touch_get_closed_ctx(symbol, "1w")
+        ctx = _ema_touch_get_closed_ctx(symbol, SLOW_IMPULSE_TF)
     except Exception as e:
         olog(f"[slow_impulse] {symbol}: ошибка получения контекста: {_explain_error(e)}")
         return
@@ -7271,7 +7308,7 @@ def _slow_impulse_maybe_trigger_ema_signal(symbol):
         return
     weekly_chg = _weekly_chg_7bar_pct(ctx)
     try:
-        touches = _ema_touch_check_symbol(symbol, "1w")
+        touches = _ema_touch_check_symbol(symbol, SLOW_IMPULSE_TF)
     except Exception as e:
         olog(f"[slow_impulse] {symbol}: ошибка проверки касания: {_explain_error(e)}")
         return
@@ -7286,12 +7323,12 @@ def _slow_impulse_maybe_trigger_ema_signal(symbol):
     # уровню. Теперь берём только САМОЕ БЛИЗКОЕ касание (наименьший
     # dist_atr), не все подряд.
     touch = min(touches, key=lambda t: t.get("dist_atr", 999))
-    key = f"{symbol}|1w|{touch['period']}"
+    key = f"{symbol}|{touch['tf']}|{touch['period']}"
     with _weekly_ema_touch_lock:
         last = _weekly_ema_touch_state.get(key, 0)
-    if now - last < WEEKLY_EMA_TOUCH_COOLDOWN_SEC:
+    if now - last < SLOW_IMPULSE_TOUCH_COOLDOWN_SEC:
         _slow_impulse_append_diag(touch, outcome="skipped_cooldown",
-                                   cooldown_remaining_sec=round(WEEKLY_EMA_TOUCH_COOLDOWN_SEC - (now - last)),
+                                   cooldown_remaining_sec=round(SLOW_IMPULSE_TOUCH_COOLDOWN_SEC - (now - last)),
                                    anomaly_z=None, anomaly_count=None, weekly_chg=weekly_chg)
         return
     max_anomaly_z = None
@@ -7316,7 +7353,7 @@ def _slow_impulse_maybe_trigger_ema_signal(symbol):
             return
     note_parts = []
     if weekly_chg is not None:
-        note_parts.append(f"накопленное движение за 7 недельных баров: {weekly_chg:+.1f}%")
+        note_parts.append(f"накопленное движение за 7 баров ({SLOW_IMPULSE_TF}): {weekly_chg:+.1f}%")
     if max_anomaly_z is not None:
         note_parts.append(f"распродажная аномалия объёма z={max_anomaly_z}")
     note = "; ".join(note_parts) if note_parts else None
@@ -7326,7 +7363,7 @@ def _slow_impulse_maybe_trigger_ema_signal(symbol):
     with _weekly_ema_touch_lock:
         _weekly_ema_touch_state[key] = now
     chg_txt = f"{weekly_chg:+.1f}%" if weekly_chg is not None else "н/д"
-    olog(f"[slow_impulse] {symbol}: недельная EMA{touch['period']} (ближайшая, накопленное "
+    olog(f"[slow_impulse] {symbol}: {SLOW_IMPULSE_TF} EMA{touch['period']} (ближайшая, накопленное "
          f"движение {chg_txt}) — сигнал отправлен")
 
 
