@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.70 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.71 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.71: по прямому вопросу "10 минут задержки, надо решать" — оба
+  сигнала (AIO_USDT/ZEST_USDT) пришли почти одновременно, оба с ~11мин
+  задержкой: явный признак затора именно в момент, когда ~700 15m-свечей
+  закрываются разом. Фильтр v0.30.68 убрал конкуренцию с 30m/1h/4h, но
+  сам всплеск в ~700 одновременных запросов остался — похоже, упирается
+  в rate limit Gate.io, и встроенный в _fetch_candles retry-with-sleep(5с)
+  превращает это в многоминутный затор. Вместо очередного подбора числа
+  потоков — честный ограничитель СКОРОСТИ запросов (не одновременности):
+  не больше 8 фетчей/сек суммарно по всем потокам. Всплеск в 700
+  запросов теперь займёт ~88 сек предсказуемо, без ретрай-штормов.
 - v0.30.70: реальный промах фильтра неликвида (v0.30.69), найден на живом
   примере RLS_USDT — паттерн "вперемешку мёртвые бары без объёма + редкий
   одиночный скачок" не ловился ни проверкой на плоскость (не ВСЕ
@@ -1685,7 +1695,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.70"
+APP_VERSION  = "0.30.71"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -8772,6 +8782,27 @@ def _stretch_liquidity_issue(candles, tf):
     return None
 
 
+STRETCH_RATE_LIMIT_PER_SEC = 8   # v0.30.71: по прямому вопросу "10 минут задержки, это надо решать" — оба сигнала (AIO/ZEST) пришли почти одновременно, оба с ~11мин задержкой: явный признак затора именно в момент, когда ~700 15m-свечей закрываются разом (фильтр v0.30.68 убрал конкуренцию с 30m/1h/4h, но сам всплеск в ~700 одновременных запросов остался и, похоже, упирается в rate limit Gate.io — retry-with-sleep в _fetch_candles превращает это в многоминутный затор). Вместо гадания с числом потоков — честный ограничитель СКОРОСТИ запросов (не одновременности): не больше N в секунду, независимо от того, сколько потоков "готовы". Всплеск в 700 запросов при этом займёт ~700/8≈88 сек предсказуемо, без ретрай-штормов, вместо непредсказуемых минут
+_stretch_rate_lock = threading.Lock()
+_stretch_rate_window = []   # временные метки недавних запросов (скользящее окно 1 секунда)
+
+
+def _stretch_rate_gate():
+    """Блокирует вызывающий поток, пока не освободится место в лимите
+    STRETCH_RATE_LIMIT_PER_SEC запросов/сек — общий для всех потоков
+    пула, не даёт всплеску одновременных задач превратиться в залп по
+    API разом."""
+    while True:
+        with _stretch_rate_lock:
+            now = time.time()
+            while _stretch_rate_window and _stretch_rate_window[0] < now - 1.0:
+                _stretch_rate_window.pop(0)
+            if len(_stretch_rate_window) < STRETCH_RATE_LIMIT_PER_SEC:
+                _stretch_rate_window.append(now)
+                return
+        time.sleep(0.05)
+
+
 def _stretch_get_closed_ctx(symbol, tf):
     """Аналог _diag_get_closed_ctx, но свои периоды (5/10/20) и свой кэш —
     не пересчитывает EMA7/14/28, которые тут не нужны."""
@@ -8781,6 +8812,7 @@ def _stretch_get_closed_ctx(symbol, tf):
         cached = _stretch_diag_ctx_cache.get(key)
     if cached and now < cached["next_close_t"]:
         return None if cached.get("insufficient") else cached
+    _stretch_rate_gate()
     fetch_days = STRETCH_DIAG_FETCH_DAYS.get(tf, 15)
     candles = _fetch_candles(symbol, tf, fetch_days)
     min_bars = max(STRETCH_DIAG_PERIODS) + 5
