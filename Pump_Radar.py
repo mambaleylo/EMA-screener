@@ -1,7 +1,20 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.47 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.48 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.48: по скриншоту — v0.30.47 остановила фоновые циклы, но забыл
+  панели на странице настроек: переключатель "голых" сигналов
+  (памп/дамп/аномалия без EMA), таблицы "Живые пампы"/"Живые дампы"/
+  "Аномальный объём продаж". Убрал весь блок из HTML + связанный JS
+  (loadPumpDumpToggle/togglePumpDumpAlerts, refreshPumps/refreshDumps/
+  refreshVolAnomaly и их setInterval-опрос, записи в CLEAR_ENDPOINTS) —
+  иначе JS падал бы на document.getElementById(null) при попытке
+  обновить несуществующие элементы (ловилось try/catch, но зря дёргало
+  /pump_status,/dump_status,/vol_anomaly_status каждые 8 сек без толку).
+  Таблица "Касания EMA7/14/28" (slow_impulse) и настройки алертов
+  (Telegram/ntfy, общие для slow_impulse) не тронуты. Backend-эндпоинты
+  (/pump_status и т.д.) оставлены как есть — не мешают, просто больше
+  никем не вызываются.
 - v0.30.47: по прямому запросу — убрано лишнее относительно цели
   "скопировать его бота". Проверено по ВСЕМ собранным сравнениям: ни
   один из его 22+ сигналов ни разу не пришёл через памп/дамп-детектор
@@ -1419,7 +1432,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.47"
+APP_VERSION  = "0.30.48"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3599,14 +3612,6 @@ details[open] summary:before{content:"▾ "}
   </div>
 </div>
 
-<div class="section-card" style="max-width:420px">
-  <label style="display:flex;gap:8px;align-items:center;font-size:13px;color:#c9d1d9;cursor:pointer">
-    <input type="checkbox" id="pumpDumpAlertsToggle" onchange="togglePumpDumpAlerts()" style="width:16px;height:16px">
-    Уведомления о "голых" сигналах (памп/дамп/аномалия объёма без EMA)
-  </label>
-  <p style="font-size:11px;color:#6e7681;margin:6px 0 0">v0.30.31: теперь охватывает и аномалию объёма тоже — приоритет "как у референс-бота": только сигналы, реально дошедшие до недельной EMA. Детект и проверка EMA-сигнала продолжают работать в фоне в любом случае (нужны для полноценных сигналов и для истории) — переключатель влияет только на отправку голого текста "Pump: X%"/"Dump: X%"/"после аномального объёма" без привязки к уровню.</p>
-  <span id="pumpDumpAlertsMsg" style="font-size:12px;color:#8b949e"></span>
-</div>
 <div id="status"></div>
 
 <div id="alertModal">
@@ -3631,40 +3636,7 @@ details[open] summary:before{content:"▾ "}
 
 <div class="section-card">
   <div class="section-head">
-    <h3>&#128293; Живые пампы</h3>
-    <div><a href="/pump_export" style="text-decoration:none"><button style="background:#21262d;border:1px solid #30363d;margin-right:6px">&#128190;</button></a><button onclick="clearHistory('pump')" class="btn-danger-sm">Очистить</button></div>
-  </div>
-  <div id="pumpSummary" class="summary-line">пока не было срабатываний</div>
-  <div class="table-scroll">
-    <table id="pumps"><thead><tr><th>Монета</th><th>%</th><th>База → сейчас</th><th>После сигнала</th><th>Когда</th></tr></thead><tbody></tbody></table>
-  </div>
-</div>
-
-<div class="section-card">
-  <div class="section-head">
-    <h3>&#128167; Живые дампы</h3>
-    <div><a href="/dump_export" style="text-decoration:none"><button style="background:#21262d;border:1px solid #30363d;margin-right:6px">&#128190;</button></a><button onclick="clearHistory('dump')" class="btn-danger-sm">Очистить</button></div>
-  </div>
-  <div id="dumpSummary" class="summary-line">пока не было срабатываний</div>
-  <div class="table-scroll">
-    <table id="dumps"><thead><tr><th>Монета</th><th>%</th><th>База → сейчас</th><th>После сигнала</th><th>Когда</th></tr></thead><tbody></tbody></table>
-  </div>
-</div>
-
-<div class="section-card">
-  <div class="section-head">
-    <h3>&#128300; Аномальный объём продаж</h3>
-    <div><a href="/vol_anomaly_export" style="text-decoration:none"><button style="background:#21262d;border:1px solid #30363d;margin-right:6px">&#128190;</button></a><button onclick="clearHistory('vol_anomaly')" class="btn-danger-sm">Очистить</button></div>
-  </div>
-  <div id="volAnomalySummary" class="summary-line">пока не было срабатываний</div>
-  <div class="table-scroll">
-    <table id="volAnomaly"><thead><tr><th>Монета</th><th>z-score</th><th>Объём</th><th>Уровень пика</th><th>Пик был</th><th>Цена сейчас</th><th>После сигнала</th><th>Когда</th></tr></thead><tbody></tbody></table>
-  </div>
-</div>
-
-<div class="section-card">
-  <div class="section-head">
-    <h3>&#128204; Касания EMA7/14/28 (триггер — памп/дамп/объём)</h3>
+    <h3>&#128204; Касания EMA7/14/28 (slow_impulse)</h3>
     <div><a href="/weekly_ema_export" style="text-decoration:none"><button style="background:#21262d;border:1px solid #30363d;margin-right:6px">&#128190;</button></a><button onclick="clearHistory('weekly_ema')" class="btn-danger-sm">Очистить</button></div>
   </div>
   <div id="sourceStatsBox" style="font-size:12px;color:#8b949e;margin-bottom:8px"></div>
@@ -3748,25 +3720,6 @@ async function saveScanSettings(){
 }
 loadScanSettings();
 
-async function loadPumpDumpToggle(){
-  try{
-    const r = await fetch('/alert_cfg'); const d = await r.json();
-    document.getElementById('pumpDumpAlertsToggle').checked = !!d.pump_dump_alerts_enabled;
-  }catch(e){}
-}
-async function togglePumpDumpAlerts(){
-  const msg = document.getElementById('pumpDumpAlertsMsg');
-  const checked = document.getElementById('pumpDumpAlertsToggle').checked;
-  try{
-    const r = await fetch('/alert_cfg', {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({pump_dump_alerts_enabled: checked})});
-    const d = await r.json();
-    msg.style.color = d.ok ? '#3fb950' : '#f85149';
-    msg.innerText = d.ok ? (checked ? 'Включено' : 'Отключено — детект и EMA-проверка продолжают работать в фоне') : 'Ошибка';
-  }catch(e){ msg.style.color = '#f85149'; msg.innerText = 'Ошибка запроса'; }
-}
-loadPumpDumpToggle();
-
 async function recheckHistory(){
   const msg = document.getElementById('recheckMsg');
   const symbol = document.getElementById('recheckSymbolInput').value.trim();
@@ -3845,9 +3798,6 @@ function fmtTrack(it){
 }
 
 const CLEAR_ENDPOINTS = {
-  pump: {url:'/pump_history_clear', label:'пампов', refresh:() => refreshPumps()},
-  dump: {url:'/dump_history_clear', label:'дампов', refresh:() => refreshDumps()},
-  vol_anomaly: {url:'/vol_anomaly_history_clear', label:'аномалий объёма', refresh:() => refreshVolAnomaly()},
   weekly_ema: {url:'/weekly_ema_history_clear', label:'EMA-сигналов (включая открытые)', refresh:() => refreshWeeklyEma()},
 };
 async function clearHistory(kind){
@@ -3857,58 +3807,6 @@ async function clearHistory(kind){
   try{
     await fetch(cfg.url, {method:'POST'});
     cfg.refresh();
-  }catch(e){}
-}
-
-async function refreshPumps(){
-  try{
-    const r = await fetch('/pump_status'); const d = await r.json();
-    const tbody = document.querySelector('#pumps tbody'); tbody.innerHTML = '';
-    const items = (d.recent || []).slice().reverse();
-    document.getElementById('pumpSummary').innerHTML = items.length
-      ? `отслеживается монет: <b>${d.tracked||0}</b> &nbsp;·&nbsp; сработало пампов: <b>${items.length}</b>`
-      : `отслеживается монет: <b>${d.tracked||0}</b> &nbsp;·&nbsp; пока не было срабатываний`;
-    for(const it of items.slice(0,50)){
-      const tr = document.createElement('tr');
-      tr.innerHTML = `<td>${it.symbol}</td><td class="long">+${it.pct}%</td><td>${it.base_price} -> ${it.last_price}</td><td>${fmtTrack(it)}</td><td>${fmtAgo(it.ts)}</td>`;
-      tbody.appendChild(tr);
-    }
-  }catch(e){}
-}
-
-async function refreshDumps(){
-  try{
-    const r = await fetch('/dump_status'); const d = await r.json();
-    const tbody = document.querySelector('#dumps tbody'); tbody.innerHTML = '';
-    const items = (d.recent || []).slice().reverse();
-    document.getElementById('dumpSummary').innerHTML = items.length
-      ? `отслеживается монет: <b>${d.tracked||0}</b> &nbsp;·&nbsp; сработало дампов: <b>${items.length}</b>`
-      : `отслеживается монет: <b>${d.tracked||0}</b> &nbsp;·&nbsp; пока не было срабатываний`;
-    for(const it of items.slice(0,50)){
-      const tr = document.createElement('tr');
-      tr.innerHTML = `<td>${it.symbol}</td><td style="color:#f85149">-${it.pct}%</td><td>${it.base_price} -> ${it.last_price}</td><td>${fmtTrack(it)}</td><td>${fmtAgo(it.ts)}</td>`;
-      tbody.appendChild(tr);
-    }
-  }catch(e){}
-}
-
-async function refreshVolAnomaly(){
-  try{
-    const [r, rw] = await Promise.all([fetch('/vol_anomaly_status'), fetch('/vol_peak_watchlist_status')]);
-    const d = await r.json();
-    const w = await rw.json();
-    const tbody = document.querySelector('#volAnomaly tbody'); tbody.innerHTML = '';
-    const items = (d.recent || []).slice().reverse();
-    const watchLine = w.total_watched
-      ? `отслеживается пиков: <b>${w.total_watched}</b> по <b>${w.coins}</b> монетам (ждём возврата цены)`
-      : 'сейчас нет отслеживаемых пиков';
-    document.getElementById('volAnomalySummary').innerHTML = (items.length ? `сработало: <b>${items.length}</b> &nbsp;·&nbsp; ` : '') + watchLine;
-    for(const it of items.slice(0,50)){
-      const tr = document.createElement('tr');
-      const peakAge = it.peak_age_min != null ? `${it.peak_age_min}м назад` : '—';
-      tr.innerHTML = `<td>${it.symbol}</td><td>${it.z}</td><td>${Math.round(it.vol)}</td><td>${it.peak_price ?? '—'}</td><td>${peakAge}</td><td>${it.price}</td><td>${fmtTrack(it)}</td><td>${fmtAgo(it.ts)}</td>`;
-      tbody.appendChild(tr);
-    }
   }catch(e){}
 }
 
@@ -3965,9 +3863,6 @@ async function pollPumpLogs(){
 }
 
 pollPumpLogs(); setInterval(pollPumpLogs, 4000);
-refreshPumps(); setInterval(refreshPumps, 8000);
-refreshDumps(); setInterval(refreshDumps, 8000);
-refreshVolAnomaly(); setInterval(refreshVolAnomaly, 8000);
 async function loadSourceStats(){
   try{
     const r = await fetch('/weekly_ema_source_stats'); const d = await r.json();
