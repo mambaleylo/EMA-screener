@@ -1,7 +1,32 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.91 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.92 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.92: по прямому запросу — автоторговля для "Отрыва от EMA", Long
+  или Short на выбор, % депозита на сделку, вход/стоп/тейк из самого
+  сигнала. Инфраструктура (подписанные запросы к Gate.io Futures,
+  расчёт размера позиции и плеча, market-вход, TP/SL price_orders,
+  ретраи, алерты на провал) уже была в файле от старой системы EMA
+  INVERT (_gate_open_position и вся цепочка вокруг неё) — просто не была
+  подключена к новому движку. Плечо теперь ФИКСИРОВАННОЕ (по памяти
+  проекта — план 10х), не выводится из %риска: risk_pct для
+  _gate_open_position вычисляется на лету как leverage×stop_pct, чтобы
+  формула round(risk_pct/stop_pct) детерминированно давала ровно
+  заданное плечо, независимо от того, у фейда стоп 0.5% или у
+  продолжения 1%. Автосделка открывается ТОЛЬКО когда алерт реально
+  отправлен (не подавлен фильтром устаревания v0.30.79) — не торгуем по
+  сигналу, который уже неактуален. Новый фоновый цикл
+  _stretch_autotrade_watch_loop следит за реально открытыми
+  live-позициями и шлёт алерт с настоящим PnL при закрытии (переиспользует
+  _check_position_closed_and_alert). Новая страница-панель на /ema_stretch:
+  режим (выкл/long/short), % депозита, плечо, вкл/выкл с подтверждением.
+  По умолчанию enabled=False — не активна без явного включения.
+  ⚠️ ВАЖНО: реальные деньги. Функции сигнатур/подписи Gate.io API уже
+  были в файле (предположительно рабочие, использовались старой
+  системой), но саму НОВУЮ цепочку (расчёт риск_pct под фикс. плечо,
+  gating по режиму/направлению, обработчики настроек) вживую против
+  Gate.io не проверял — нет доступа к их API из этой среды. Настоятельно
+  тестировать сначала с минимальным % депозита.
 - v0.30.91: по прямому вопросу "что можно добавить для лонга" — trend_pct
   (v0.30.90) уже собирается на обеих стратегиях, гипотеза для
   continuation обратная фейду (стретч ПОВЕРХ уже идущего тренда —
@@ -1910,7 +1935,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.91"
+APP_VERSION  = "0.30.92"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -9425,6 +9450,7 @@ def _stretch_diag_maybe_alert_top_combo(new_recs):
             _send_alert(msg)
         olog(f"[ema_stretch] {rec['symbol']} {top_tf} EMA{top_period} ({label}): "
              f"алерт по топ-связке отправлен (отрыв {rec['stretch_pct']:+.2f}%)")
+        _stretch_maybe_open_live_trade(rec)   # v0.30.92: по прямому запросу — автоторговля, только для сигналов, которые реально дошли до алерта
 
     for strategy, label in (("fade", "фейд"), ("continuation", "продолжение")):
         candidates = [e for e in summary if e.get("strategy", "fade") == strategy]
@@ -9471,6 +9497,121 @@ def _stretch_recent_1m_high_low(symbol):
     with _stretch_1m_cache_lock:
         _stretch_1m_cache[key] = (now, result)
     return result
+
+
+STRETCH_AUTOTRADE_CFG_FILE = os.path.expanduser("~/pumpradar_stretch_autotrade_cfg.json")
+_stretch_autotrade_lock = threading.Lock()
+_stretch_autotrade_state = {
+    "enabled": False,
+    "mode": "off",          # v0.30.92: по прямому запросу — "Long или Short на выбор". "off" | "long" | "short"
+    "position_pct": 3.0,    # % депозита (маржи) на одну сделку
+    "leverage": 10,         # v0.30.92: по памяти проекта — план торговать с фикс. 10х плечом; leverage передаётся не напрямую в _gate_open_position (та выводит плечо из risk_pct/sl_pct%), а через risk_pct = leverage × sl_pct, вычисляемый на лету под фактический стоп сигнала — так плечо получается ровно заданным независимо от того, у фейда стоп 0.5% или у продолжения 1%
+    "max_concurrent": None,
+}
+
+
+def _load_stretch_autotrade_cfg():
+    try:
+        with open(STRETCH_AUTOTRADE_CFG_FILE) as f:
+            saved = json.load(f)
+        with _stretch_autotrade_lock:
+            for k in ("enabled", "mode", "position_pct", "leverage", "max_concurrent"):
+                if k in saved:
+                    _stretch_autotrade_state[k] = saved[k]
+    except Exception:
+        pass
+
+
+def _save_stretch_autotrade_cfg():
+    try:
+        with _stretch_autotrade_lock:
+            snapshot = dict(_stretch_autotrade_state)
+        with open(STRETCH_AUTOTRADE_CFG_FILE, "w") as f:
+            json.dump(snapshot, f)
+    except Exception as e:
+        olog(f"[stretch_autotrade] ошибка сохранения настроек: {_explain_error(e)}")
+
+
+def _stretch_maybe_open_live_trade(rec):
+    """v0.30.92: по прямому запросу — "автоторговля для Long или Short на
+    выбор, тейки и стоп из сигнала". Переиспользует уже готовый
+    _gate_open_position (расчёт плеча/размера позиции, ретраи, TP/SL,
+    алерты на провал — весь этот код уже был в файле от старой системы
+    EMA INVERT, просто не был подключён к отрывам от EMA). Вызывается из
+    _stretch_diag_maybe_alert_top_combo — ТОЛЬКО когда алерт реально
+    отправлен (не подавлен фильтром устаревания), чтобы не торговать по
+    сигналу, который уже неактуален к моменту обработки."""
+    with _stretch_autotrade_lock:
+        if not _stretch_autotrade_state["enabled"]:
+            return
+        mode = _stretch_autotrade_state["mode"]
+        if mode == "off" or rec.get("direction") != mode:
+            return
+        position_pct = _stretch_autotrade_state["position_pct"]
+        leverage = _stretch_autotrade_state["leverage"]
+        max_c = _stretch_autotrade_state["max_concurrent"]
+    if not (GATE_KEY and GATE_SECRET):
+        olog(f"[stretch_autotrade] {rec['symbol']}: включено, но ключи Gate.io не настроены (/gate_cfg) — пропуск")
+        return
+    symbol = rec["symbol"]
+    contract = symbol.replace("/", "_").upper()
+    with _stretch_diag_lock:
+        live_open = [r for r in _stretch_diag_records if r.get("live") and not r.get("live_closed")]
+    if any(r["symbol"] == symbol for r in live_open):
+        olog(f"[stretch_autotrade] {symbol}: уже есть открытая live-позиция по этой монете — пропуск")
+        return
+    if max_c and len(live_open) >= max_c:
+        olog(f"[stretch_autotrade] лимит {max_c} одновр. live-позиций достигнут — пропуск {symbol}")
+        return
+    try:
+        existing = _gate_get_position(contract)
+    except Exception as e:
+        olog(f"[stretch_autotrade] {symbol}: не смог проверить биржу перед входом ({_explain_error(e)}) — пропуск на этот раз")
+        return
+    if existing:
+        olog(f"[stretch_autotrade] {symbol}: на бирже уже есть позиция вне нашего учёта — пропуск")
+        return
+    entry, stop, take = rec["entry"], rec["stop"], rec["take"]
+    sl_pct = abs(entry - stop) / entry * 100.0
+    risk_pct = leverage * sl_pct   # см. докстринг _stretch_autotrade_state["leverage"] — так выводится ровно заданное плечо
+    strat_label = "фейд" if rec.get("strategy") == "fade" else "продолжение"
+    pos_info = _gate_open_position(
+        symbol, rec["direction"], entry, stop, take, risk_pct,
+        position_pct=position_pct, label=f"STRETCH {strat_label}", text_prefix="stretch",
+    )
+    if not pos_info:
+        return
+    with _stretch_diag_lock:
+        rec["live"] = True
+        rec["live_size"] = pos_info.get("size")
+        rec["live_leverage"] = pos_info.get("leverage")
+        rec["live_notional"] = pos_info.get("notional")
+        rec["live_opened_at"] = int(time.time())
+    _stretch_diag_save()
+
+
+def _stretch_autotrade_watch_loop():
+    """Раз в минуту проверяет реально открытые live-позиции по отрывам от
+    EMA — если позиция на бирже закрылась (TP/SL сработал или закрыта
+    вручную), шлёт алерт с реальным PnL (переиспользует
+    _check_position_closed_and_alert, тот же код, что и у старой системы
+    EMA INVERT) и помечает запись как live_closed, чтобы не проверять
+    повторно."""
+    time.sleep(120)
+    while True:
+        try:
+            with _stretch_diag_lock:
+                live_open = [r for r in _stretch_diag_records if r.get("live") and not r.get("live_closed")]
+            for rec in live_open:
+                closed = _check_position_closed_and_alert(
+                    rec["symbol"], {"dir": rec["direction"], "entry": rec["entry"]})
+                if closed:
+                    with _stretch_diag_lock:
+                        rec["live_closed"] = True
+                    _stretch_diag_save()
+        except Exception as e:
+            olog(f"[stretch_autotrade] ошибка цикла проверки live-позиций: {_explain_error(e)}")
+        time.sleep(60)
 
 
 def _stretch_diag_track_loop():
@@ -10848,6 +10989,35 @@ select,input{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-ra
 <p style="color:#3fb950;font-size:12px;max-width:520px">С v0.30.67 это уже настоящий сигнал: Вход = цена триггера, Стоп = вход+2% (SHORT — цена ушла вверх, ждём падения), Тейк = уровень EMA. Исход (тейк/стоп/таймаут) считается в реальном порядке событий — если стоп задело раньше, чем цена дошла до EMA, это "stop", даже если ПОЗЖЕ цена всё равно дошла бы до цели (реальной позиции бы уже не было). Колонка "Винрейт тейк/стоп" — по этому честному исходу.</p>
 <p style="color:#58a6ff;font-size:12px;max-width:520px">С v0.30.83 — вторая, отдельная стратегия: "📈 продолжение" (LONG). Данные показали, что отрывы больше 2% почти никогда не откатываются до фиксированного стопа — это чаще реальный тренд, не перегрев. Для таких случаев теперь отдельный сигнал на продолжение импульса вместо фейда. Стоп 1% / тейк 2% (RR 2:1, узкий стоп — зеркально фейду, настоящий тренд не должен откатываться сильно) — ⚠️ экспериментально, НЕ откалибровано по своим историческим данным, копим статистику с нуля так же, как и с фейдом в своё время.</p>
 
+<div class="section-card" style="border:1px solid #f85149">
+  <h3 style="color:#f85149">&#9888;&#65039; Автоторговля (реальные деньги)</h3>
+  <p style="color:#8b949e;font-size:12px">Открывает настоящую позицию на Gate.io, когда алерт по топ-связке реально отправлен (не подавлен фильтром устаревания). Вход/стоп/тейк — из самого сигнала, плечо — фиксированное (задаётся ниже, по умолчанию 10х). Выключено по умолчанию — включай осознанно.</p>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0">
+    <label style="font-size:13px;color:#c9d1d9">Режим:
+      <select id="autoTradeMode" style="background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px">
+        <option value="off">Выкл</option>
+        <option value="long">Long (продолжение)</option>
+        <option value="short">Short (фейд)</option>
+      </select>
+    </label>
+    <label style="font-size:13px;color:#c9d1d9">% депозита на сделку:
+      <input type="number" id="autoTradePct" step="0.1" min="0.1" max="20" style="width:70px;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px">
+    </label>
+    <label style="font-size:13px;color:#c9d1d9">Плечо:
+      <input type="number" id="autoTradeLev" step="1" min="1" max="20" style="width:60px;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px">
+    </label>
+  </div>
+  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+    <label style="display:flex;gap:6px;align-items:center;font-size:13px;color:#c9d1d9;cursor:pointer">
+      <input type="checkbox" id="autoTradeEnabled" style="width:16px;height:16px">
+      Включить автоторговлю
+    </label>
+    <button onclick="saveAutoTradeSettings()">&#128190; Сохранить</button>
+  </div>
+  <div id="autoTradeStatus" style="font-size:12px;color:#8b949e;margin-top:6px"></div>
+  <div id="autoTradeLive" style="font-size:12px;margin-top:8px"></div>
+</div>
+
 <div class="section-card">
   <div class="section-head">
     <h3>&#128202; Сводка: какой ТФ/период откатывает лучше всего</h3>
@@ -10947,6 +11117,44 @@ async function clearStretchHistory(){
     else { alert('Не получилось очистить'); }
   }catch(e){ alert('Ошибка запроса'); }
 }
+
+async function loadAutoTradeSettings(){
+  const statusEl = document.getElementById('autoTradeStatus');
+  const liveEl = document.getElementById('autoTradeLive');
+  try{
+    const r = await fetch('/stretch_autotrade_settings'); const d = await r.json();
+    document.getElementById('autoTradeMode').value = d.mode || 'off';
+    document.getElementById('autoTradePct').value = d.position_pct ?? 3.0;
+    document.getElementById('autoTradeLev').value = d.leverage ?? 10;
+    document.getElementById('autoTradeEnabled').checked = !!d.enabled;
+    statusEl.style.color = d.gate_configured ? '#3fb950' : '#f85149';
+    statusEl.innerText = d.gate_configured ? 'Ключи Gate.io настроены' : 'Ключи Gate.io НЕ настроены (страница /gate_cfg) — включить нельзя';
+    const live = d.live_positions || [];
+    liveEl.innerHTML = live.length
+      ? '<b>Открытые live-позиции:</b><br>' + live.map(p =>
+          `${p.direction==='long'?'🟢':'🔴'} ${p.symbol} (${p.strategy}) вход ${p.entry}, ${p.size} контр, ${p.leverage}×, ~${p.notional}U`
+        ).join('<br>')
+      : 'Live-позиций сейчас нет';
+  }catch(e){ statusEl.innerText = 'Ошибка загрузки настроек'; }
+}
+
+async function saveAutoTradeSettings(){
+  const statusEl = document.getElementById('autoTradeStatus');
+  const mode = document.getElementById('autoTradeMode').value;
+  const pct = parseFloat(document.getElementById('autoTradePct').value);
+  const lev = parseInt(document.getElementById('autoTradeLev').value);
+  const enabled = document.getElementById('autoTradeEnabled').checked;
+  if(enabled && !confirm(`Точно включить автоторговлю? Режим: ${mode}, ${pct}% депозита на сделку, плечо ${lev}×. Это реальные деньги на Gate.io.`)) return;
+  try{
+    const r = await fetch('/stretch_autotrade_settings', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({mode, position_pct: pct, leverage: lev, enabled})});
+    const d = await r.json();
+    statusEl.style.color = d.ok ? '#3fb950' : '#f85149';
+    statusEl.innerText = d.ok ? 'Настройки сохранены' : (d.msg || 'Ошибка сохранения');
+    if(d.ok) loadAutoTradeSettings();
+  }catch(e){ statusEl.style.color = '#f85149'; statusEl.innerText = 'Ошибка запроса'; }
+}
+loadAutoTradeSettings();
 
 async function loadRaw(){
   const statusEl = document.getElementById('rawStatus');
@@ -11636,6 +11844,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json({"summary": _stretch_diag_summary(), "count": len(items),
                         "last_cycle_sec": _stretch_diag_last_cycle_sec,
                         "recent": items[-100:]})
+        elif self.path == "/stretch_autotrade_settings":
+            with _stretch_autotrade_lock:
+                cfg = dict(_stretch_autotrade_state)
+            with _stretch_diag_lock:
+                live_open = [r for r in _stretch_diag_records if r.get("live") and not r.get("live_closed")]
+            cfg["gate_configured"] = bool(GATE_KEY and GATE_SECRET)
+            cfg["live_positions"] = [{"symbol": r["symbol"], "direction": r["direction"],
+                                       "strategy": r.get("strategy"), "entry": r["entry"],
+                                       "size": r.get("live_size"), "leverage": r.get("live_leverage"),
+                                       "notional": r.get("live_notional"), "opened_at": r.get("live_opened_at")}
+                                      for r in live_open]
+            self._json(cfg)
         elif self.path == "/ema_stretch_export":
             with _stretch_diag_lock:
                 items = list(_stretch_diag_records)
@@ -11706,6 +11926,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception: pass
 
     def do_POST(self):
+        global GATE_KEY, GATE_SECRET   # v0.30.92: реальный синтаксис-баг, найден при компиляции — global должен идти раньше ЛЮБОГО упоминания имени по всей функции, не только в своём блоке; было раскидано по нескольким elif-веткам, теперь один раз в начале
         if self.path == "/pump_match_run":
             self._handle_pump_match_run()
             return
@@ -11810,6 +12031,52 @@ class Handler(http.server.BaseHTTPRequestHandler):
             _stretch_diag_save()
             olog("[ema_stretch] история отрывов от EMA очищена вручную")
             self._json({"ok": True})
+
+        elif self.path == "/stretch_autotrade_settings":
+            # v0.30.92: по прямому запросу — "автоторговля для Long или
+            # Short на выбор, % депозита на сделку, тейки/стоп из сигнала".
+            # Валидация нарочно строгая — это реальные деньги, ошибка в
+            # диапазоне значения может стоить дорого.
+            try:
+                errors = []
+                kwargs = {}
+                if "mode" in body:
+                    mode = str(body["mode"]).strip().lower()
+                    if mode not in ("off", "long", "short"):
+                        errors.append(f"mode: должно быть off/long/short, получено {mode!r}")
+                    else:
+                        kwargs["mode"] = mode
+                if "position_pct" in body:
+                    pct = float(body["position_pct"])
+                    if not (0.1 <= pct <= 20.0):
+                        errors.append(f"position_pct: {pct} вне разумного диапазона 0.1-20% (это % ДЕПОЗИТА на одну сделку)")
+                    else:
+                        kwargs["position_pct"] = pct
+                if "leverage" in body:
+                    lev = int(body["leverage"])
+                    if not (1 <= lev <= MAX_LEVERAGE):
+                        errors.append(f"leverage: {lev} вне диапазона 1-{MAX_LEVERAGE}")
+                    else:
+                        kwargs["leverage"] = lev
+                if "max_concurrent" in body:
+                    mc = body["max_concurrent"]
+                    kwargs["max_concurrent"] = int(mc) if mc not in (None, "") else None
+                if "enabled" in body:
+                    enabled = bool(body["enabled"])
+                    if enabled and not (GATE_KEY and GATE_SECRET):
+                        errors.append("нельзя включить — не настроены ключи Gate.io (страница /gate_cfg)")
+                    else:
+                        kwargs["enabled"] = enabled
+                if errors:
+                    self._json({"ok": False, "msg": "; ".join(errors)}); return
+                with _stretch_autotrade_lock:
+                    _stretch_autotrade_state.update(kwargs)
+                _save_stretch_autotrade_cfg()
+                olog(f"[stretch_autotrade] настройки обновлены: {kwargs}")
+                with _stretch_autotrade_lock:
+                    self._json({"ok": True, **_stretch_autotrade_state})
+            except (TypeError, ValueError) as e:
+                self._json({"ok": False, "msg": f"ошибка в значении: {_explain_error(e)}"})
 
         elif self.path == "/ema_diag_backfill_extended":
             # v0.30.16: по прямому вопросу — досчитать 12-часовые чекпоинты
@@ -11921,7 +12188,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self._json({"ok": True, "msg": "Скан запущен (топ-50, 3 ТФ x 4 EMA) — статус на /ema_dossier_status"})
 
         elif self.path == "/gate_cfg":
-            global GATE_KEY, GATE_SECRET
             GATE_KEY    = (body.get("gate_key")    or "").strip()
             GATE_SECRET = (body.get("gate_secret") or "").strip()
             _save_gate_cfg()
@@ -12084,6 +12350,7 @@ def main():
     _load_alert_cfg()
     _load_gate_cfg()
     _load_ema_auto_trade_cfg()
+    _load_stretch_autotrade_cfg()   # v0.30.92: по прямому запросу — автоторговля для отрывов от EMA, по умолчанию enabled=False/mode=off, не активна без явного включения через UI
     _load_pump_render_params()
     # v0.15.0: КРИТИЧНЫЙ фикс — раньше история EMA-сигналов подхватывалась
     # только внутри _weekly_ema_touch_loop; когда в v0.13.0 этот цикл
@@ -12113,6 +12380,7 @@ def main():
     threading.Thread(target=_diag_track_loop, daemon=True).start()
     threading.Thread(target=_stretch_diag_scan_loop, daemon=True).start()
     threading.Thread(target=_stretch_diag_track_loop, daemon=True).start()
+    threading.Thread(target=_stretch_autotrade_watch_loop, daemon=True).start()   # v0.30.92: наблюдает за реально открытыми live-позициями, шлёт алерт с реальным PnL при закрытии
     # v0.30.47: по прямому запросу — убрано всё лишнее относительно цели
     # "скопировать его бота". Проверено по ВСЕМ собранным сравнениям: ни
     # один из его 22+ сигналов ни разу не пришёл через памп/дамп или
