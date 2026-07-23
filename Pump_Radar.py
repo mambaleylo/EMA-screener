@@ -1,9 +1,27 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.81 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.83 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
-- v0.30.81: по прямому вопросу "лучший винрейт 55% мало для 1 к 2, что
-  делать" — разобрал реальный PnL по силе отрыва (979 решённых сигналов,
+- v0.30.83: по прямому запросу — потолок отрыва для алерта вернули
+  обратно на 2.0% (было временно занижено до 1.5 в v0.30.82), и добавлена
+  вторая, отдельная стратегия для отрывов больше потолка: "продолжение"
+  (LONG на импульс, а не SHORT на возврат к EMA) — раз данные показали,
+  что сильные отрывы почти всегда оказываются реальным трендом, имеет
+  смысл торговать это направление, а не просто отбрасывать сигнал.
+  ⚠️ Экспериментально — стоп 2%/тейк 4% (RR 2:1) НЕ откалиброваны по
+  историческим данным (своей статистики по продолжению ещё нет), это
+  стартовая прикидка. Реализация: новое поле "strategy" (fade/
+  continuation) на каждой записи, сводка теперь группируется по
+  (ТФ, период, стратегия) — не мешает фейд и продолжение в одну
+  статистику. Алерты идут отдельно по топ-связке КАЖДОЙ стратегии
+  параллельно. Трек-луп получил отдельную, более простую ветку для
+  continuation (чистый вход/стоп/тейк по цене, без EMA — там сама идея
+  не про возврат к уровню, а про движение дальше). Обновлены сводная и
+  сырая таблицы на странице (колонка "Стратегия"), чарт-рендерер и
+  подписи в Telegram — везде видно, какая это стратегия.
+- v0.30.82 (короткоживущая, тут же уточнена до отдельной стратегии
+  в v0.30.83): пробовал сузить потолок отрыва до 1.5% по прямому вопросу
+  "разделить на 1% и 2% отдельно" — разобрал реальный PnL по силе отрыва (979 решённых сигналов,
   все связки): 1-2%=винрейт 62%/средний PnL +0.07% (положительно), 2-3%=
   23%/-1.02%, 3-5%=14%/-1.19%, 5%+=2%/-1.86%. Чем сильнее исходный отрыв,
   тем реже цена откатывается ДО того, как заденет фиксированный стоп
@@ -1805,7 +1823,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.81"
+APP_VERSION  = "0.30.83"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -9010,6 +9028,7 @@ def _stretch_check_symbol(symbol, tf, submitted_ts=None):
             "debug_fetch_sec": ctx.get("_debug_fetch_sec"),           # сколько занял сам сетевой запрос к Gate.io
             "trigger_price": closed_price, "trigger_ema": _round_price(ema_closed),
             "entry": entry, "stop": stop, "take": take,
+            "strategy": "fade", "direction": "short",   # v0.30.83: явное поле — раньше стратегия была одна (фейд), теперь есть вторая (продолжение), нужно различать в сводке/ранжировании
             "stretch_pct": round(stretch_pct, 3), "side": "above" if stretch_pct > 0 else "below",
             "touched": False, "touched_at": None, "time_to_touch_sec": None,
             "closest_stretch_pct": round(stretch_pct, 3),
@@ -9019,6 +9038,39 @@ def _stretch_check_symbol(symbol, tf, submitted_ts=None):
             "last_checked_ts": int(now),
             "track_until": now + STRETCH_DIAG_TRACK_WINDOW_SEC.get(tf, 6 * 3600), "track_done": False,
         })
+        if stretch_pct > STRETCH_SIGNAL_MAX_PCT:
+            # v0.30.83: по прямому запросу — "силу отрыва больше 2% можно
+            # использовать как открытие сделки в другую сторону". Данные
+            # (979 решённых фейд-сигналов) показали: чем сильнее отрыв,
+            # тем реже цена откатывается к EMA до фиксированного стопа —
+            # сильные отрывы почти всегда оказываются реальным трендом.
+            # Это разворачивает тезис на 180° — не фейд (шорт на возврат),
+            # а продолжение (лонг на импульс). ВАЖНО: это НЕ проверено
+            # эмпирически — своих исторических данных по продолжению нет,
+            # цифры стоп/тейк ниже НАЧАЛЬНАЯ прикидка (RR 2:1 по аналогии
+            # с фейдом), не откалиброванный результат. Копим статистику
+            # с нуля, как и с фейдом в своё время.
+            c_entry = closed_price
+            c_stop = _round_price(c_entry * (1 - STRETCH_CONTINUATION_STOP_PCT / 100))
+            c_take = _round_price(c_entry * (1 + STRETCH_CONTINUATION_TAKE_PCT / 100))
+            out.append({
+                "id": f"{symbol}|{tf}|{period}|cont|{int(now)}",
+                "ts": int(now), "symbol": symbol, "tf": tf, "period": period,
+                "bar_close_ts": bar_close_ts,
+                "debug_queue_wait_sec": queue_wait_sec, "debug_submitted_ts": submitted_ts,
+                "debug_gate_wait_sec": ctx.get("_debug_gate_wait_sec"), "debug_fetch_sec": ctx.get("_debug_fetch_sec"),
+                "trigger_price": closed_price, "trigger_ema": _round_price(ema_closed),
+                "entry": c_entry, "stop": c_stop, "take": c_take,
+                "strategy": "continuation", "direction": "long",
+                "stretch_pct": round(stretch_pct, 3), "side": "above",
+                "touched": False, "touched_at": None, "time_to_touch_sec": None,
+                "closest_stretch_pct": round(stretch_pct, 3),
+                "max_retrace_pct_of_stretch": 0.0,
+                "max_adverse_stretch_pct": round(stretch_pct, 3),
+                "signal_outcome": "open",
+                "last_checked_ts": int(now),
+                "track_until": now + STRETCH_DIAG_TRACK_WINDOW_SEC.get(tf, 6 * 3600), "track_done": False,
+            })
     return out
 
 
@@ -9131,7 +9183,9 @@ def _stretch_diag_scan_loop():
 
 STRETCH_TOP_ALERT_MIN_EVENTS = 10   # v0.30.53: не объявляем "топовую связку" по горстке случайных событий — ждём минимум столько оценённых, прежде чем на неё начать алертить
 STRETCH_ALERT_MAX_STALENESS_SEC = 300   # v0.30.79: по прямому запросу — "задержка по факту позднего запуска, сигнал неактуален, зачем слать". 5 минут "мёртвого" времени ДО постановки в очередь (не путать с самой обработкой — та обычно секунды) — типичный признак пропущенного цикла/рестарта, не нормальная рабочая задержка
-STRETCH_SIGNAL_MAX_PCT = 2.0   # v0.30.81: по прямому вопросу "винрейт 55% мало для 1 к 2" — реальный PnL по силе отрыва (979 решённых сигналов): 1-2%=винрейт 62%/PnL +0.07%, 2-3%=23%/-1.02%, 5%+=2%/-1.86%. Чем сильнее отрыв, тем реже откат случается ДО фиксированного стопа 2% — сильные отрывы почти всегда реальный тренд, не перегрев. Потолок на отправку алерта (не на саму фиксацию в истории)
+STRETCH_SIGNAL_MAX_PCT = 2.0   # v0.30.83: по прямому запросу вернули обратно на 2.0 (было временно занижено до 1.5 в v0.30.82) — отрывы больше этого порога теперь не отбрасываются, а идут в отдельную стратегию продолжения (см. STRETCH_CONTINUATION_*)
+STRETCH_CONTINUATION_STOP_PCT = 2.0   # v0.30.83: НАЧАЛЬНАЯ прикидка, не откалибровано по данным — стоп для лонга на продолжение импульса, по аналогии с фейд-стопом
+STRETCH_CONTINUATION_TAKE_PCT = 4.0   # v0.30.83: НАЧАЛЬНАЯ прикидка (RR 2:1) — своих исторических данных по продолжению нет, копим статистику с нуля
 
 
 def _stretch_render_alert_chart(rec):
@@ -9158,8 +9212,10 @@ def _stretch_render_alert_chart(rec):
         ctx = _stretch_get_closed_ctx(rec["symbol"], rec["tf"])
         if not ctx:
             return None, "не удалось получить контекст свечей для графика (ctx пуст)"
+        dir_label = (f"LONG — продолжение импульса" if rec.get("strategy") == "continuation"
+                     else f"SHORT — цель EMA{rec['period']}")
         sig = {"entry": rec.get("entry", rec["trigger_price"]), "tp": rec.get("take", rec["trigger_ema"]),
-               "sl": rec.get("stop"), "dir": f"SHORT — цель EMA{rec['period']}", "entry_i": ctx["i"]}
+               "sl": rec.get("stop"), "dir": dir_label, "entry_i": ctx["i"]}
         if have_pil:
             png = _render_signal_chart_png(ctx["candles"], sig, rec["symbol"], rec["tf"])
             if png:
@@ -9180,7 +9236,11 @@ def _stretch_diag_maybe_alert_top_combo(new_recs):
     хотя бы одна с (tf, period), совпадающим с #1 в рейтинге — шлёт
     алерт. Топ пересчитывается каждый раз заново (не зафиксирован
     навсегда) — по мере накопления данных лидер может смениться, и
-    алерты будут идти уже по новому лидеру, без ручного вмешательства."""
+    алерты будут идти уже по новому лидеру, без ручного вмешательства.
+    v0.30.83: по прямому запросу — сильные отрывы (>STRETCH_SIGNAL_MAX_PCT)
+    теперь не просто отбрасываются, а идут отдельной стратегией
+    "продолжение" (LONG на импульс, а не SHORT на возврат). У неё свой
+    топ, независимый от фейда — обе стратегии могут алертить параллельно."""
     if not _get_stretch_top_alert_enabled():
         return
     try:
@@ -9190,27 +9250,10 @@ def _stretch_diag_maybe_alert_top_combo(new_recs):
         return
     if not summary:
         return   # ещё не набралось достаточно данных ни по одной связке
-    top = summary[0]
-    top_tf, top_period = top["tf"], top["period"]
-    o = top["overall"]
-    for rec in new_recs:
-        if rec["tf"] != top_tf or rec["period"] != top_period:
-            continue
-        if rec["stretch_pct"] > STRETCH_SIGNAL_MAX_PCT:
-            # v0.30.81: по прямому вопросу "винрейт 55% мало для 1 к 2, что
-            # делать" — разобрал реальный PnL по силе отрыва (979 решённых
-            # сигналов): 1-2% отрыв даёт винрейт 62%, средний PnL +0.07% —
-            # положительно. 2-3% — винрейт падает до 23%, PnL -1.02%. 5%+ —
-            # винрейт 2%(!), PnL -1.86%. Чем сильнее исходный отрыв, тем
-            # реже цена откатывается ДО того, как заденет фиксированный
-            # стоп 2% — сильные отрывы почти всегда оказываются реальным
-            # трендом, а не перегревом. Идея фейда работает только на
-            # мелких отрывах — не шлём алерт на сильные, хотя запись
-            # всё равно копится в истории для дальнейшего анализа.
-            olog(f"[ema_stretch] {rec['symbol']} {top_tf} EMA{top_period}: "
-                 f"алерт пропущен — отрыв {rec['stretch_pct']:.2f}% больше {STRETCH_SIGNAL_MAX_PCT}% "
-                 f"(по данным винрейт резко падает на больших отрывах)")
-            continue
+
+    def _fire(rec, top, label):
+        top_tf, top_period = top["tf"], top["period"]
+        o = top["overall"]
         lag_sec = max(0, int(time.time() - rec.get("bar_close_ts", rec["ts"])))
         # v0.30.79: по прямому запросу — "задержка просто по факту запуска
         # позднего, такие сигналы неактуальны, зачем их слать". Раньше
@@ -9220,32 +9263,39 @@ def _stretch_diag_maybe_alert_top_combo(new_recs):
         # ДО постановки в очередь (submitted_ts - bar_close_ts) — если
         # событие уже было старым, когда его только поставили на
         # обработку, это типичный след пропущенного цикла/рестарта, не
-        # нормальная рабочая задержка. Сама обработка (очередь+лимит+
-        # запрос) обычно занимает секунды — если общая задержка сильно
-        # больше их суммы, разница и есть этот "мёртвый" период. Запись
-        # всё равно остаётся в истории для статистики — режем только
-        # отправку алерта.
+        # нормальная рабочая задержка. Запись всё равно остаётся в истории
+        # для статистики — режем только отправку алерта.
         submitted_ts = rec.get("debug_submitted_ts")
         if submitted_ts:
             staleness_before_queue = submitted_ts - rec.get("bar_close_ts", submitted_ts)
             if staleness_before_queue > STRETCH_ALERT_MAX_STALENESS_SEC:
-                olog(f"[ema_stretch] {rec['symbol']} {top_tf} EMA{top_period}: "
+                olog(f"[ema_stretch] {rec['symbol']} {top_tf} EMA{top_period} ({label}): "
                      f"алерт пропущен — событие устарело ещё до постановки в очередь "
                      f"({round(staleness_before_queue/60,1)} мин, типичный след рестарта)")
-                continue
+                return
         lag_txt = f"{lag_sec}с" if lag_sec < 60 else f"{lag_sec // 60}м{lag_sec % 60}с"
         qw, gw, fs = rec.get("debug_queue_wait_sec"), rec.get("debug_gate_wait_sec"), rec.get("debug_fetch_sec")
         debug_txt = (f" (очередь {qw}с, рейт-лимит {gw}с, запрос {fs}с)"
                      if qw is not None or gw is not None or fs is not None else "")
-        msg = (f"📉 <b>{rec['symbol']}</b> — SHORT на возврат к EMA{top_period} ({top_tf}), "
-               f"топ связка по винрейту тейк/стоп\n"
-               f"Вход: {_fmt_px(rec['entry'])} | Стоп: {_fmt_px(rec['stop'])} ({STRETCH_REF_STOP_PCT}%) | "
-               f"Тейк: {_fmt_px(rec['take'])} (уровень EMA{top_period})\n"
-               f"Отрыв: {rec['stretch_pct']:+.2f}%\n"
-               f"Задержка от закрытия свечи: {lag_txt}{debug_txt}\n"
-               f"По статистике этой связки (n={o['evaluated']}, риск-выборка n={o['stop_survival_n']}): "
-               f"выживает при стопе {STRETCH_REF_STOP_PCT}% — {o['stop_survival_rate']}%, "
-               f"винрейт тейк/стоп (n={o['signal_resolved_n']}) — {o['signal_win_rate']}%")
+        if rec.get("strategy") == "continuation":
+            msg = (f"📈 <b>{rec['symbol']}</b> — LONG на продолжение импульса от EMA{top_period} ({top_tf}), "
+                   f"топ связка по винрейту тейк/стоп (⚠️ экспериментально, стоп/тейк не откалиброваны по истории)\n"
+                   f"Вход: {_fmt_px(rec['entry'])} | Стоп: {_fmt_px(rec['stop'])} ({STRETCH_CONTINUATION_STOP_PCT}%) | "
+                   f"Тейк: {_fmt_px(rec['take'])} ({STRETCH_CONTINUATION_TAKE_PCT}%, фикс. цель, не EMA)\n"
+                   f"Отрыв на входе: {rec['stretch_pct']:+.2f}%\n"
+                   f"Задержка от закрытия свечи: {lag_txt}{debug_txt}\n"
+                   f"По статистике этой связки (n={o['evaluated']}): "
+                   f"винрейт тейк/стоп (n={o['signal_resolved_n']}) — {o['signal_win_rate']}%")
+        else:
+            msg = (f"📉 <b>{rec['symbol']}</b> — SHORT на возврат к EMA{top_period} ({top_tf}), "
+                   f"топ связка по винрейту тейк/стоп\n"
+                   f"Вход: {_fmt_px(rec['entry'])} | Стоп: {_fmt_px(rec['stop'])} ({STRETCH_REF_STOP_PCT}%) | "
+                   f"Тейк: {_fmt_px(rec['take'])} (уровень EMA{top_period})\n"
+                   f"Отрыв: {rec['stretch_pct']:+.2f}%\n"
+                   f"Задержка от закрытия свечи: {lag_txt}{debug_txt}\n"
+                   f"По статистике этой связки (n={o['evaluated']}, риск-выборка n={o['stop_survival_n']}): "
+                   f"выживает при стопе {STRETCH_REF_STOP_PCT}% — {o['stop_survival_rate']}%, "
+                   f"винрейт тейк/стоп (n={o['signal_resolved_n']}) — {o['signal_win_rate']}%")
         png, err = _stretch_render_alert_chart(rec)
         if png:
             _send_alert_photo(png, msg)
@@ -9253,8 +9303,21 @@ def _stretch_diag_maybe_alert_top_combo(new_recs):
             msg += f"\n⚠️ график не приложен: {err}"
             olog(f"[ema_stretch] ⚠ график для {rec['symbol']} не отрисован: {err}")
             _send_alert(msg)
-        olog(f"[ema_stretch] {rec['symbol']} {top_tf} EMA{top_period}: "
+        olog(f"[ema_stretch] {rec['symbol']} {top_tf} EMA{top_period} ({label}): "
              f"алерт по топ-связке отправлен (отрыв {rec['stretch_pct']:+.2f}%)")
+
+    for strategy, label in (("fade", "фейд"), ("continuation", "продолжение")):
+        candidates = [e for e in summary if e.get("strategy", "fade") == strategy]
+        if not candidates:
+            continue
+        top = candidates[0]
+        top_tf, top_period = top["tf"], top["period"]
+        for rec in new_recs:
+            if rec.get("strategy", "fade") != strategy:
+                continue
+            if rec["tf"] != top_tf or rec["period"] != top_period:
+                continue
+            _fire(rec, top, label)
 
 
 STRETCH_TRACK_WORKERS = 32   # v0.30.74: реальный баг, найден по прямому сообщению "стоп был, а в логах не нашёл" — трек-луп был ОДНОПОТОЧНЫМ: шёл по всем открытым записям ПО ОДНОЙ, с сетевым запросом на каждую. Когда открытых записей накопилось за тысячу (100% из них!), last_checked_ts НИ РАЗУ не обновлялся после создания — однопоточный проход просто не успевал закончиться до следующего цикла, а список тем временем только рос. Ровно та же болезнь, что была у скана монет (v0.30.62), только тут пропустил. Теперь параллельно, пулом потоков — как и скан
@@ -9307,6 +9370,45 @@ def _stretch_diag_track_loop():
 
                 def _process(rec):
                     try:
+                        if rec.get("strategy") == "continuation":
+                            # v0.30.83: по прямому запросу — сигналы на
+                            # продолжение (LONG) не связаны с EMA вообще,
+                            # это простая фикс. цель/стоп от цены входа —
+                            # своя, более простая ветка слежения
+                            live_price = _gate_get_price(rec["symbol"])
+                            if not live_price:
+                                if now >= rec.get("track_until", 0):
+                                    rec["track_done"] = True
+                                    return True
+                                return False
+                            recent_hl = _stretch_recent_1m_high_low(rec["symbol"])
+                            stop, take = rec.get("stop"), rec.get("take")
+                            stop_hit = bool(stop and live_price <= stop)
+                            if not stop_hit and stop and recent_hl and recent_hl[1] <= stop:
+                                stop_hit = True   # v0.30.77-стиль: диапазон за 15 мин, не одна точка
+                            take_hit = bool(take and live_price >= take)
+                            if not take_hit and take and recent_hl and recent_hl[0] >= take:
+                                take_hit = True
+                            rec["last_checked_ts"] = int(now)
+                            if stop_hit and take_hit:
+                                # оба задело в одном окне опроса — порядок
+                                # внутри окна неизвестен, берём консервативное
+                                # предположение (стоп), не занижаем риск
+                                rec["signal_outcome"] = "stop"
+                                rec["track_done"] = True
+                            elif stop_hit:
+                                rec["signal_outcome"] = "stop"
+                                rec["track_done"] = True
+                            elif take_hit:
+                                rec["touched"] = True
+                                rec["touched_at"] = int(now)
+                                rec["time_to_touch_sec"] = int(now - rec["ts"])
+                                rec["signal_outcome"] = "take"
+                                rec["track_done"] = True
+                            elif now >= rec.get("track_until", 0):
+                                rec["signal_outcome"] = "timeout"
+                                rec["track_done"] = True
+                            return True
                         ctx = _stretch_get_closed_ctx(rec["symbol"], rec["tf"])
                         live_price = _gate_get_price(rec["symbol"])
                         if not ctx or not live_price:
@@ -9396,7 +9498,7 @@ def _stretch_diag_summary(min_events=3):
         records = list(_stretch_diag_records)
     groups = {}
     for r in records:
-        groups.setdefault((r["tf"], r["period"]), []).append(r)
+        groups.setdefault((r["tf"], r["period"], r.get("strategy", "fade")), []).append(r)
 
     def _agg(items):
         total = len(items)
@@ -9440,10 +9542,10 @@ def _stretch_diag_summary(min_events=3):
         }
 
     result = []
-    for (tf, period), items in groups.items():
+    for (tf, period, strategy), items in groups.items():
         if len(items) < min_events:
             continue
-        entry = {"tf": tf, "period": period, "overall": _agg(items)}
+        entry = {"tf": tf, "period": period, "strategy": strategy, "overall": _agg(items)}
         for lo, hi, label in STRETCH_DIAG_BUCKETS:
             subset = [r for r in items if lo <= abs(r["stretch_pct"]) < hi]
             if subset:
@@ -10604,6 +10706,7 @@ select,input{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-ra
 <p style="color:#8b949e;font-size:13px;max-width:520px">Триггер — отрыв цены ВВЕРХ от короткой EMA (5/10/20) на ЗАКРЫТИИ свечи, ≥1%, на ТФ 15м/30м/1h/4h (только вверх — ожидаем падение к EMA обратно, отрыв вниз не отслеживается). Дальше следим ЛИБО до касания той же EMA обратно, ЛИБО до таймаута (свой на каждый ТФ) — и считаем % отката от исходного отрыва (100% = полностью коснулась). Сводка разбита ещё и по величине самого отрыва (1-3% / 3-6% / 6%+), чтобы видеть, растёт ли шанс отката вместе с силой отрыва.</p>
 <p style="color:#d29922;font-size:12px;max-width:520px">С v0.30.78 топ-связка (та, по которой шлются алерты) ранжируется в первую очередь по винрейту тейк/стоп (колонка "Винрейт тейк/стоп"), "выживаемость при стопе 2%" — второй критерий (тай-брейк), не первый. До v0.30.60 было по чистому % отката. Стоп 2% при 10х — это 20% маржи, ориентировочная линейка сравнения, не готовая рекомендация.</p>
 <p style="color:#3fb950;font-size:12px;max-width:520px">С v0.30.67 это уже настоящий сигнал: Вход = цена триггера, Стоп = вход+2% (SHORT — цена ушла вверх, ждём падения), Тейк = уровень EMA. Исход (тейк/стоп/таймаут) считается в реальном порядке событий — если стоп задело раньше, чем цена дошла до EMA, это "stop", даже если ПОЗЖЕ цена всё равно дошла бы до цели (реальной позиции бы уже не было). Колонка "Винрейт тейк/стоп" — по этому честному исходу.</p>
+<p style="color:#58a6ff;font-size:12px;max-width:520px">С v0.30.83 — вторая, отдельная стратегия: "📈 продолжение" (LONG). Данные показали, что отрывы больше 2% почти никогда не откатываются до фиксированного стопа — это чаще реальный тренд, не перегрев. Для таких случаев теперь отдельный сигнал на продолжение импульса вместо фейда. ⚠️ Экспериментально — стоп 2%/тейк 4% (RR 2:1) НЕ откалиброваны по своим историческим данным, это стартовая прикидка, копим статистику с нуля так же, как и с фейдом в своё время.</p>
 
 <div class="section-card">
   <div class="section-head">
@@ -10616,7 +10719,7 @@ select,input{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-ra
   <div id="summaryStatus" class="summary-line">загрузка...</div>
   <div class="table-scroll">
     <table id="summaryTable">
-      <thead><tr><th>ТФ</th><th>EMA</th><th>Событий</th><th>Оценено</th><th>Винрейт тейк/стоп</th><th>Выжив. при стопе 2% (10х)</th><th>Touch rate</th><th>Avg откат%</th><th>Med откат%</th><th>Avg время до касания</th><th>Avg хуже на%</th><th>Худший случай</th><th>1-3% events</th><th>3-6% events</th><th>6%+ events</th></tr></thead>
+      <thead><tr><th>Стратегия</th><th>ТФ</th><th>EMA</th><th>Событий</th><th>Оценено</th><th>Винрейт тейк/стоп</th><th>Выжив. при стопе 2% (10х)</th><th>Touch rate</th><th>Avg откат%</th><th>Med откат%</th><th>Avg время до касания</th><th>Avg хуже на%</th><th>Худший случай</th><th>1-3% events</th><th>3-6% events</th><th>6%+ events</th></tr></thead>
       <tbody></tbody>
     </table>
   </div>
@@ -10645,7 +10748,7 @@ select,input{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-ra
   <div id="rawStatus" class="summary-line"></div>
   <div class="table-scroll">
     <table id="rawTable">
-      <thead><tr><th>Монета</th><th>ТФ</th><th>EMA</th><th>Вход</th><th>Стоп</th><th>Тейк</th><th>Отрыв%</th><th>Ближайший подход%</th><th>Худший заход%</th><th>Откат%</th><th>Исход</th><th>Время до касания</th><th>Когда</th></tr></thead>
+      <thead><tr><th>Стратегия</th><th>Монета</th><th>ТФ</th><th>EMA</th><th>Вход</th><th>Стоп</th><th>Тейк</th><th>Отрыв%</th><th>Ближайший подход%</th><th>Худший заход%</th><th>Откат%</th><th>Исход</th><th>Время до касания</th><th>Когда</th></tr></thead>
       <tbody></tbody>
     </table>
   </div>
@@ -10670,7 +10773,7 @@ async function loadSummary(){
       const o = e.overall;
       const tr = document.createElement('tr');
       const b13 = e['stretch_1-3%'], b36 = e['stretch_3-6%'], b6p = e['stretch_6%+'];
-      tr.innerHTML = `<td>${e.tf}</td><td>EMA${e.period}</td><td>${o.total}</td><td>${o.evaluated}</td>`+
+      tr.innerHTML = `<td>${e.strategy === 'continuation' ? '📈 продолжение' : '📉 фейд'}</td><td>${e.tf}</td><td>EMA${e.period}</td><td>${o.total}</td><td>${o.evaluated}</td>`+
         `<td>${o.signal_win_rate ?? '—'}% (n=${o.signal_resolved_n ?? 0}, таймаутов=${o.signal_timeouts ?? 0})</td>`+
         `<td>${o.stop_survival_rate ?? '—'}% (n=${o.stop_survival_n ?? 0})</td>`+
         `<td>${o.touch_rate ?? '—'}%</td><td>${o.avg_retrace_pct_of_stretch ?? '—'}%</td>`+
@@ -10711,7 +10814,7 @@ async function loadRaw(){
       const outcomeColors = {take:'#3fb950', stop:'#f85149', timeout:'#8b949e', open:'#d29922'};
       const oc = it.signal_outcome || (it.touched ? 'take' : (it.track_done ? 'timeout' : 'open'));
       const status = `<span style="color:${outcomeColors[oc]||'#8b949e'}">${oc}</span>`;
-      tr.innerHTML = `<td>${it.symbol}</td><td>${it.tf}</td><td>EMA${it.period}</td>`+
+      tr.innerHTML = `<td>${it.strategy === 'continuation' ? '📈' : '📉'}</td><td>${it.symbol}</td><td>${it.tf}</td><td>EMA${it.period}</td>`+
         `<td>${it.entry ?? '—'}</td><td>${it.stop ?? '—'}</td><td>${it.take ?? '—'}</td>`+
         `<td>${it.stretch_pct>0?'+':''}${it.stretch_pct}%</td><td>${it.closest_stretch_pct}%</td>`+
         `<td>${it.max_adverse_stretch_pct ?? it.stretch_pct}%</td>`+
