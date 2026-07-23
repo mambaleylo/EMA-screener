@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.92 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.93 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.93: финальная проверка безопасности автоторговли (v0.30.92) перед
+  тем, как ей пользоваться — нашёл реальную гонку: между проверкой "нет
+  ли уже открытой live-позиции по этой монете" и самим открытием ордера
+  проходит сетевое время (запрос к Gate.io), а скан теперь параллельный
+  (48 потоков) — теоретически два потока могли пройти проверку
+  одновременно и открыть ДВЕ позиции по одной монете. Добавлена
+  отдельная блокировка (_stretch_autotrade_open_lock), сериализующая
+  ВЕСЬ check-then-open как единый атомарный блок — не только чтение
+  списка live-позиций, но и сам вызов _gate_open_position. Открытие
+  сделок теперь строго по одной за раз, не параллельно — это осознанный
+  компромисс скорости ради безопасности реальных денег.
 - v0.30.92: по прямому запросу — автоторговля для "Отрыва от EMA", Long
   или Short на выбор, % депозита на сделку, вход/стоп/тейк из самого
   сигнала. Инфраструктура (подписанные запросы к Gate.io Futures,
@@ -1935,7 +1946,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.92"
+APP_VERSION  = "0.30.93"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -9532,6 +9543,9 @@ def _save_stretch_autotrade_cfg():
         olog(f"[stretch_autotrade] ошибка сохранения настроек: {_explain_error(e)}")
 
 
+_stretch_autotrade_open_lock = threading.Lock()   # v0.30.93: реальная находка при финальной проверке безопасности — между проверкой "нет ли уже открытой позиции" и самим открытием ордера проходит сетевое время, в параллельном скане (48 потоков) теоретически два потока могли пройти проверку одновременно и открыть ДВЕ позиции по одной монете. Явная блокировка сериализует весь check-then-open, устраняя гонку полностью, не только для этого конкретного сценария
+
+
 def _stretch_maybe_open_live_trade(rec):
     """v0.30.92: по прямому запросу — "автоторговля для Long или Short на
     выбор, тейки и стоп из сигнала". Переиспользует уже готовый
@@ -9555,39 +9569,40 @@ def _stretch_maybe_open_live_trade(rec):
         return
     symbol = rec["symbol"]
     contract = symbol.replace("/", "_").upper()
-    with _stretch_diag_lock:
-        live_open = [r for r in _stretch_diag_records if r.get("live") and not r.get("live_closed")]
-    if any(r["symbol"] == symbol for r in live_open):
-        olog(f"[stretch_autotrade] {symbol}: уже есть открытая live-позиция по этой монете — пропуск")
-        return
-    if max_c and len(live_open) >= max_c:
-        olog(f"[stretch_autotrade] лимит {max_c} одновр. live-позиций достигнут — пропуск {symbol}")
-        return
-    try:
-        existing = _gate_get_position(contract)
-    except Exception as e:
-        olog(f"[stretch_autotrade] {symbol}: не смог проверить биржу перед входом ({_explain_error(e)}) — пропуск на этот раз")
-        return
-    if existing:
-        olog(f"[stretch_autotrade] {symbol}: на бирже уже есть позиция вне нашего учёта — пропуск")
-        return
-    entry, stop, take = rec["entry"], rec["stop"], rec["take"]
-    sl_pct = abs(entry - stop) / entry * 100.0
-    risk_pct = leverage * sl_pct   # см. докстринг _stretch_autotrade_state["leverage"] — так выводится ровно заданное плечо
-    strat_label = "фейд" if rec.get("strategy") == "fade" else "продолжение"
-    pos_info = _gate_open_position(
-        symbol, rec["direction"], entry, stop, take, risk_pct,
-        position_pct=position_pct, label=f"STRETCH {strat_label}", text_prefix="stretch",
-    )
-    if not pos_info:
-        return
-    with _stretch_diag_lock:
-        rec["live"] = True
-        rec["live_size"] = pos_info.get("size")
-        rec["live_leverage"] = pos_info.get("leverage")
-        rec["live_notional"] = pos_info.get("notional")
-        rec["live_opened_at"] = int(time.time())
-    _stretch_diag_save()
+    with _stretch_autotrade_open_lock:   # v0.30.93: сериализует ВЕСЬ check-then-open, не только чтение списка — см. докстринг лока выше
+        with _stretch_diag_lock:
+            live_open = [r for r in _stretch_diag_records if r.get("live") and not r.get("live_closed")]
+        if any(r["symbol"] == symbol for r in live_open):
+            olog(f"[stretch_autotrade] {symbol}: уже есть открытая live-позиция по этой монете — пропуск")
+            return
+        if max_c and len(live_open) >= max_c:
+            olog(f"[stretch_autotrade] лимит {max_c} одновр. live-позиций достигнут — пропуск {symbol}")
+            return
+        try:
+            existing = _gate_get_position(contract)
+        except Exception as e:
+            olog(f"[stretch_autotrade] {symbol}: не смог проверить биржу перед входом ({_explain_error(e)}) — пропуск на этот раз")
+            return
+        if existing:
+            olog(f"[stretch_autotrade] {symbol}: на бирже уже есть позиция вне нашего учёта — пропуск")
+            return
+        entry, stop, take = rec["entry"], rec["stop"], rec["take"]
+        sl_pct = abs(entry - stop) / entry * 100.0
+        risk_pct = leverage * sl_pct   # см. докстринг _stretch_autotrade_state["leverage"] — так выводится ровно заданное плечо
+        strat_label = "фейд" if rec.get("strategy") == "fade" else "продолжение"
+        pos_info = _gate_open_position(
+            symbol, rec["direction"], entry, stop, take, risk_pct,
+            position_pct=position_pct, label=f"STRETCH {strat_label}", text_prefix="stretch",
+        )
+        if not pos_info:
+            return
+        with _stretch_diag_lock:
+            rec["live"] = True
+            rec["live_size"] = pos_info.get("size")
+            rec["live_leverage"] = pos_info.get("leverage")
+            rec["live_notional"] = pos_info.get("notional")
+            rec["live_opened_at"] = int(time.time())
+        _stretch_diag_save()
 
 
 def _stretch_autotrade_watch_loop():
