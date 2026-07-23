@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.85 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.86 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.86: серьёзный реальный баг, найден по прямому вопросу "когда уже
+  появятся лонги?" — проверил свежий экспорт: 2217 fade-записей с
+  отрывом >2% (то есть событий, достаточных для continuation, было
+  полно), но continuation-записей — 0, ни одной. Причина — дедупликация
+  в цикле сканирования сравнивала кандидатов по ключу symbol|tf|period,
+  БЕЗ стратегии. Fade и continuation для одной и той же связки
+  создаются в ОДНОМ батче кандидатов с одинаковым ключом — fade
+  добавлялась первой, помечала ключ "уже отслеживается", и continuation
+  для того же самого события тут же отбрасывалась как "дубликат" на
+  следующей итерации того же цикла. Добавил strategy в ключ
+  дедупликации — теперь fade и continuation не конфликтуют.
 - v0.30.85: по прямому вопросу "для лонга понятно, а для шорта?" — тот же
   диагноз, что и у продолжения до правки: старый фейд-стоп 2.0% при
   обычно МЕНЬШЕМ тейке (уровень EMA, часто 1-2%) означал риск больше
@@ -1845,7 +1856,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.85"
+APP_VERSION  = "0.30.86"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -9169,11 +9180,11 @@ def _stretch_diag_scan_loop():
                     if not candidates:
                         continue
                     with _stretch_diag_lock:
-                        open_keys = {f"{r['symbol']}|{r['tf']}|{r['period']}"
+                        open_keys = {f"{r['symbol']}|{r['tf']}|{r['period']}|{r.get('strategy', 'fade')}"
                                      for r in _stretch_diag_records if not r.get("track_done", True)}
                         fresh = []
                         for rec in candidates:
-                            rkey = f"{rec['symbol']}|{rec['tf']}|{rec['period']}"
+                            rkey = f"{rec['symbol']}|{rec['tf']}|{rec['period']}|{rec.get('strategy', 'fade')}"   # v0.30.86: реальный баг — раньше ключ БЕЗ стратегии, fade и continuation для той же связки создавались с ОДИНАКОВЫМ ключом в одном и том же батче кандидатов, fade добавлялась первой и continuation тут же отбрасывалась как "дубликат" — вот почему continuation всегда было 0
                             if rkey in open_keys:   # уже отслеживаем отрыв по этой же связке — не дублируем
                                 continue
                             _stretch_diag_records.append(rec)
