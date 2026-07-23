@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.88 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.89 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.89: реальная находка по прямому вопросу "топ-1 продолжение, а
+  сигнал шортом" — таблица сводки сортировалась ЕДИНЫМ списком (фейд и
+  continuation вперемешку), из-за чего выглядело так, будто есть только
+  ОДИН общий лидер — хотя на деле у каждой стратегии свой топ-1, и
+  алерты идут по нему независимо (логика алертов и раньше была верной,
+  проблема была чисто в отображении сводки, вводила в заблуждение).
+  Теперь сортировка сначала группирует по стратегии (фейд, потом
+  continuation), внутри группы — как раньше по винрейту. На странице
+  добавлены заголовки-разделители между блоками и корона 👑 у реального
+  лидера каждой стратегии — теперь сразу видно, что их два, не один.
 - v0.30.88: реальная находка на первых 1491 решённых continuation-сигналах
   (дедуп-фикс v0.30.86 наконец дал данные) — у continuation ОБРАТНАЯ
   зависимость от фейда: чем сильнее отрыв, тем ЛУЧШЕ результат (2-2.5%=
@@ -1878,7 +1888,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.88"
+APP_VERSION  = "0.30.89"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -9613,10 +9623,22 @@ def _stretch_diag_summary(min_events=3):
     # всё ещё полезен как более широкая, менее шумная выборка риска,
     # раз выше сами же обсуждали разницу между ними. Отсутствие данных
     # (None) по-прежнему считаем худшим (0), не даём связке без
-    # решённых сигналов случайно всплыть в топ
-    result.sort(key=lambda e: (e["overall"]["signal_win_rate"] if e["overall"]["signal_win_rate"] is not None else 0,
-                               e["overall"]["stop_survival_rate"] if e["overall"]["stop_survival_rate"] is not None else 0,
-                               e["overall"]["avg_retrace_pct_of_stretch"] or 0), reverse=True)
+    # решённых сигналов случайно всплыть в топ.
+    # v0.30.89: реальная находка по прямому вопросу "топ-1 продолжение,
+    # а сигнал шортом" — раньше сортировка была ЕДИНАЯ по всем строкам
+    # разом (фейд и continuation вперемешку), из-за чего выглядело так,
+    # будто есть только ОДИН общий лидер — хотя на самом деле у каждой
+    # стратегии свой топ-1, и алерты идут по нему независимо. Теперь
+    # сначала группируем по стратегии (фейд первым, continuation вторым),
+    # ВНУТРИ каждой группы сортируем как раньше — топ каждой стратегии
+    # сразу виден как первая строка своего блока, не теряется в общем списке
+    strategy_order = {"fade": 0, "continuation": 1}
+    result.sort(key=lambda e: (
+        strategy_order.get(e.get("strategy", "fade"), 2),
+        -(e["overall"]["signal_win_rate"] if e["overall"]["signal_win_rate"] is not None else 0),
+        -(e["overall"]["stop_survival_rate"] if e["overall"]["stop_survival_rate"] is not None else 0),
+        -(e["overall"]["avg_retrace_pct_of_stretch"] or 0),
+    ))
     return result
 
 # ─── конец EMA Stretch/Retrace Diagnostics ──────────────────────────────────
@@ -10825,11 +10847,22 @@ async function loadSummary(){
     const r = await fetch('/ema_stretch_status'); const d = await r.json();
     const tbody = document.querySelector('#summaryTable tbody'); tbody.innerHTML = '';
     statusEl.innerText = `Всего событий в истории: ${d.count}` + (d.last_cycle_sec != null ? ` · последний скан занял ${d.last_cycle_sec}с` : '');
+    let lastStrategy = null;
     for(const e of (d.summary || [])){
       const o = e.overall;
+      if(e.strategy !== lastStrategy){
+        lastStrategy = e.strategy;
+        const hdr = document.createElement('tr');
+        hdr.innerHTML = `<td colspan="15" style="background:#161b22;color:${e.strategy==='continuation'?'#58a6ff':'#f85149'};font-weight:bold;padding-top:14px">`+
+          `${e.strategy === 'continuation' ? '📈 ПРОДОЛЖЕНИЕ — свой отдельный топ, алертит независимо от фейда' : '📉 ФЕЙД — свой отдельный топ, алертит независимо от продолжения'}</td>`;
+        tbody.appendChild(hdr);
+      }
+      const isLeader = tbody.querySelectorAll(`tr[data-strategy="${e.strategy}"]`).length === 0;
       const tr = document.createElement('tr');
+      tr.setAttribute('data-strategy', e.strategy);
+      if(isLeader) tr.style.background = '#132d1d';
       const b13 = e['stretch_1-3%'], b36 = e['stretch_3-6%'], b6p = e['stretch_6%+'];
-      tr.innerHTML = `<td>${e.strategy === 'continuation' ? '📈 продолжение' : '📉 фейд'}</td><td>${e.tf}</td><td>EMA${e.period}</td><td>${o.total}</td><td>${o.evaluated}</td>`+
+      tr.innerHTML = `<td>${isLeader ? '👑 ' : ''}${e.strategy === 'continuation' ? '📈 продолжение' : '📉 фейд'}</td><td>${e.tf}</td><td>EMA${e.period}</td><td>${o.total}</td><td>${o.evaluated}</td>`+
         `<td>${o.signal_win_rate ?? '—'}% (n=${o.signal_resolved_n ?? 0}, таймаутов=${o.signal_timeouts ?? 0})</td>`+
         `<td>${o.stop_survival_rate ?? '—'}% (n=${o.stop_survival_n ?? 0})</td>`+
         `<td>${o.touch_rate ?? '—'}%</td><td>${o.avg_retrace_pct_of_stretch ?? '—'}%</td>`+
