@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.89 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.90 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.90: по прямому запросу — "если всплеск на затишье, шанс на откат
+  выше, чем на тренде, сравнить потом винрейт". Добавлено новое поле
+  trend_pct на каждой записи (и фейд, и continuation) — измеряет силу
+  движения цены за 20 баров ДО триггерной свечи (не включая её саму,
+  иначе сам отрыв исказил бы измерение). Не требует доп. сетевых
+  запросов — считается из уже загруженных свечей в ctx. Добавлена
+  разбивка по силе тренда в сводку (STRETCH_TREND_BUCKETS: затишье
+  <3%, умеренный тренд 3-8%, сильный тренд 8%+) — как только накопится
+  статистика, можно будет честно сравнить винрейт фейда в затишье
+  против винрейта на тренде через экспорт JSON.
 - v0.30.89: реальная находка по прямому вопросу "топ-1 продолжение, а
   сигнал шортом" — таблица сводки сортировалась ЕДИНЫМ списком (фейд и
   continuation вперемешку), из-за чего выглядело так, будто есть только
@@ -1888,7 +1898,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.89"
+APP_VERSION  = "0.30.90"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -8920,6 +8930,7 @@ STRETCH_DIAG_PERIODS = [5, 10, 20]
 STRETCH_DIAG_TIMEFRAMES = ["15m", "30m", "1h", "4h"]
 STRETCH_DIAG_FETCH_DAYS = {"15m": 10, "30m": 15, "1h": 30, "4h": 60}
 STRETCH_DIAG_MIN_PCT = 1.0          # минимальный % отрыва ВВЕРХ от EMA, чтобы зафиксировать событие (v0.30.52: только вверх, см. _stretch_check_symbol) — иначе шум почти на каждой свече
+STRETCH_TREND_LOOKBACK_BARS = 20    # v0.30.90: по прямому запросу — "затишье vs тренд" — сколько баров ДО триггерной свечи смотрим, чтобы измерить фон, на котором произошёл отрыв
 STRETCH_DIAG_TOUCH_TOL_PCT = 0.1    # ближе этого к EMA (или пересечение на другую сторону) считается "коснулась снова"
 STRETCH_DIAG_SCAN_POLL_SEC = 45      # v0.30.63: по прямому запросу — "сигналы приходят позже, чем надо, следующий прогон может быть уже поздно". Раньше 180с (3 мин) было разумно при ПОСЛЕДОВАТЕЛЬНОМ обходе (сам скан и так уже мог занимать сравнимое время), теперь скан параллельный (v0.30.62) и завершается на порядок быстрее — можно опрашивать намного чаще, не перегружая API
 STRETCH_DIAG_TRACK_POLL_SEC = 60
@@ -8927,6 +8938,7 @@ STRETCH_DIAG_TRACK_WINDOW_SEC = {"15m": 6 * 3600, "30m": 12 * 3600, "1h": 24 * 3
 STRETCH_DIAG_FILE = os.path.expanduser("~/pumpradar_ema_stretch_diag.json")
 STRETCH_DIAG_MAX_RECORDS = 5000
 STRETCH_DIAG_BUCKETS = [(1, 3, "1-3%"), (3, 6, "3-6%"), (6, 999, "6%+")]   # для сводки — какой % отрыва даёт какой средний откат
+STRETCH_TREND_BUCKETS = [(0, 3, "затишье"), (3, 8, "умеренный тренд"), (8, 999, "сильный тренд")]   # v0.30.90: по прямому запросу — разбивка по |trend_pct| (сила движения ДО отрыва), чтобы сравнить винрейт фейда на затишье vs на тренде
 
 _stretch_diag_lock = threading.Lock()
 _stretch_diag_records = []
@@ -9071,6 +9083,18 @@ def _stretch_check_symbol(symbol, tf, submitted_ts=None):
         return []
     now = time.time()
     closed_price = ctx["closes"][ctx["i"]]
+    # v0.30.90: по прямому запросу — "если всплеск на затишье, шанс на
+    # откат выше, чем в трендовом рынке". Меряем силу тренда ДО отрыва —
+    # изменение цены за STRETCH_TREND_LOOKBACK_BARS баров, предшествующих
+    # закрытой свече триггера (не включая саму эту свечу — иначе сам
+    # отрыв исказил бы измерение). Данные уже есть в ctx (не нужен
+    # дополнительный сетевой запрос)
+    trend_i = ctx["i"] - STRETCH_TREND_LOOKBACK_BARS
+    trend_pct = None
+    if trend_i >= 0 and ctx["closes"][trend_i]:
+        base = ctx["closes"][trend_i]
+        ref_price = ctx["closes"][ctx["i"] - 1] if ctx["i"] >= 1 else closed_price   # v0.30.90: тренд ДО текущего бара, сам триггерный бар не включаем
+        trend_pct = round((ref_price - base) / base * 100, 3)
     out = []
     for period in STRETCH_DIAG_PERIODS:
         ema_closed = ctx["ema_arrays"][period][ctx["i"]]
@@ -9094,6 +9118,7 @@ def _stretch_check_symbol(symbol, tf, submitted_ts=None):
             "trigger_price": closed_price, "trigger_ema": _round_price(ema_closed),
             "entry": entry, "stop": stop, "take": take,
             "strategy": "fade", "direction": "short",   # v0.30.83: явное поле — раньше стратегия была одна (фейд), теперь есть вторая (продолжение), нужно различать в сводке/ранжировании
+            "trend_pct": trend_pct,   # v0.30.90: сила тренда ДО отрыва — по прямому запросу, для сравнения винрейта "затишье vs тренд"
             "stretch_pct": round(stretch_pct, 3), "side": "above" if stretch_pct > 0 else "below",
             "touched": False, "touched_at": None, "time_to_touch_sec": None,
             "closest_stretch_pct": round(stretch_pct, 3),
@@ -9127,6 +9152,7 @@ def _stretch_check_symbol(symbol, tf, submitted_ts=None):
                 "trigger_price": closed_price, "trigger_ema": _round_price(ema_closed),
                 "entry": c_entry, "stop": c_stop, "take": c_take,
                 "strategy": "continuation", "direction": "long",
+                "trend_pct": trend_pct,
                 "stretch_pct": round(stretch_pct, 3), "side": "above",
                 "touched": False, "touched_at": None, "time_to_touch_sec": None,
                 "closest_stretch_pct": round(stretch_pct, 3),
@@ -9616,6 +9642,10 @@ def _stretch_diag_summary(min_events=3):
             subset = [r for r in items if lo <= abs(r["stretch_pct"]) < hi]
             if subset:
                 entry[f"stretch_{label}"] = _agg(subset)
+        for lo, hi, label in STRETCH_TREND_BUCKETS:
+            subset = [r for r in items if r.get("trend_pct") is not None and lo <= abs(r["trend_pct"]) < hi]
+            if subset:
+                entry[f"trend_{label}"] = _agg(subset)
         result.append(entry)
     # v0.30.78: по прямому запросу — приоритет отдан винрейту тейк/стоп
     # (signal_win_rate), а не stop_survival_rate, как было с v0.30.60.
