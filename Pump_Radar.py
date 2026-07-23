@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.90 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.91 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.91: по прямому вопросу "что можно добавить для лонга" — trend_pct
+  (v0.30.90) уже собирается на обеих стратегиях, гипотеза для
+  continuation обратная фейду (стретч ПОВЕРХ уже идущего тренда —
+  подтверждение реального движения, не разовый спайк из затишья), сможем
+  сравнить, когда накопится статистика. Добавлена вторая, новая метрика,
+  специфичная для тезиса продолжения — объём триггерной свечи
+  относительно фона (trigger_vol_ratio): настоящий пробой обычно идёт с
+  ростом объёма, случайный шпиль на тонком объёме скорее выдыхается. Не
+  требует доп. сетевых запросов — считается из уже загруженных свечей.
+  Добавлена разбивка по объёму в сводку (STRETCH_VOL_BUCKETS: низкий/
+  нормальный/высокий) — как и с трендом, сравним винрейт по сегментам,
+  когда накопится статистика.
 - v0.30.90: по прямому запросу — "если всплеск на затишье, шанс на откат
   выше, чем на тренде, сравнить потом винрейт". Добавлено новое поле
   trend_pct на каждой записи (и фейд, и continuation) — измеряет силу
@@ -1898,7 +1910,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.90"
+APP_VERSION  = "0.30.91"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -8939,6 +8951,7 @@ STRETCH_DIAG_FILE = os.path.expanduser("~/pumpradar_ema_stretch_diag.json")
 STRETCH_DIAG_MAX_RECORDS = 5000
 STRETCH_DIAG_BUCKETS = [(1, 3, "1-3%"), (3, 6, "3-6%"), (6, 999, "6%+")]   # для сводки — какой % отрыва даёт какой средний откат
 STRETCH_TREND_BUCKETS = [(0, 3, "затишье"), (3, 8, "умеренный тренд"), (8, 999, "сильный тренд")]   # v0.30.90: по прямому запросу — разбивка по |trend_pct| (сила движения ДО отрыва), чтобы сравнить винрейт фейда на затишье vs на тренде
+STRETCH_VOL_BUCKETS = [(0, 1, "низкий объём"), (1, 2, "нормальный объём"), (2, 999, "высокий объём")]   # v0.30.91: по прямому запросу "что добавить для лонга" — разбивка по trigger_vol_ratio (объём триггерной свечи к фону), тезис: настоящий пробой идёт с ростом объёма
 
 _stretch_diag_lock = threading.Lock()
 _stretch_diag_records = []
@@ -9095,6 +9108,19 @@ def _stretch_check_symbol(symbol, tf, submitted_ts=None):
         base = ctx["closes"][trend_i]
         ref_price = ctx["closes"][ctx["i"] - 1] if ctx["i"] >= 1 else closed_price   # v0.30.90: тренд ДО текущего бара, сам триггерный бар не включаем
         trend_pct = round((ref_price - base) / base * 100, 3)
+    # v0.30.91: по прямому запросу — "что можно добавить для лонга". Настоящий
+    # пробой обычно идёт с ростом объёма на самой триггерной свече, а
+    # случайный шпиль на тонком объёме скорее выдохнется — особенно
+    # значимо для continuation (тезис "это реальный импульс"). Объём
+    # триггерной свечи относительно среднего за предыдущие
+    # STRETCH_TREND_LOOKBACK_BARS баров (не включая саму свечу)
+    trigger_vol_ratio = None
+    if trend_i >= 0:
+        prev_vols = [c.get("vol") or 0 for c in ctx["candles"][trend_i:ctx["i"]]]
+        avg_vol = sum(prev_vols) / len(prev_vols) if prev_vols else 0
+        trigger_vol = ctx["candles"][ctx["i"]].get("vol") or 0
+        if avg_vol > 0:
+            trigger_vol_ratio = round(trigger_vol / avg_vol, 2)
     out = []
     for period in STRETCH_DIAG_PERIODS:
         ema_closed = ctx["ema_arrays"][period][ctx["i"]]
@@ -9119,6 +9145,7 @@ def _stretch_check_symbol(symbol, tf, submitted_ts=None):
             "entry": entry, "stop": stop, "take": take,
             "strategy": "fade", "direction": "short",   # v0.30.83: явное поле — раньше стратегия была одна (фейд), теперь есть вторая (продолжение), нужно различать в сводке/ранжировании
             "trend_pct": trend_pct,   # v0.30.90: сила тренда ДО отрыва — по прямому запросу, для сравнения винрейта "затишье vs тренд"
+            "trigger_vol_ratio": trigger_vol_ratio,   # v0.30.91: объём триггерной свечи относительно среднего фона — подтверждение реального пробоя, не тонкого шпиля
             "stretch_pct": round(stretch_pct, 3), "side": "above" if stretch_pct > 0 else "below",
             "touched": False, "touched_at": None, "time_to_touch_sec": None,
             "closest_stretch_pct": round(stretch_pct, 3),
@@ -9153,6 +9180,7 @@ def _stretch_check_symbol(symbol, tf, submitted_ts=None):
                 "entry": c_entry, "stop": c_stop, "take": c_take,
                 "strategy": "continuation", "direction": "long",
                 "trend_pct": trend_pct,
+                "trigger_vol_ratio": trigger_vol_ratio,
                 "stretch_pct": round(stretch_pct, 3), "side": "above",
                 "touched": False, "touched_at": None, "time_to_touch_sec": None,
                 "closest_stretch_pct": round(stretch_pct, 3),
@@ -9646,6 +9674,10 @@ def _stretch_diag_summary(min_events=3):
             subset = [r for r in items if r.get("trend_pct") is not None and lo <= abs(r["trend_pct"]) < hi]
             if subset:
                 entry[f"trend_{label}"] = _agg(subset)
+        for lo, hi, label in STRETCH_VOL_BUCKETS:
+            subset = [r for r in items if r.get("trigger_vol_ratio") is not None and lo <= r["trigger_vol_ratio"] < hi]
+            if subset:
+                entry[f"vol_{label}"] = _agg(subset)
         result.append(entry)
     # v0.30.78: по прямому запросу — приоритет отдан винрейту тейк/стоп
     # (signal_win_rate), а не stop_survival_rate, как было с v0.30.60.
