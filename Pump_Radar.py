@@ -1,7 +1,22 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.76 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.77 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.77: реальный баг, найден по прямому вопросу "стоп словил, а в
+  логах нет" (EPIC_USDT, 4h EMA20). Проверил живую цену на скрине —
+  локальный пик 0.6142 реально выше стопа 0.610368, но в записи
+  max_adverse_stretch_pct как был равен исходному отрыву при создании
+  (16.103), так и остался — наша система вообще не увидела этот скачок.
+  Причина — _gate_get_price() берёт ОДНУ точку цены раз в 60 секунд
+  (STRETCH_DIAG_TRACK_POLL_SEC): если цена дёрнулась выше стопа и
+  вернулась быстрее минуты между опросами, точечная выборка её просто не
+  видит, хотя на бирже стоп сработал бы по факту касания. Добавлена
+  проверка по последним ~15 минутам 1-минутных свечей (high/low, не одна
+  точка) — со своим коротким кэшем (30с), чтобы несколько записей одного
+  symbol не дублировали запрос. Заодно нашёл и починил соседний реальный
+  баг в _fetch_candles — при дробном days (мой новый вызов передаёт
+  days=0.015) since могло остаться float, а Gate.io отклоняет дробный
+  `from` (та же болезнь, что уже чинили под offset_days в v0.30.17).
 - v0.30.76: реальный дедлок, найден по прямому сообщению "нажал удалить,
   подвисло, после рестарта история на месте". В обработчике
   /ema_stretch_history_clear (v0.30.75) держали _stretch_diag_lock и
@@ -1750,7 +1765,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.76"
+APP_VERSION  = "0.30.77"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2757,7 +2772,7 @@ def _fetch_candles(symbol, tf, days, _stop_event=None, offset_days=0):
     since = now - days * 86400
     LIMIT = 999
     all_candles = []
-    current_from = since
+    current_from = int(since)   # v0.30.77: реальная находка — since могло быть float при дробном days (мой новый _stretch_recent_1m_high_low передаёт days=0.015) — Gate.io отклоняет дробный `from`, та же болезнь, что уже чинили под offset_days в v0.30.17, просто с другой стороны
     fail_count = 0
     MAX_FAILS = 5
     while current_from < now:
@@ -9162,6 +9177,36 @@ def _stretch_diag_maybe_alert_top_combo(new_recs):
 STRETCH_TRACK_WORKERS = 32   # v0.30.74: реальный баг, найден по прямому сообщению "стоп был, а в логах не нашёл" — трек-луп был ОДНОПОТОЧНЫМ: шёл по всем открытым записям ПО ОДНОЙ, с сетевым запросом на каждую. Когда открытых записей накопилось за тысячу (100% из них!), last_checked_ts НИ РАЗУ не обновлялся после создания — однопоточный проход просто не успевал закончиться до следующего цикла, а список тем временем только рос. Ровно та же болезнь, что была у скана монет (v0.30.62), только тут пропустил. Теперь параллельно, пулом потоков — как и скан
 
 
+_stretch_1m_cache = {}
+_stretch_1m_cache_lock = threading.Lock()
+
+
+def _stretch_recent_1m_high_low(symbol):
+    """v0.30.77: реальная находка по прямому вопросу "стоп словил, а в
+    логах нет" (EPIC_USDT) — _gate_get_price() берёт ОДНУ точку цены раз в
+    60 секунд (STRETCH_DIAG_TRACK_POLL_SEC). Если цена дёрнулась выше
+    стопа и вернулась обратно быстрее минуты между двумя опросами — эта
+    точечная выборка её просто не видит, хотя на бирже стоп сработал бы
+    по факту касания. Возвращает (макс_high, мин_low) по последним ~15
+    минутам 1-минутных свечей — покрывает разрыв между опросами с
+    запасом. Свой короткий кэш (30 сек) — несколько записей с одним и тем
+    же symbol, но разными period/tf, не дублируют сетевой запрос."""
+    key = symbol
+    now = time.time()
+    with _stretch_1m_cache_lock:
+        cached = _stretch_1m_cache.get(key)
+        if cached and now - cached[0] < 30:
+            return cached[1]
+    try:
+        candles = _fetch_candles(symbol, "1m", 0.015)
+        result = (max(c["high"] for c in candles), min(c["low"] for c in candles)) if candles else None
+    except Exception:
+        result = None
+    with _stretch_1m_cache_lock:
+        _stretch_1m_cache[key] = (now, result)
+    return result
+
+
 def _stretch_diag_track_loop():
     """Раз в STRETCH_DIAG_TRACK_POLL_SEC пересчитывает живую EMA и цену для
     каждой ещё открытой записи, обновляет ближайший подход к EMA
@@ -9194,8 +9239,12 @@ def _stretch_diag_track_loop():
                         crossed = (current_stretch > 0) != (rec["stretch_pct"] > 0)
                         if abs(current_stretch) < abs(rec["closest_stretch_pct"]):
                             rec["closest_stretch_pct"] = round(current_stretch, 3)
-                        if not crossed and abs(current_stretch) > abs(rec.get("max_adverse_stretch_pct", rec["stretch_pct"])):
-                            rec["max_adverse_stretch_pct"] = round(current_stretch, 3)   # v0.30.56: по прямому запросу — сколько ДАЛЬШЕ от EMA ушло, прежде чем откатиться (или так и не откатилось): видим не только шанс на возврат, но и худший случай на пути
+                        recent_hl = _stretch_recent_1m_high_low(rec["symbol"])   # v0.30.77: диапазон за ~15 мин, не одна точка
+                        worst_stretch = current_stretch
+                        if recent_hl and rec["stretch_pct"] > 0:
+                            worst_stretch = max(worst_stretch, (recent_hl[0] - ema_now) / ema_now * 100.0)
+                        if not crossed and abs(worst_stretch) > abs(rec.get("max_adverse_stretch_pct", rec["stretch_pct"])):
+                            rec["max_adverse_stretch_pct"] = round(worst_stretch, 3)   # v0.30.56: по прямому запросу — сколько ДАЛЬШЕ от EMA ушло, прежде чем откатиться (или так и не откатилось): видим не только шанс на возврат, но и худший случай на пути
                         retrace = 100.0 * (1 - abs(current_stretch) / abs(rec["stretch_pct"])) if rec["stretch_pct"] else 0.0
                         if retrace > rec["max_retrace_pct_of_stretch"]:
                             rec["max_retrace_pct_of_stretch"] = round(retrace, 1)
@@ -9211,7 +9260,11 @@ def _stretch_diag_track_loop():
                         # выхода из отслеживания — годилось для наблюдения,
                         # но не для честного сигнала с реальным исходом.
                         stop = rec.get("stop")
-                        if stop and rec["stretch_pct"] > 0 and live_price >= stop:
+                        stop_hit = bool(stop and rec["stretch_pct"] > 0 and live_price >= stop)
+                        if not stop_hit and stop and rec["stretch_pct"] > 0 and recent_hl:
+                            if recent_hl[0] >= stop:
+                                stop_hit = True   # v0.30.77: словили спайком по 1m-свечам, который точечный опрос пропустил бы
+                        if stop_hit:
                             rec["signal_outcome"] = "stop"
                             rec["touched_at"] = None
                             rec["track_done"] = True
