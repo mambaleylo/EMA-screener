@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.93 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.94 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.94: по прямому сообщению "раньше баланс видело без проблем" —
+  автосделка не открылась из-за RuntimeError "Нет баланса: 0.0", хотя в
+  логе видно margin_mode=3 (не обычный cross), available=0.0 и
+  cross_margin_balance=None — оба поля, что проверяет _gate_get_balance,
+  пришли пустыми. Похоже, режим маржи на аккаунте сменился на что-то не
+  cross/isolated, и баланс при этом режиме лежит в другом поле ответа
+  API, которое код не проверял. Вместо гадания — теперь при получении
+  0/пустого баланса печатается ВЕСЬ сырой ответ /futures/usdt/accounts
+  целиком в лог, чтобы увидеть точно, в каком поле баланс на самом деле,
+  и поправить код прицельно на следующей проверке, а не наугад.
 - v0.30.93: финальная проверка безопасности автоторговли (v0.30.92) перед
   тем, как ей пользоваться — нашёл реальную гонку: между проверкой "нет
   ли уже открытой live-позиции по этой монете" и самим открытием ордера
@@ -1946,7 +1956,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.93"
+APP_VERSION  = "0.30.94"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2126,9 +2136,19 @@ def _gate_get_balance():
             avail = 0.0
         olog(f"🔍 gate_balance: margin_mode={data.get('margin_mode')} "
              f"available={avail} cross_margin_balance={cross_bal}")
-        if cross_bal is not None and cross_bal > 0:
-            return cross_bal
-        return avail
+        result = cross_bal if (cross_bal is not None and cross_bal > 0) else avail
+        if result <= 0:
+            # v0.30.94: реальная находка по прямому сообщению "раньше баланс
+            # видело без проблем" — при margin_mode=3 (не обычный cross)
+            # оба поля, что мы проверяем (available/cross_margin_balance),
+            # пришли пустыми, хотя деньги на аккаунте, по словам
+            # пользователя, реально есть. Вместо гадания — печатаем ВЕСЬ
+            # сырой ответ API целиком, чтобы увидеть, в каком поле баланс
+            # на самом деле лежит при этом режиме маржи, и поправить точно,
+            # не наугад
+            olog(f"🔍 gate_balance: баланс вышел 0/пусто при margin_mode="
+                 f"{data.get('margin_mode')} — полный сырой ответ API: {json.dumps(data)}")
+        return result
     except Exception as e:
         olog(f"⚠ gate_get_balance: {_explain_error(e)}")
         return 0.0
