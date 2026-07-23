@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.78 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.79 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.79: по прямому запросу — "задержка просто по факту запуска
+  позднего, такие сигналы неактуальны, зачем их слать" (RIF/ESPORTS,
+  16-17 мин задержки при debug-разбивке очередь+лимит+запрос всего
+  ~11-13 сек). Раньше уже пробовали резать по ИТОГОВОЙ задержке — не
+  годилось, тогда она была большой почти у всех сигналов. Теперь режем
+  точнее: смотрим, сколько времени прошло ДО постановки в очередь
+  (submitted_ts - bar_close_ts, новое поле debug_submitted_ts) — если
+  событие уже было старым, когда его только поставили на обработку, это
+  типичный след пропущенного цикла/рестарта, а не нормальная рабочая
+  задержка (та обычно секунды, судя по debug-полям). Порог — 5 минут
+  (STRETCH_ALERT_MAX_STALENESS_SEC). Запись всё равно остаётся в истории
+  для статистики — режем только отправку алерта в Telegram.
 - v0.30.78: по прямому запросу — приоритет ранжирования топ-связки
   (та, по которой шлются алерты) отдан винрейту тейк/стоп
   (signal_win_rate), не stop_survival_rate, как было с v0.30.60.
@@ -1773,7 +1785,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.78"
+APP_VERSION  = "0.30.79"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -8969,6 +8981,7 @@ def _stretch_check_symbol(symbol, tf, submitted_ts=None):
             "ts": int(now), "symbol": symbol, "tf": tf, "period": period,
             "bar_close_ts": bar_close_ts,   # v0.30.63: по прямому запросу — прозрачность задержки: реальный момент закрытия свечи, не момент обнаружения
             "debug_queue_wait_sec": queue_wait_sec,     # v0.30.72: сколько ждала своей очереди у 24 потоков
+            "debug_submitted_ts": submitted_ts,   # v0.30.79: момент постановки в очередь — нужен, чтобы отличить "долго обрабатывали" от "долго ждала своей очереди после закрытия свечи" (типично после рестарта)
             "debug_gate_wait_sec": ctx.get("_debug_gate_wait_sec"),   # сколько ждала в ограничителе скорости (8 запросов/сек)
             "debug_fetch_sec": ctx.get("_debug_fetch_sec"),           # сколько занял сам сетевой запрос к Gate.io
             "trigger_price": closed_price, "trigger_ema": _round_price(ema_closed),
@@ -9093,6 +9106,7 @@ def _stretch_diag_scan_loop():
 
 
 STRETCH_TOP_ALERT_MIN_EVENTS = 10   # v0.30.53: не объявляем "топовую связку" по горстке случайных событий — ждём минимум столько оценённых, прежде чем на неё начать алертить
+STRETCH_ALERT_MAX_STALENESS_SEC = 300   # v0.30.79: по прямому запросу — "задержка по факту позднего запуска, сигнал неактуален, зачем слать". 5 минут "мёртвого" времени ДО постановки в очередь (не путать с самой обработкой — та обычно секунды) — типичный признак пропущенного цикла/рестарта, не нормальная рабочая задержка
 
 
 def _stretch_render_alert_chart(rec):
@@ -9158,6 +9172,27 @@ def _stretch_diag_maybe_alert_top_combo(new_recs):
         if rec["tf"] != top_tf or rec["period"] != top_period:
             continue
         lag_sec = max(0, int(time.time() - rec.get("bar_close_ts", rec["ts"])))
+        # v0.30.79: по прямому запросу — "задержка просто по факту запуска
+        # позднего, такие сигналы неактуальны, зачем их слать". Раньше
+        # уже пробовали резать по общей задержке — не годилось, тогда
+        # задержка была большой почти у всех сигналов. Теперь режем точнее:
+        # смотрим не на ИТОГОВУЮ задержку, а на то, сколько времени прошло
+        # ДО постановки в очередь (submitted_ts - bar_close_ts) — если
+        # событие уже было старым, когда его только поставили на
+        # обработку, это типичный след пропущенного цикла/рестарта, не
+        # нормальная рабочая задержка. Сама обработка (очередь+лимит+
+        # запрос) обычно занимает секунды — если общая задержка сильно
+        # больше их суммы, разница и есть этот "мёртвый" период. Запись
+        # всё равно остаётся в истории для статистики — режем только
+        # отправку алерта.
+        submitted_ts = rec.get("debug_submitted_ts")
+        if submitted_ts:
+            staleness_before_queue = submitted_ts - rec.get("bar_close_ts", submitted_ts)
+            if staleness_before_queue > STRETCH_ALERT_MAX_STALENESS_SEC:
+                olog(f"[ema_stretch] {rec['symbol']} {top_tf} EMA{top_period}: "
+                     f"алерт пропущен — событие устарело ещё до постановки в очередь "
+                     f"({round(staleness_before_queue/60,1)} мин, типичный след рестарта)")
+                continue
         lag_txt = f"{lag_sec}с" if lag_sec < 60 else f"{lag_sec // 60}м{lag_sec % 60}с"
         qw, gw, fs = rec.get("debug_queue_wait_sec"), rec.get("debug_gate_wait_sec"), rec.get("debug_fetch_sec")
         debug_txt = (f" (очередь {qw}с, рейт-лимит {gw}с, запрос {fs}с)"
