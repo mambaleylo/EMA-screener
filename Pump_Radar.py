@@ -1,7 +1,33 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.94 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.95 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.95: по прямому запросу — три отдельных доработки.
+  (1) Скан "Отрыва от EMA" теперь можно ограничить выбранными параметрами
+  ЕМА+ТФ — на странице /ema_stretch новый блок с галочками напротив
+  каждого периода (5/10/20) и каждого ТФ (15m/30m/1h/4h), настройка
+  /stretch_scan_settings, персистится на диск. По умолчанию выбрано всё
+  (поведение не меняется, пока пользователь явно не снимет галочки) —
+  пустой список с любой из сторон трактуется как "выбрано всё", чтобы
+  случайно снятые все галочки не остановили скан молча.
+  (2) Автоторговля для "Отрыва от EMA" раньше была намертво привязана к
+  топ-связке по винрейту (_stretch_diag_maybe_alert_top_combo вызывала
+  её только для сигналов текущего лидера) — то есть по факту всегда
+  "топ 1", список для торговли менялся сам без участия пользователя.
+  Теперь отвязано: в настройках автоторговли — своя матрица галочек
+  (ТФ×период, отдельно для фейда и продолжения), торговля идёт СТРОГО
+  по выбранным пользователем конфигам, независимо от того, кто сейчас
+  лидер по винрейту и ушёл ли по этой конкретной связке алерт в
+  Telegram. Секция настроек также показывает, по каким конфигам сейчас
+  реально ведётся автоторговля. Проверка на устаревание сигнала
+  (staleness, было только у алертов) вынесена в отдельную функцию
+  _stretch_rec_is_stale и применяется теперь и здесь — не торгуем по
+  сигналу, который уже неактуален к моменту обработки, даже если он не
+  идёт в Telegram.
+  (3) Лог-файл на диске (~/pumpradar.log, до этого писался только в
+  память для веб-страницы и терялся при рестарте) — с ротацией по
+  размеру, не более 5 МБ: при превышении обрезается снизу (отбрасывается
+  старая часть), в файле остаётся хвост.
 - v0.30.94: по прямому сообщению "раньше баланс видело без проблем" —
   автосделка не открылась из-за RuntimeError "Нет баланса: 0.0", хотя в
   логе видно margin_mode=3 (не обычный cross), available=0.0 и
@@ -1956,7 +1982,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.94"
+APP_VERSION  = "0.30.95"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2800,12 +2826,48 @@ def _save_gate_cfg():
 def _ts():
     return time.strftime("[%H:%M:%S]")
 
+LOG_FILE = os.path.expanduser("~/pumpradar.log")
+LOG_FILE_MAX_BYTES = 5 * 1024 * 1024   # v0.30.95: по прямому запросу — лог на диске не должен расти бесконечно (места на телефоне ограничено)
+LOG_FILE_TRIM_TARGET_BYTES = int(LOG_FILE_MAX_BYTES * 0.8)   # обрезаем не ровно до лимита, а с запасом — иначе обрезка запускалась бы почти на каждой следующей строке
+
+
+def _log_file_write(line):
+    """Дописывает строку в постоянный лог-файл на диске (в дополнение к
+    in-memory логу для веб-страницы — тот при рестарте процесса теряется,
+    этот переживает). Если файл перерос LOG_FILE_MAX_BYTES — обрезается
+    СНИЗУ (отбрасывается старая часть), остаётся хвост ~80% от лимита, не
+    ровно по границе. Ошибка записи лога не должна ронять процесс —
+    любое исключение здесь молча проглатывается."""
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        try:
+            size = os.path.getsize(LOG_FILE)
+        except OSError:
+            return
+        if size > LOG_FILE_MAX_BYTES:
+            with open(LOG_FILE, "rb") as f:
+                f.seek(-LOG_FILE_TRIM_TARGET_BYTES, os.SEEK_END)
+                tail = f.read()
+            nl = tail.find(b"\n")   # не начинать файл с обрубленной посередине строки
+            if nl != -1:
+                tail = tail[nl + 1:]
+            tmp_path = LOG_FILE + f".tmp{os.getpid()}"
+            with open(tmp_path, "wb") as f:
+                f.write(tail)
+            os.replace(tmp_path, LOG_FILE)
+    except Exception:
+        pass
+
+
 def olog(msg):
     with _log_lock:
-        opt_state["logs"].append({"ts": time.strftime("%H:%M:%S"), "msg": msg})
+        ts = time.strftime("%H:%M:%S")
+        opt_state["logs"].append({"ts": ts, "msg": msg})
         if len(opt_state["logs"]) > 500:
             opt_state["logs"] = opt_state["logs"][-300:]
             opt_state["logs_dropped"] = opt_state.get("logs_dropped",0) + 200
+        _log_file_write(f"[{ts}] {msg}")
 
 def _explain_error(e):
     """v0.30.0: по прямому запросу — раньше в логах текст самого исключения
@@ -8996,6 +9058,57 @@ def _diag_summary(min_touches=3):
 # по прямому уточнению, отрыв смотрим именно от короткой EMA. ТФ от 15 минут.
 STRETCH_DIAG_PERIODS = [5, 10, 20]
 STRETCH_DIAG_TIMEFRAMES = ["15m", "30m", "1h", "4h"]
+
+# v0.30.95: по прямому запросу — скан "Отрыва от EMA" можно ограничить
+# выбранными параметрами ЕМА+ТФ (галочки на странице /ema_stretch), чтобы
+# не гонять все 3×4=12 связок, если интересны только некоторые. По
+# умолчанию (файла конфига ещё нет, или списки в нём пустые) — выбрано
+# всё, поведение как раньше. Пустой список с любой из сторон трактуется
+# как "выбрано всё" — если пользователь случайно снял все галочки,
+# безопаснее вернуться к старому поведению (сканировать всё), чем молча
+# остановить весь скан.
+STRETCH_SCAN_CFG_FILE = os.path.expanduser("~/pumpradar_stretch_scan_cfg.json")
+_stretch_scan_cfg_lock = threading.Lock()
+_stretch_scan_cfg_state = {
+    "periods": list(STRETCH_DIAG_PERIODS),
+    "timeframes": list(STRETCH_DIAG_TIMEFRAMES),
+}
+
+
+def _load_stretch_scan_cfg():
+    try:
+        with open(STRETCH_SCAN_CFG_FILE) as f:
+            saved = json.load(f)
+        with _stretch_scan_cfg_lock:
+            for k in ("periods", "timeframes"):
+                if k in saved and isinstance(saved[k], list):
+                    _stretch_scan_cfg_state[k] = saved[k]
+    except Exception:
+        pass
+
+
+def _save_stretch_scan_cfg():
+    try:
+        with _stretch_scan_cfg_lock:
+            snapshot = dict(_stretch_scan_cfg_state)
+        with open(STRETCH_SCAN_CFG_FILE, "w") as f:
+            json.dump(snapshot, f)
+    except Exception as e:
+        olog(f"[ema_stretch] ⚠ не смог сохранить настройки скана: {_explain_error(e)}")
+
+
+def _stretch_scan_active_timeframes():
+    with _stretch_scan_cfg_lock:
+        tfs = [tf for tf in STRETCH_DIAG_TIMEFRAMES if tf in _stretch_scan_cfg_state["timeframes"]]
+    return tfs or list(STRETCH_DIAG_TIMEFRAMES)
+
+
+def _stretch_scan_active_periods():
+    with _stretch_scan_cfg_lock:
+        periods = [p for p in STRETCH_DIAG_PERIODS if p in _stretch_scan_cfg_state["periods"]]
+    return periods or list(STRETCH_DIAG_PERIODS)
+
+
 STRETCH_DIAG_FETCH_DAYS = {"15m": 10, "30m": 15, "1h": 30, "4h": 60}
 STRETCH_DIAG_MIN_PCT = 1.0          # минимальный % отрыва ВВЕРХ от EMA, чтобы зафиксировать событие (v0.30.52: только вверх, см. _stretch_check_symbol) — иначе шум почти на каждой свече
 STRETCH_TREND_LOOKBACK_BARS = 20    # v0.30.90: по прямому запросу — "затишье vs тренд" — сколько баров ДО триггерной свечи смотрим, чтобы измерить фон, на котором произошёл отрыв
@@ -9178,7 +9291,7 @@ def _stretch_check_symbol(symbol, tf, submitted_ts=None):
         if avg_vol > 0:
             trigger_vol_ratio = round(trigger_vol / avg_vol, 2)
     out = []
-    for period in STRETCH_DIAG_PERIODS:
+    for period in _stretch_scan_active_periods():   # v0.30.95: по прямому запросу — скан только по выбранным ЕМА (галочки в настройках), ema_arrays выше всё равно посчитаны для всех STRETCH_DIAG_PERIODS (дёшево, кэш общий), фильтр только на генерацию сигналов
         ema_closed = ctx["ema_arrays"][period][ctx["i"]]
         if ema_closed is None:
             continue
@@ -9301,10 +9414,11 @@ def _stretch_diag_scan_loop():
             # немногих, кому СЕЙЧАС реально нужен свежий фетч. Теперь
             # заранее фильтруем — в пул уходят только те (symbol, tf), у
             # которых кэш просрочен или ещё не создавался вообще.
+            active_tfs = _stretch_scan_active_timeframes()   # v0.30.95: по прямому запросу — скан только по выбранным ТФ (галочки в настройках)
             with _stretch_diag_ctx_cache_lock:
                 due_tasks = []
                 for symbol in symbols:
-                    for tf in STRETCH_DIAG_TIMEFRAMES:
+                    for tf in active_tfs:
                         cached = _stretch_diag_ctx_cache.get(f"{symbol}|{tf}")
                         if not cached or now0 >= cached["next_close_t"]:
                             due_tasks.append((symbol, tf))
@@ -9346,10 +9460,11 @@ def _stretch_diag_scan_loop():
                         # привязки к длительности всего прохода.
                         _stretch_diag_save()
                         _stretch_diag_maybe_alert_top_combo(fresh)
+                        _stretch_autotrade_process_fresh(fresh)   # v0.30.95: по прямому запросу — автоторговля по выбранным конфигам, не привязана к топ-связке алертов
             cycle_sec = round(time.time() - cycle_start, 1)
             _stretch_diag_last_cycle_sec = cycle_sec
             olog(f"[ema_stretch] скан завершён за {cycle_sec}с: +{added} новых отрывов "
-                 f"(задач {len(tasks)} из {len(symbols) * len(STRETCH_DIAG_TIMEFRAMES)} возможных, "
+                 f"(задач {len(tasks)} из {len(symbols) * len(active_tfs)} возможных, "
                  f"всего в истории {len(_stretch_diag_records)})")
         except Exception as e:
             olog(f"[ema_stretch] ошибка цикла сканирования: {_explain_error(e)}")
@@ -9405,6 +9520,25 @@ def _stretch_render_alert_chart(rec):
         return None, _explain_error(e)
 
 
+def _stretch_rec_is_stale(rec):
+    """v0.30.95: вынесено из _fire (было только для алерта) — событие
+    считается устаревшим, если задержка ДО постановки в очередь
+    (submitted_ts - bar_close_ts) больше STRETCH_ALERT_MAX_STALENESS_SEC
+    — типичный след пропущенного цикла/рестарта, не нормальная рабочая
+    задержка. Теперь используется и независимо в автоторговле по
+    выбранным конфигам (_stretch_autotrade_process_fresh), чтобы не
+    открывать позицию по сигналу, который уже неактуален к моменту
+    обработки, даже если по нему не отправлялся Telegram-алерт (не
+    топ-связка). Возвращает (is_stale: bool, reason: str|None)."""
+    submitted_ts = rec.get("debug_submitted_ts")
+    if submitted_ts:
+        staleness_before_queue = submitted_ts - rec.get("bar_close_ts", submitted_ts)
+        if staleness_before_queue > STRETCH_ALERT_MAX_STALENESS_SEC:
+            return True, (f"событие устарело ещё до постановки в очередь "
+                           f"({round(staleness_before_queue/60,1)} мин, типичный след рестарта)")
+    return False, None
+
+
 def _stretch_diag_maybe_alert_top_combo(new_recs):
     """По прямому запросу — "алертить топовую связку в тг": каждый скан
     заново смотрит текущий рейтинг (_stretch_diag_summary, тот же, что
@@ -9441,14 +9575,14 @@ def _stretch_diag_maybe_alert_top_combo(new_recs):
         # обработку, это типичный след пропущенного цикла/рестарта, не
         # нормальная рабочая задержка. Запись всё равно остаётся в истории
         # для статистики — режем только отправку алерта.
-        submitted_ts = rec.get("debug_submitted_ts")
-        if submitted_ts:
-            staleness_before_queue = submitted_ts - rec.get("bar_close_ts", submitted_ts)
-            if staleness_before_queue > STRETCH_ALERT_MAX_STALENESS_SEC:
-                olog(f"[ema_stretch] {rec['symbol']} {top_tf} EMA{top_period} ({label}): "
-                     f"алерт пропущен — событие устарело ещё до постановки в очередь "
-                     f"({round(staleness_before_queue/60,1)} мин, типичный след рестарта)")
-                return
+        # v0.30.95: проверка вынесена в _stretch_rec_is_stale — теперь
+        # используется и здесь, и независимо в автоторговле по выбранным
+        # конфигам (та больше не идёт следом за этим алертом).
+        stale, stale_reason = _stretch_rec_is_stale(rec)
+        if stale:
+            olog(f"[ema_stretch] {rec['symbol']} {top_tf} EMA{top_period} ({label}): "
+                 f"алерт пропущен — {stale_reason}")
+            return
         lag_txt = f"{lag_sec}с" if lag_sec < 60 else f"{lag_sec // 60}м{lag_sec % 60}с"
         qw, gw, fs = rec.get("debug_queue_wait_sec"), rec.get("debug_gate_wait_sec"), rec.get("debug_fetch_sec")
         debug_txt = (f" (очередь {qw}с, рейт-лимит {gw}с, запрос {fs}с)"
@@ -9481,7 +9615,12 @@ def _stretch_diag_maybe_alert_top_combo(new_recs):
             _send_alert(msg)
         olog(f"[ema_stretch] {rec['symbol']} {top_tf} EMA{top_period} ({label}): "
              f"алерт по топ-связке отправлен (отрыв {rec['stretch_pct']:+.2f}%)")
-        _stretch_maybe_open_live_trade(rec)   # v0.30.92: по прямому запросу — автоторговля, только для сигналов, которые реально дошли до алерта
+        # v0.30.95: автоторговля больше не вызывается отсюда — раньше
+        # была жёстко привязана к топ-связке (только для сигналов,
+        # совпавших с текущим лидером по винрейту), теперь она
+        # независимый путь по явно выбранным пользователем конфигам, см.
+        # _stretch_autotrade_process_fresh (вызывается из скан-лупа для
+        # каждого прохода, а не отсюда).
 
     for strategy, label in (("fade", "фейд"), ("continuation", "продолжение")):
         candidates = [e for e in summary if e.get("strategy", "fade") == strategy]
@@ -9538,6 +9677,7 @@ _stretch_autotrade_state = {
     "position_pct": 3.0,    # % депозита (маржи) на одну сделку
     "leverage": 10,         # v0.30.92: по памяти проекта — план торговать с фикс. 10х плечом; leverage передаётся не напрямую в _gate_open_position (та выводит плечо из risk_pct/sl_pct%), а через risk_pct = leverage × sl_pct, вычисляемый на лету под фактический стоп сигнала — так плечо получается ровно заданным независимо от того, у фейда стоп 0.5% или у продолжения 1%
     "max_concurrent": None,
+    "configs": [],   # v0.30.95: по прямому запросу — "по какому конфигу осуществлять автоторговлю, а не по топ 1". Список строк "tf|period|strategy" (напр. "15m|5|fade") — явно выбранные пользователем связки, галочки на странице. Пусто = автоторговля не откроет ни одной позиции, даже если enabled=True (раньше по умолчанию торговала по меняющейся топ-связке — теперь нужен явный выбор)
 }
 
 
@@ -9546,7 +9686,7 @@ def _load_stretch_autotrade_cfg():
         with open(STRETCH_AUTOTRADE_CFG_FILE) as f:
             saved = json.load(f)
         with _stretch_autotrade_lock:
-            for k in ("enabled", "mode", "position_pct", "leverage", "max_concurrent"):
+            for k in ("enabled", "mode", "position_pct", "leverage", "max_concurrent", "configs"):
                 if k in saved:
                     _stretch_autotrade_state[k] = saved[k]
     except Exception:
@@ -9571,10 +9711,14 @@ def _stretch_maybe_open_live_trade(rec):
     выбор, тейки и стоп из сигнала". Переиспользует уже готовый
     _gate_open_position (расчёт плеча/размера позиции, ретраи, TP/SL,
     алерты на провал — весь этот код уже был в файле от старой системы
-    EMA INVERT, просто не был подключён к отрывам от EMA). Вызывается из
-    _stretch_diag_maybe_alert_top_combo — ТОЛЬКО когда алерт реально
-    отправлен (не подавлен фильтром устаревания), чтобы не торговать по
-    сигналу, который уже неактуален к моменту обработки."""
+    EMA INVERT, просто не был подключён к отрывам от EMA).
+    v0.30.95: раньше вызывалась ТОЛЬКО из _stretch_diag_maybe_alert_top_combo
+    (то есть только для сигналов текущей топ-связки, чей алерт реально
+    ушёл). Теперь вызывается из _stretch_autotrade_process_fresh — по
+    явно выбранным пользователем конфигам, независимо от топ-связки.
+    Проверки enabled/mode здесь оставлены как есть (защита от гонки —
+    настройки могли поменяться между отбором в вызывающей функции и
+    этим вызовом)."""
     with _stretch_autotrade_lock:
         if not _stretch_autotrade_state["enabled"]:
             return
@@ -9623,6 +9767,41 @@ def _stretch_maybe_open_live_trade(rec):
             rec["live_notional"] = pos_info.get("notional")
             rec["live_opened_at"] = int(time.time())
         _stretch_diag_save()
+
+
+def _stretch_autotrade_process_fresh(fresh):
+    """v0.30.95: по прямому запросу — "по какому конфигу осуществлять
+    автоторговлю, а не по топ 1". Раньше автоторговля была жёстко
+    привязана к топ-связке по винрейту (вызывалась только из _fire,
+    только для сигналов, совпавших с текущим лидером) — список конфигов
+    для торговли менялся сам вслед за лидером, без участия пользователя.
+    Теперь независимый путь: для каждой свежей записи скана проверяем,
+    совпадает ли её (tf, period, strategy) с одним из явно выбранных
+    пользователем конфигов (галочки в настройках автоторговли,
+    _stretch_autotrade_state['configs']). Полностью отвязано от того,
+    ушёл ли по этой связке алерт в Telegram — торговый и алертовый пути
+    независимы. Проверка на устаревание (_stretch_rec_is_stale)
+    сохранена — не торгуем по сигналу, который уже неактуален к моменту
+    обработки, даже если он не идёт в Telegram."""
+    with _stretch_autotrade_lock:
+        if not _stretch_autotrade_state["enabled"]:
+            return
+        mode = _stretch_autotrade_state["mode"]
+        configs = set(_stretch_autotrade_state.get("configs") or [])
+    if mode == "off" or not configs:
+        return
+    for rec in fresh:
+        if rec.get("direction") != mode:
+            continue
+        cfg_key = f"{rec['tf']}|{rec['period']}|{rec.get('strategy', 'fade')}"
+        if cfg_key not in configs:
+            continue
+        stale, reason = _stretch_rec_is_stale(rec)
+        if stale:
+            olog(f"[stretch_autotrade] {rec['symbol']} {rec['tf']} EMA{rec['period']}: "
+                 f"сигнал пропущен для автоторговли — {reason}")
+            continue
+        _stretch_maybe_open_live_trade(rec)
 
 
 def _stretch_autotrade_watch_loop():
@@ -11024,9 +11203,17 @@ select,input{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-ra
 <p style="color:#3fb950;font-size:12px;max-width:520px">С v0.30.67 это уже настоящий сигнал: Вход = цена триггера, Стоп = вход+2% (SHORT — цена ушла вверх, ждём падения), Тейк = уровень EMA. Исход (тейк/стоп/таймаут) считается в реальном порядке событий — если стоп задело раньше, чем цена дошла до EMA, это "stop", даже если ПОЗЖЕ цена всё равно дошла бы до цели (реальной позиции бы уже не было). Колонка "Винрейт тейк/стоп" — по этому честному исходу.</p>
 <p style="color:#58a6ff;font-size:12px;max-width:520px">С v0.30.83 — вторая, отдельная стратегия: "📈 продолжение" (LONG). Данные показали, что отрывы больше 2% почти никогда не откатываются до фиксированного стопа — это чаще реальный тренд, не перегрев. Для таких случаев теперь отдельный сигнал на продолжение импульса вместо фейда. Стоп 1% / тейк 2% (RR 2:1, узкий стоп — зеркально фейду, настоящий тренд не должен откатываться сильно) — ⚠️ экспериментально, НЕ откалибровано по своим историческим данным, копим статистику с нуля так же, как и с фейдом в своё время.</p>
 
+<div class="section-card">
+  <h3>&#9989; Скан только по выбранным ЕМА+ТФ</h3>
+  <p style="color:#8b949e;font-size:12px">По умолчанию скан проверяет все связки (ЕМА5/10/20 × 15м/30м/1h/4h). Сними лишние галочки, чтобы сканировать только интересующие параметры — сэкономит запросы к бирже. Если снять все галочки с одной из сторон, скан вернётся к "всё" (защита от случайной остановки).</p>
+  <div id="scanFilterBox" style="display:flex;gap:24px;flex-wrap:wrap;margin:8px 0"></div>
+  <button onclick="saveScanSettings()">&#128190; Сохранить</button>
+  <div id="scanFilterStatus" style="font-size:12px;color:#8b949e;margin-top:6px"></div>
+</div>
+
 <div class="section-card" style="border:1px solid #f85149">
   <h3 style="color:#f85149">&#9888;&#65039; Автоторговля (реальные деньги)</h3>
-  <p style="color:#8b949e;font-size:12px">Открывает настоящую позицию на Gate.io, когда алерт по топ-связке реально отправлен (не подавлен фильтром устаревания). Вход/стоп/тейк — из самого сигнала, плечо — фиксированное (задаётся ниже, по умолчанию 10х). Выключено по умолчанию — включай осознанно.</p>
+  <p style="color:#8b949e;font-size:12px">Открывает настоящую позицию на Gate.io. С v0.30.95 — СТРОГО по выбранным ниже конфигам (галочки ТФ×ЕМА, отдельно для фейда и продолжения), а не по меняющейся топ-связке. Вход/стоп/тейк — из самого сигнала, плечо — фиксированное (задаётся ниже, по умолчанию 10х). Выключено по умолчанию — включай осознанно.</p>
   <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0">
     <label style="font-size:13px;color:#c9d1d9">Режим:
       <select id="autoTradeMode" style="background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px">
@@ -11042,6 +11229,8 @@ select,input{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-ra
       <input type="number" id="autoTradeLev" step="1" min="1" max="20" style="width:60px;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px">
     </label>
   </div>
+  <div style="font-size:13px;color:#c9d1d9;margin:8px 0 4px">По каким конфигам ведётся автоторговля:</div>
+  <div id="autoTradeConfigsBox" style="display:flex;gap:24px;flex-wrap:wrap;margin:8px 0"></div>
   <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
     <label style="display:flex;gap:6px;align-items:center;font-size:13px;color:#c9d1d9;cursor:pointer">
       <input type="checkbox" id="autoTradeEnabled" style="width:16px;height:16px">
@@ -11050,8 +11239,10 @@ select,input{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-ra
     <button onclick="saveAutoTradeSettings()">&#128190; Сохранить</button>
   </div>
   <div id="autoTradeStatus" style="font-size:12px;color:#8b949e;margin-top:6px"></div>
+  <div id="autoTradeActiveConfigs" style="font-size:12px;color:#8b949e;margin-top:6px"></div>
   <div id="autoTradeLive" style="font-size:12px;margin-top:8px"></div>
 </div>
+
 
 <div class="section-card">
   <div class="section-head">
@@ -11153,15 +11344,93 @@ async function clearStretchHistory(){
   }catch(e){ alert('Ошибка запроса'); }
 }
 
+const STRETCH_PERIODS = [5,10,20];
+const STRETCH_TFS = ["15m","30m","1h","4h"];
+const STRETCH_STRATEGIES = [["fade","Фейд (SHORT, возврат к EMA)"],["continuation","Продолжение (LONG, на импульс)"]];
+
+function buildScanFilterUI(){
+  const box = document.getElementById('scanFilterBox');
+  let html = '<div><div style="font-size:12px;color:#8b949e;margin-bottom:4px">ЕМА периоды</div>';
+  for(const p of STRETCH_PERIODS){
+    html += `<label style="display:flex;gap:6px;align-items:center;font-size:13px;color:#c9d1d9;cursor:pointer;margin-bottom:4px"><input type="checkbox" id="scanPeriod_${p}" style="width:16px;height:16px">EMA${p}</label>`;
+  }
+  html += '</div><div><div style="font-size:12px;color:#8b949e;margin-bottom:4px">Таймфреймы</div>';
+  for(const tf of STRETCH_TFS){
+    html += `<label style="display:flex;gap:6px;align-items:center;font-size:13px;color:#c9d1d9;cursor:pointer;margin-bottom:4px"><input type="checkbox" id="scanTf_${tf}" style="width:16px;height:16px">${tf}</label>`;
+  }
+  html += '</div>';
+  box.innerHTML = html;
+}
+buildScanFilterUI();
+
+async function loadScanSettings(){
+  const statusEl = document.getElementById('scanFilterStatus');
+  try{
+    const r = await fetch('/stretch_scan_settings'); const d = await r.json();
+    const periods = (d.periods && d.periods.length) ? d.periods : (d.all_periods || STRETCH_PERIODS);
+    const tfs = (d.timeframes && d.timeframes.length) ? d.timeframes : (d.all_timeframes || STRETCH_TFS);
+    for(const p of STRETCH_PERIODS){ const el = document.getElementById(`scanPeriod_${p}`); if(el) el.checked = periods.includes(p); }
+    for(const tf of STRETCH_TFS){ const el = document.getElementById(`scanTf_${tf}`); if(el) el.checked = tfs.includes(tf); }
+    statusEl.innerText = '';
+  }catch(e){ statusEl.innerText = 'Ошибка загрузки настроек скана'; }
+}
+
+async function saveScanSettings(){
+  const statusEl = document.getElementById('scanFilterStatus');
+  const periods = STRETCH_PERIODS.filter(p => document.getElementById(`scanPeriod_${p}`).checked);
+  const timeframes = STRETCH_TFS.filter(tf => document.getElementById(`scanTf_${tf}`).checked);
+  try{
+    const r = await fetch('/stretch_scan_settings', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({periods, timeframes})});
+    const d = await r.json();
+    statusEl.style.color = d.ok ? '#3fb950' : '#f85149';
+    statusEl.innerText = d.ok ? 'Настройки скана сохранены' : (d.msg || 'Ошибка сохранения');
+    if(d.ok) loadScanSettings();
+  }catch(e){ statusEl.style.color = '#f85149'; statusEl.innerText = 'Ошибка запроса'; }
+}
+loadScanSettings();
+
+function buildAutoTradeConfigsUI(){
+  const box = document.getElementById('autoTradeConfigsBox');
+  let html = '';
+  for(const [strat, label] of STRETCH_STRATEGIES){
+    html += `<div><div style="font-size:12px;color:#8b949e;margin-bottom:4px">${label}</div>`;
+    html += '<table style="border-collapse:collapse"><thead><tr><th></th>' + STRETCH_TFS.map(tf=>`<th style="font-size:11px;color:#8b949e;padding:2px 6px">${tf}</th>`).join('') + '</tr></thead><tbody>';
+    for(const p of STRETCH_PERIODS){
+      html += `<tr><td style="font-size:11px;color:#8b949e;padding:2px 6px">EMA${p}</td>`;
+      for(const tf of STRETCH_TFS){
+        html += `<td style="text-align:center;padding:2px 6px"><input type="checkbox" id="autoCfg_${tf}_${p}_${strat}" style="width:14px;height:14px"></td>`;
+      }
+      html += '</tr>';
+    }
+    html += '</tbody></table></div>';
+  }
+  box.innerHTML = html;
+}
+buildAutoTradeConfigsUI();
+
 async function loadAutoTradeSettings(){
   const statusEl = document.getElementById('autoTradeStatus');
   const liveEl = document.getElementById('autoTradeLive');
+  const activeEl = document.getElementById('autoTradeActiveConfigs');
   try{
     const r = await fetch('/stretch_autotrade_settings'); const d = await r.json();
     document.getElementById('autoTradeMode').value = d.mode || 'off';
     document.getElementById('autoTradePct').value = d.position_pct ?? 3.0;
     document.getElementById('autoTradeLev').value = d.leverage ?? 10;
     document.getElementById('autoTradeEnabled').checked = !!d.enabled;
+    const configs = d.configs || [];
+    for(const [strat] of STRETCH_STRATEGIES){
+      for(const p of STRETCH_PERIODS){
+        for(const tf of STRETCH_TFS){
+          const el = document.getElementById(`autoCfg_${tf}_${p}_${strat}`);
+          if(el) el.checked = configs.includes(`${tf}|${p}|${strat}`);
+        }
+      }
+    }
+    activeEl.innerText = configs.length
+      ? `Автоторговля ведётся по: ${configs.join(', ')}`
+      : 'Ни один конфиг не выбран — автоторговля не откроет ни одной позиции, даже если включена';
     statusEl.style.color = d.gate_configured ? '#3fb950' : '#f85149';
     statusEl.innerText = d.gate_configured ? 'Ключи Gate.io настроены' : 'Ключи Gate.io НЕ настроены (страница /gate_cfg) — включить нельзя';
     const live = d.live_positions || [];
@@ -11179,10 +11448,20 @@ async function saveAutoTradeSettings(){
   const pct = parseFloat(document.getElementById('autoTradePct').value);
   const lev = parseInt(document.getElementById('autoTradeLev').value);
   const enabled = document.getElementById('autoTradeEnabled').checked;
-  if(enabled && !confirm(`Точно включить автоторговлю? Режим: ${mode}, ${pct}% депозита на сделку, плечо ${lev}×. Это реальные деньги на Gate.io.`)) return;
+  const configs = [];
+  for(const [strat] of STRETCH_STRATEGIES){
+    for(const p of STRETCH_PERIODS){
+      for(const tf of STRETCH_TFS){
+        const el = document.getElementById(`autoCfg_${tf}_${p}_${strat}`);
+        if(el && el.checked) configs.push(`${tf}|${p}|${strat}`);
+      }
+    }
+  }
+  if(enabled && !configs.length && !confirm('Ни один конфиг не выбран — автоторговля не откроет ни одной позиции. Всё равно включить?')) return;
+  if(enabled && !confirm(`Точно включить автоторговлю? Режим: ${mode}, ${pct}% депозита на сделку, плечо ${lev}×, конфигов выбрано: ${configs.length}. Это реальные деньги на Gate.io.`)) return;
   try{
     const r = await fetch('/stretch_autotrade_settings', {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({mode, position_pct: pct, leverage: lev, enabled})});
+      body: JSON.stringify({mode, position_pct: pct, leverage: lev, enabled, configs})});
     const d = await r.json();
     statusEl.style.color = d.ok ? '#3fb950' : '#f85149';
     statusEl.innerText = d.ok ? 'Настройки сохранены' : (d.msg || 'Ошибка сохранения');
@@ -11891,6 +12170,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                        "notional": r.get("live_notional"), "opened_at": r.get("live_opened_at")}
                                       for r in live_open]
             self._json(cfg)
+        elif self.path == "/stretch_scan_settings":
+            # v0.30.95: по прямому запросу — какие ЕМА+ТФ сейчас реально
+            # выбраны для скана "Отрыва от EMA" (галочки на странице)
+            with _stretch_scan_cfg_lock:
+                cfg = dict(_stretch_scan_cfg_state)
+            cfg["all_periods"] = list(STRETCH_DIAG_PERIODS)
+            cfg["all_timeframes"] = list(STRETCH_DIAG_TIMEFRAMES)
+            self._json(cfg)
         elif self.path == "/ema_stretch_export":
             with _stretch_diag_lock:
                 items = list(_stretch_diag_records)
@@ -12102,6 +12389,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         errors.append("нельзя включить — не настроены ключи Gate.io (страница /gate_cfg)")
                     else:
                         kwargs["enabled"] = enabled
+                if "configs" in body:
+                    # v0.30.95: по прямому запросу — "по какому конфигу
+                    # осуществлять автоторговлю, а не по топ 1". Список
+                    # строк "tf|period|strategy" — галочки на странице.
+                    # Валидация: каждый элемент должен разбираться на
+                    # известные tf/period/strategy, иначе опечатка в теле
+                    # запроса тихо создала бы "мёртвый" конфиг, который
+                    # никогда ни с чем не совпадёт.
+                    raw_configs = body["configs"]
+                    if not isinstance(raw_configs, list):
+                        errors.append("configs: должен быть списком строк вида 'tf|period|strategy'")
+                    else:
+                        valid_tfs = set(STRETCH_DIAG_TIMEFRAMES)
+                        valid_periods = {str(p) for p in STRETCH_DIAG_PERIODS}
+                        valid_strategies = {"fade", "continuation"}
+                        cleaned = []
+                        for c in raw_configs:
+                            parts = str(c).split("|")
+                            if len(parts) != 3 or parts[0] not in valid_tfs or parts[1] not in valid_periods or parts[2] not in valid_strategies:
+                                errors.append(f"configs: неизвестная связка {c!r}")
+                                continue
+                            cleaned.append(f"{parts[0]}|{parts[1]}|{parts[2]}")
+                        if not errors:
+                            kwargs["configs"] = cleaned
                 if errors:
                     self._json({"ok": False, "msg": "; ".join(errors)}); return
                 with _stretch_autotrade_lock:
@@ -12110,6 +12421,48 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 olog(f"[stretch_autotrade] настройки обновлены: {kwargs}")
                 with _stretch_autotrade_lock:
                     self._json({"ok": True, **_stretch_autotrade_state})
+            except (TypeError, ValueError) as e:
+                self._json({"ok": False, "msg": f"ошибка в значении: {_explain_error(e)}"})
+
+        elif self.path == "/stretch_scan_settings":
+            # v0.30.95: по прямому запросу — скан "Отрыва от EMA" только по
+            # выбранным параметрам ЕМА+ТФ (галочки на странице).
+            try:
+                errors = []
+                kwargs = {}
+                if "periods" in body:
+                    raw = body["periods"]
+                    if not isinstance(raw, list):
+                        errors.append("periods: должен быть списком чисел")
+                    else:
+                        try:
+                            periods = [int(p) for p in raw]
+                        except (TypeError, ValueError):
+                            errors.append("periods: все значения должны быть числами")
+                        else:
+                            bad = [p for p in periods if p not in STRETCH_DIAG_PERIODS]
+                            if bad:
+                                errors.append(f"periods: неизвестные значения {bad} (доступны {STRETCH_DIAG_PERIODS})")
+                            else:
+                                kwargs["periods"] = periods
+                if "timeframes" in body:
+                    raw = body["timeframes"]
+                    if not isinstance(raw, list):
+                        errors.append("timeframes: должен быть списком строк")
+                    else:
+                        bad = [tf for tf in raw if tf not in STRETCH_DIAG_TIMEFRAMES]
+                        if bad:
+                            errors.append(f"timeframes: неизвестные значения {bad} (доступны {STRETCH_DIAG_TIMEFRAMES})")
+                        else:
+                            kwargs["timeframes"] = list(raw)
+                if errors:
+                    self._json({"ok": False, "msg": "; ".join(errors)}); return
+                with _stretch_scan_cfg_lock:
+                    _stretch_scan_cfg_state.update(kwargs)
+                _save_stretch_scan_cfg()
+                olog(f"[ema_stretch] настройки скана обновлены: {kwargs}")
+                with _stretch_scan_cfg_lock:
+                    self._json({"ok": True, **_stretch_scan_cfg_state})
             except (TypeError, ValueError) as e:
                 self._json({"ok": False, "msg": f"ошибка в значении: {_explain_error(e)}"})
 
@@ -12386,6 +12739,7 @@ def main():
     _load_gate_cfg()
     _load_ema_auto_trade_cfg()
     _load_stretch_autotrade_cfg()   # v0.30.92: по прямому запросу — автоторговля для отрывов от EMA, по умолчанию enabled=False/mode=off, не активна без явного включения через UI
+    _load_stretch_scan_cfg()   # v0.30.95: по прямому запросу — выбранные ЕМА+ТФ для скана "Отрыва от EMA", по умолчанию (нет файла) — выбрано всё
     _load_pump_render_params()
     # v0.15.0: КРИТИЧНЫЙ фикс — раньше история EMA-сигналов подхватывалась
     # только внутри _weekly_ema_touch_loop; когда в v0.13.0 этот цикл
