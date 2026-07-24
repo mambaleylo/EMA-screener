@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.30.96 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.30.97 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.30.97: по прямому запросу — кнопка "Очистить логи" рядом с блоком
+  "Логи" на страницах (эндпоинт /ema_logs_clear). Чистит ОБА хранилища
+  разом: in-memory (opt_state["logs"], то, что видно на странице) и
+  постоянный файл на диске (~/pumpradar.log, v0.30.95) — это отдельная
+  вещь от кнопки "Очистить историю" у "Отрыва от EMA" (та трогает только
+  сами записи об отрывах, не логи вообще).
 - v0.30.96: серьёзный реальный баг, найден по прямому вопросу "стоп по
   bill и magma, что скажешь по винрейту" — BILL_USDT дал 483
   continuation-записи, но ТОЛЬКО 34 уникальные комбинации (tf, период,
@@ -2000,7 +2006,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.30.96"
+APP_VERSION  = "0.30.97"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4294,6 +4300,7 @@ details[open] summary:before{content:"▾ "}
 <div class="section-card">
   <details id="logDetails">
     <summary><h3 style="display:inline">&#128221; Логи</h3></summary>
+    <div style="margin-top:6px"><button onclick="clearLogs()" style="background:#3a1414;border:1px solid #f85149;color:#f85149">🗑 Очистить логи</button></div>
     <div class="card log-box" id="logBox" style="margin-top:8px"></div>
   </details>
 </div>
@@ -4521,6 +4528,15 @@ async function pollPumpLogs(){
 }
 
 pollPumpLogs(); setInterval(pollPumpLogs, 4000);
+async function clearLogs(){
+  if(!confirm('Точно очистить все логи (в памяти и на диске)? Это нельзя отменить.')) return;
+  try{
+    const r = await fetch('/ema_logs_clear', {method:'POST'});
+    const d = await r.json();
+    if(d.ok){ document.getElementById('logBox').innerHTML=''; pumpLogsTotal = 0; }
+    else{ alert(d.msg || 'Не получилось очистить'); }
+  }catch(e){ alert('Ошибка запроса'); }
+}
 async function loadSourceStats(){
   try{
     const r = await fetch('/weekly_ema_source_stats'); const d = await r.json();
@@ -4668,6 +4684,7 @@ details[open] summary:before{content:"▾ "}
 <div class="section-card">
   <details id="logDetails">
     <summary><h3 style="display:inline">&#128221; Логи</h3></summary>
+    <div style="margin-top:6px"><button onclick="clearLogs()" style="background:#3a1414;border:1px solid #f85149;color:#f85149">🗑 Очистить логи</button></div>
     <div class="card log-box" id="logBox" style="margin-top:8px"></div>
   </details>
 </div>
@@ -4990,6 +5007,15 @@ async function pollEmaLogs(){
 }
 
 pollEmaLogs(); setInterval(pollEmaLogs, 4000);
+async function clearLogs(){
+  if(!confirm('Точно очистить все логи (в памяти и на диске)? Это нельзя отменить.')) return;
+  try{
+    const r = await fetch('/ema_logs_clear', {method:'POST'});
+    const d = await r.json();
+    if(d.ok){ document.getElementById('logBox').innerHTML=''; emaLogsTotal = 0; }
+    else{ alert(d.msg || 'Не получилось очистить'); }
+  }catch(e){ alert('Ошибка запроса'); }
+}
 refresh(); setInterval(refresh, 5000);
 refreshAutoTradeBox(); setInterval(refreshAutoTradeBox, 5000);
 refreshPumps(); setInterval(refreshPumps, 8000);
@@ -12370,6 +12396,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 _weekly_ema_recent = []
                 _save_weekly_ema_history()
             olog("[weekly_ema] история EMA-сигналов очищена вручную")
+            self._json({"ok": True})
+
+        elif self.path == "/ema_logs_clear":
+            # v0.30.97: по прямому запросу — "добавь [кнопку очистки логов]".
+            # Чистит ОБА хранилища логов разом: in-memory (opt_state["logs"],
+            # то, что видно на странице) и постоянный файл на диске
+            # (~/pumpradar.log, v0.30.95) — раньше это были две разные вещи,
+            # кнопка "Очистить историю" у "Отрыва от EMA" их не трогала
+            # вообще (чистит только сами записи об отрывах, не логи).
+            with opt_lock:
+                opt_state["logs"] = []
+                opt_state["logs_dropped"] = 0
+            try:
+                open(LOG_FILE, "w").close()
+            except Exception as e:
+                self._json({"ok": False, "msg": f"логи в памяти очищены, но файл на диске — нет: {_explain_error(e)}"})
+                return
+            olog("[logs] логи очищены вручную (в памяти и на диске)")
             self._json({"ok": True})
 
         elif self.path == "/ema_stretch_history_clear":
