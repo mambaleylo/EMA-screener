@@ -1,7 +1,20 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.31.0 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.31.1 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.31.1: по прямому вопросу — "что добавить для логирования на
+  будущее". Два добавления, оба напрямую от уроков этого разговора: (1)
+  app_version — теперь на каждой записи (fade и continuation) и на самом
+  экспорте JSON целиком. За весь разговор много раз путались, какая
+  версия создала конкретную запись (несколько раз путали старый экспорт
+  со свежим) — теперь видно прямо в данных, не нужно гадать по времени
+  или сверяться с чейнджлогом. (2) Срез "режима рынка" — раз в час в лог
+  пишется медианная |trend_pct| по последним 500 событиям. Нашли, что
+  направление зависимости фейда от тренда само меняется вместе с
+  характером рынка (v0.30.90 — сильный тренд лучше, v0.31.0 — разворот,
+  затишье лучше) — теперь задним числом можно сопоставлять периоды
+  хорошей/плохой статистики с тем, был рынок трендовым или плоским в
+  этот момент, не восстанавливая это постфактум вручную.
 - v0.31.0: по прямому вопросу — "статистика плохая, дать другие тейки и
   стоп? применить фильтры из логов?". Разбор свежих данных (2323 решённых
   фейд-сигналов, 733 continuation): (1) фейд-стоп сужен 0.5%→0.25% —
@@ -2051,7 +2064,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.31.0"
+APP_VERSION  = "0.31.1"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -9402,6 +9415,7 @@ def _stretch_check_symbol(symbol, tf, submitted_ts=None):
             "trigger_price": closed_price, "trigger_ema": _round_price(ema_closed),
             "entry": entry, "stop": stop, "take": take,
             "strategy": "fade", "direction": "short",   # v0.30.83: явное поле — раньше стратегия была одна (фейд), теперь есть вторая (продолжение), нужно различать в сводке/ранжировании
+            "app_version": APP_VERSION,   # v0.31.1: по прямому запросу "что добавить для логирования" — за весь разговор путались, какая версия создала конкретную запись (несколько раз путали старый экспорт со свежим). Теперь видно прямо в самой записи, не нужно гадать по времени/чейнджлогу
             "trend_pct": trend_pct,   # v0.30.90: сила тренда ДО отрыва — по прямому запросу, для сравнения винрейта "затишье vs тренд"
             "trigger_vol_ratio": trigger_vol_ratio,   # v0.30.91: объём триггерной свечи относительно среднего фона — подтверждение реального пробоя, не тонкого шпиля
             "stretch_pct": round(stretch_pct, 3), "side": "above" if stretch_pct > 0 else "below",
@@ -9437,6 +9451,7 @@ def _stretch_check_symbol(symbol, tf, submitted_ts=None):
                 "trigger_price": closed_price, "trigger_ema": _round_price(ema_closed),
                 "entry": c_entry, "stop": c_stop, "take": c_take,
                 "strategy": "continuation", "direction": "long",
+                "app_version": APP_VERSION,
                 "trend_pct": trend_pct,
                 "trigger_vol_ratio": trigger_vol_ratio,
                 "stretch_pct": round(stretch_pct, 3), "side": "above",
@@ -9483,6 +9498,7 @@ STRETCH_DIAG_SCAN_WORKERS = 48   # v0.30.73: реальная находка —
 
 
 _stretch_diag_last_cycle_sec = None   # v0.30.66: по прямому вопросу "сколько времени уходит на цикл" — раньше никак не измерялось, только гадали по косвенным признакам (лагу). Теперь честный замер.
+_stretch_last_regime_log_ts = 0   # v0.31.1: троттлинг для срезов режима рынка — раз в час, не на каждый цикл
 
 
 def _stretch_diag_scan_loop():
@@ -9594,6 +9610,23 @@ def _stretch_diag_scan_loop():
             olog(f"[ema_stretch] скан завершён за {cycle_sec}с: +{added} новых отрывов "
                  f"(задач {len(tasks)} из {len(symbols) * len(active_tfs)} возможных, "
                  f"всего в истории {len(_stretch_diag_records)})")
+            # v0.31.1: по прямому запросу "что добавить для логирования" —
+            # нашли, что направление зависимости от trend_pct само меняется
+            # вместе с "характером рынка" (v0.30.90 vs v0.31.0, разворот).
+            # Раз в час логируем срез медианной силы тренда по последним
+            # событиям — задним числом можно будет сопоставлять периоды
+            # плохой/хорошей статистики с тем, был ли рынок трендовым или
+            # плоским в этот момент, а не гадать постфактум
+            global _stretch_last_regime_log_ts
+            now_ts = time.time()
+            if now_ts - _stretch_last_regime_log_ts > 3600:
+                with _stretch_diag_lock:
+                    recent_trend = [r["trend_pct"] for r in _stretch_diag_records[-500:] if r.get("trend_pct") is not None]
+                if recent_trend:
+                    median_trend = statistics.median(abs(t) for t in recent_trend)
+                    olog(f"[ema_stretch] 📊 срез режима рынка: медиана |trend_pct| "
+                         f"за последние {len(recent_trend)} событий = {median_trend:.2f}%")
+                _stretch_last_regime_log_ts = now_ts
         except Exception as e:
             olog(f"[ema_stretch] ошибка цикла сканирования: {_explain_error(e)}")
         time.sleep(STRETCH_DIAG_SCAN_POLL_SEC)
@@ -12327,7 +12360,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/ema_stretch_export":
             with _stretch_diag_lock:
                 items = list(_stretch_diag_records)
-            payload = {"exported_at": int(time.time()), "count": len(items),
+            payload = {"exported_at": int(time.time()), "app_version": APP_VERSION, "count": len(items),
                        "summary": _stretch_diag_summary(), "records": items}
             body = json.dumps(payload, ensure_ascii=False, indent=2).encode()
             fname = f"ema_stretch_diag_{time.strftime('%Y%m%d_%H%M')}.json"
