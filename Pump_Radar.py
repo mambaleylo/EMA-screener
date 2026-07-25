@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.31.2 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.31.3 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.31.3: по прямому сообщению "я скидывал же файл лога" — оказалось,
+  скидывать было НЕЧЕГО: страница показывала только последние 300-500
+  строк из памяти, скачать реальный файл на диске (~/pumpradar.log) было
+  негде. Добавлена кнопка "💾 Скачать лог" рядом с "Очистить логи" (эндпоинт
+  /pumpradar_log_download) — тем же паттерном, что и "Скачать JSON" у
+  истории отрывов от EMA. Теперь можно прислать настоящий файл целиком,
+  чтобы честно посчитать реальный период/объём, а не гадать по прикидкам.
 - v0.31.2: реальная находка по прямому вопросу "на сколько хватает 5 МБ
   логов" — строка "скан завершён..." писалась БЕЗУСЛОВНО на каждый цикл
   скана, а цикл теперь каждые 5с (было 45с, v0.30.99) — 9-кратный рост
@@ -2074,7 +2081,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.31.2"
+APP_VERSION  = "0.31.3"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4368,7 +4375,7 @@ details[open] summary:before{content:"▾ "}
 <div class="section-card">
   <details id="logDetails">
     <summary><h3 style="display:inline">&#128221; Логи</h3></summary>
-    <div style="margin-top:6px"><button onclick="clearLogs()" style="background:#3a1414;border:1px solid #f85149;color:#f85149">🗑 Очистить логи</button></div>
+    <div style="margin-top:6px"><a href="/pumpradar_log_download" download><button style="margin:0">💾 Скачать лог</button></a> <button onclick="clearLogs()" style="background:#3a1414;border:1px solid #f85149;color:#f85149">🗑 Очистить логи</button></div>
     <div class="card log-box" id="logBox" style="margin-top:8px"></div>
   </details>
 </div>
@@ -4752,7 +4759,7 @@ details[open] summary:before{content:"▾ "}
 <div class="section-card">
   <details id="logDetails">
     <summary><h3 style="display:inline">&#128221; Логи</h3></summary>
-    <div style="margin-top:6px"><button onclick="clearLogs()" style="background:#3a1414;border:1px solid #f85149;color:#f85149">🗑 Очистить логи</button></div>
+    <div style="margin-top:6px"><a href="/pumpradar_log_download" download><button style="margin:0">💾 Скачать лог</button></a> <button onclick="clearLogs()" style="background:#3a1414;border:1px solid #f85149;color:#f85149">🗑 Очистить логи</button></div>
     <div class="card log-box" id="logBox" style="margin-top:8px"></div>
   </details>
 </div>
@@ -12382,6 +12389,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
             cfg["all_periods"] = list(STRETCH_DIAG_PERIODS)
             cfg["all_timeframes"] = list(STRETCH_DIAG_TIMEFRAMES)
             self._json(cfg)
+        elif self.path == "/pumpradar_log_download":
+            # v0.31.3: по прямому запросу — "я скидывал же файл лога" —
+            # оказалось, скидывать было НЕЧЕГО: страница показывала только
+            # последние 300-500 строк из памяти (opt_state["logs"]), скачать
+            # реальный файл на диске (~/pumpradar.log) было негде. Теперь
+            # отдаёт файл как есть, тем же паттерном, что и "Скачать JSON"
+            # у истории отрывов от EMA.
+            try:
+                with open(LOG_FILE, "rb") as f:
+                    body = f.read()
+            except FileNotFoundError:
+                body = b"(log file does not exist yet)"
+            fname = f"pumpradar_{time.strftime('%Y%m%d_%H%M')}.log"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
+            self.send_header("Content-Length", len(body))
+            self.end_headers()
+            self.wfile.write(body)
         elif self.path == "/ema_stretch_export":
             with _stretch_diag_lock:
                 items = list(_stretch_diag_records)
