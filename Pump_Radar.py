@@ -1,7 +1,21 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.31.7 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.31.8 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.31.8: по прямому запросу — "таймаут увеличим, чтобы понимать точно
+  как закрылась сделка, или направление наоборот станет ещё привлекательнее".
+  Реальный перекос в прежних бэктестах гипотетического разворота: как
+  только у фейда резолвился СВОЙ исход (стоп 0.25% или тейк) — трек-луп
+  сразу переставал следить за записью вообще, включая максимальный отход
+  от EMA (max_adverse_stretch_pct). Если цена после резолва продолжала
+  идти дальше в направлении, важном для гипотетического разворота, этих
+  данных просто не было — не параметр бэктеста был проблемой, а сама
+  обрезанная история. Добавлено расширенное слежение: после официального
+  резолва fade-записи трек-луп ещё STRETCH_EXTENDED_TRACK_MULT=3 раза
+  дольше продолжает обновлять НОВОЕ поле max_adverse_stretch_pct_ext
+  (официальный signal_outcome не трогает, только этот отдельный
+  показатель). Нужно копить с нуля — старые записи это поле не получат
+  задним числом, только новые с этой версии.
 - v0.31.7: по прямому запросу — "файл уже 6 МБ, сократи макс до 5"
   (подтверждено: присланный ema_stretch_diag весит 6.39 МБ). Раньше
   ограничение у истории отрывов от EMA было только по КОЛИЧЕСТВУ записей
@@ -2141,7 +2155,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.31.7"
+APP_VERSION  = "0.31.8"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -9295,6 +9309,7 @@ STRETCH_DIAG_TOUCH_TOL_PCT = 0.1    # ближе этого к EMA (или пе�
 STRETCH_DIAG_SCAN_POLL_SEC = 5      # v0.30.99: реальный пересмотр по прямому вопросу "откуда 45 секунд взялись, почему не гонять заново сразу" — справедливо: due-фильтр (v0.30.68) уже гарантирует, что в большинстве циклов проверять почти нечего (due_tasks пустой или крошечный), цикл отрабатывает за доли секунды — а мы всё равно ждали до 45с ПОСЛЕ этого просто так. Снижено до 5с — единственная реальная плата: _fetch_all_symbols() (лёгкий тикер-запрос, не по монетам) дёргается в ~9 раз чаще, это разумный компромисс, не 0 (совсем без паузы рискованно долбить биржу при полностью пустых циклах)
 STRETCH_DIAG_TRACK_POLL_SEC = 60
 STRETCH_DIAG_TRACK_WINDOW_SEC = {"15m": 6 * 3600, "30m": 12 * 3600, "1h": 24 * 3600, "4h": 4 * 86400}   # с запасом под масштаб ТФ
+STRETCH_EXTENDED_TRACK_MULT = 3   # v0.31.8: по прямому запросу — насколько дольше следим за экстремумом ПОСЛЕ того, как фейд уже официально резолвился (стоп/тейк), чтобы честно оценить "а что было бы с разворотом в другую сторону" без искусственного обрыва данных слишком рано
 STRETCH_DIAG_FILE = os.path.expanduser("~/pumpradar_ema_stretch_diag.json")
 STRETCH_DIAG_MAX_RECORDS = 5000
 STRETCH_DIAG_BUCKETS = [(1, 3, "1-3%"), (3, 6, "3-6%"), (6, 999, "6%+")]   # для сводки — какой % отрыва даёт какой средний откат
@@ -9503,6 +9518,8 @@ def _stretch_check_symbol(symbol, tf, submitted_ts=None):
             "signal_outcome": "open",   # v0.30.67: "open" | "take" | "stop" | "timeout" — реальный исход С УЧЁТОМ порядка событий (что случилось раньше), не задним числом по пиковым значениям
             "last_checked_ts": int(now),
             "track_until": now + STRETCH_DIAG_TRACK_WINDOW_SEC.get(tf, 6 * 3600), "track_done": False,
+            "extended_track_until": now + STRETCH_DIAG_TRACK_WINDOW_SEC.get(tf, 6 * 3600) * STRETCH_EXTENDED_TRACK_MULT,   # v0.31.8: по прямому запросу — "таймаут увеличим, чтобы понимать точно как закрылась сделка [для гипотетического разворота]". Официальный исход фейда резолвится быстро (стоп 0.25%), но ПОСЛЕ этого слежение обычно останавливалось — не видели, куда цена шла ДАЛЬШЕ. Теперь после резолва слежение за экстремумом продолжается ещё STRETCH_EXTENDED_TRACK_MULT раз дольше — см. max_adverse_stretch_pct_ext
+            "extended_track_done": False,
         })
         if stretch_pct > STRETCH_CONTINUATION_MIN_PCT:
             # v0.30.83: по прямому запросу — "силу отрыва больше 2% можно
@@ -10143,6 +10160,50 @@ def _stretch_diag_track_loop():
         try:
             with _stretch_diag_lock:
                 open_recs = [r for r in _stretch_diag_records if not r.get("track_done", True)]
+                # v0.31.8: по прямому запросу — "таймаут увеличим, чтобы
+                # понимать точно как закрылась сделка [для гипотетического
+                # разворота]". Отдельный, более лёгкий проход по УЖЕ
+                # резолвленным fade-записям — официальный исход не трогаем,
+                # только продолжаем следить за пиковым отходом от EMA ещё
+                # STRETCH_EXTENDED_TRACK_MULT раз дольше (max_adverse_
+                # stretch_pct_ext), раз раньше слежение обрывалось сразу
+                # после резолва и не показывало, куда цена шла дальше
+                extended_recs = [r for r in _stretch_diag_records
+                                  if r.get("track_done") and r.get("strategy", "fade") == "fade"
+                                  and not r.get("extended_track_done")
+                                  and time.time() < r.get("extended_track_until", 0)]
+            if extended_recs:
+                def _process_extended(rec):
+                    try:
+                        ctx = _stretch_get_closed_ctx(rec["symbol"], rec["tf"])
+                        live_price = _gate_get_price(rec["symbol"])
+                        now_ext = time.time()
+                        if not ctx or not live_price:
+                            if now_ext >= rec.get("extended_track_until", 0):
+                                rec["extended_track_done"] = True
+                            return
+                        ema_closed = ctx["ema_arrays"][rec["period"]][ctx["i"]]
+                        ema_now = _ema_live_value(ema_closed, live_price, rec["period"]) if ema_closed else None
+                        if not ema_now:
+                            return
+                        current_stretch = (live_price - ema_now) / ema_now * 100.0
+                        crossed = (current_stretch > 0) != (rec["stretch_pct"] > 0)
+                        recent_hl = _stretch_recent_1m_high_low(rec["symbol"])
+                        worst_stretch = current_stretch
+                        if recent_hl and rec["stretch_pct"] > 0:
+                            worst_stretch = max(worst_stretch, (recent_hl[0] - ema_now) / ema_now * 100.0)
+                        base_worst = rec.get("max_adverse_stretch_pct_ext", rec.get("max_adverse_stretch_pct", rec["stretch_pct"]))
+                        if not crossed and abs(worst_stretch) > abs(base_worst):
+                            rec["max_adverse_stretch_pct_ext"] = round(worst_stretch, 3)
+                        if now_ext >= rec.get("extended_track_until", 0):
+                            rec["extended_track_done"] = True
+                    except Exception as e:
+                        olog(f"[ema_stretch_track] ⚠ расширенное слежение — пропущена битая запись "
+                             f"({rec.get('symbol', '?')}): {_explain_error(e)}")
+
+                with ThreadPoolExecutor(max_workers=STRETCH_TRACK_WORKERS) as pool:
+                    list(pool.map(_process_extended, extended_recs))
+                _stretch_diag_save()
             if open_recs:
                 now = time.time()
 
