@@ -1,7 +1,22 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.31.5 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.31.6 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.31.6: по прямому вопросу — "как поймём, какие проценты потом менять
+  по тейку и стопу" для continuation, раз v0.31.5 честно занулила
+  сломанные метрики. Реальный пробел: continuation фиксировал только
+  финальный исход (тейк/стоп/таймаут), без самого ПУТИ цены — без пути
+  нельзя задним числом прикинуть "а что если бы стоп был шире/уже".
+  Добавлен аналог MFE/MAE в трек-луп continuation: cont_best_pct
+  (насколько ДАЛЬШЕ в пользу LONG доходило когда-либо от входа) и
+  cont_worst_pct (насколько ДАЛЬШЕ против) — той же логикой диапазона за
+  15 минут, что уже используется для обнаружения самого стопа/тейка, не
+  только точечным опросом. В сводке — avg_best_pct/avg_worst_pct/
+  median_worst_pct вместо прежних None-заглушек. В сырой таблице на
+  странице для 📈 продолжения колонки "Ближайший подход%"/"Худший заход%"
+  теперь тоже показывают эти честные MFE/MAE-значения (не старые
+  EMA-относительные поля, которые никогда не обновлялись для
+  continuation) — добавлена поясняющая подпись над таблицей.
 - v0.31.5: реальный баг, найден по прямому вопросу "почему нулевые данные
   в лонгах" — оказалось, наоборот, "Выжив. при стопе" показывала
   ЛОЖНЫЕ 100% буквально у ВСЕХ continuation-строк, даже у тех с честным
@@ -2114,7 +2129,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.31.5"
+APP_VERSION  = "0.31.6"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -10113,6 +10128,31 @@ def _stretch_diag_track_loop():
                                 return False
                             recent_hl = _stretch_recent_1m_high_low(rec["symbol"])
                             stop, take = rec.get("stop"), rec.get("take")
+                            entry = rec["entry"]
+                            # v0.31.6: по прямому вопросу "как поймём, какие
+                            # проценты потом менять по тейку и стопу" —
+                            # раньше continuation фиксировал только финальный
+                            # исход (тейк/стоп/таймаут), без самого ПУТИ цены
+                            # — без пути нельзя задним числом прикинуть "а
+                            # что если бы стоп был шире/уже". Аналог MFE/MAE
+                            # (лучшая/худшая точка от входа, % в пользу LONG):
+                            # cont_best_pct — насколько ДАЛЬШЕ в нашу пользу
+                            # доходило когда-либо; cont_worst_pct — насколько
+                            # ДАЛЬШЕ против нас. И живая цена, и диапазон за
+                            # 15 мин (recent_hl) — та же логика, что уже
+                            # используется для обнаружения самого стопа/тейка
+                            best_price = max(live_price, recent_hl[0]) if recent_hl else live_price
+                            worst_price = min(live_price, recent_hl[1]) if recent_hl else live_price
+                            best_pct = round((best_price - entry) / entry * 100, 3)
+                            worst_pct = round((worst_price - entry) / entry * 100, 3)
+                            if best_pct > rec.get("cont_best_pct", best_pct):
+                                rec["cont_best_pct"] = best_pct
+                            elif "cont_best_pct" not in rec:
+                                rec["cont_best_pct"] = best_pct
+                            if worst_pct < rec.get("cont_worst_pct", worst_pct):
+                                rec["cont_worst_pct"] = worst_pct
+                            elif "cont_worst_pct" not in rec:
+                                rec["cont_worst_pct"] = worst_pct
                             stop_hit = bool(stop and live_price <= stop)
                             if not stop_hit and stop and recent_hl and recent_hl[1] <= stop:
                                 stop_hit = True   # v0.30.77-стиль: диапазон за 15 мин, не одна точка
@@ -10259,11 +10299,21 @@ def _stretch_diag_summary(min_events=3):
             # отражало реальность. Честно возвращаем None вместо ложных
             # чисел — единственная надёжная метрика для continuation это
             # signal_win_rate (уже считается отдельно, по-настоящему).
+            # v0.31.6: по прямому вопросу "как поймём, какие проценты потом
+            # менять по тейку и стопу" — вместо простого None теперь
+            # честные MFE/MAE-метрики (cont_best_pct/cont_worst_pct,
+            # см. трек-луп) — по ним можно будет прикинуть альтернативные
+            # ширины стопа/тейка задним числом, не гадая
+            best_vals = [r["cont_best_pct"] for r in items if r.get("cont_best_pct") is not None]
+            worst_vals = [r["cont_worst_pct"] for r in items if r.get("cont_worst_pct") is not None]
             base.update({
                 "touch_rate": None, "avg_retrace_pct_of_stretch": None,
                 "median_retrace_pct_of_stretch": None, "avg_time_to_touch_min": None,
                 "avg_extra_adverse_pct": None, "max_extra_adverse_pct": None,
                 "stop_survival_n": 0, "stop_survival_rate": None,
+                "avg_best_pct": round(sum(best_vals) / len(best_vals), 2) if best_vals else None,
+                "avg_worst_pct": round(sum(worst_vals) / len(worst_vals), 2) if worst_vals else None,
+                "median_worst_pct": round(statistics.median(worst_vals), 2) if worst_vals else None,
             })
             return base
         retrace_vals = [r["max_retrace_pct_of_stretch"] for r in evaluated]
@@ -11559,6 +11609,7 @@ select,input{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-ra
     </div>
   </div>
   <div id="rawStatus" class="summary-line"></div>
+  <p style="color:#8b949e;font-size:11px;margin:4px 0">Для 📈 продолжения колонки "Ближайший подход%"/"Худший заход%" показывают не то же самое, что у 📉 фейда — это MFE/MAE от входа (лучшая/худшая точка по цене), не EMA-относительные величины. "Откат%" для продолжения не считается вообще (нет смысла — там не про возврат к EMA).</p>
   <div class="table-scroll">
     <table id="rawTable">
       <thead><tr><th>Стратегия</th><th>Монета</th><th>ТФ</th><th>EMA</th><th>Вход</th><th>Стоп</th><th>Тейк</th><th>Отрыв%</th><th>Ближайший подход%</th><th>Худший заход%</th><th>Откат%</th><th>Исход</th><th>Время до касания</th><th>Когда</th></tr></thead>
@@ -11764,11 +11815,20 @@ async function loadRaw(){
       const outcomeColors = {take:'#3fb950', stop:'#f85149', timeout:'#8b949e', open:'#d29922'};
       const oc = it.signal_outcome || (it.touched ? 'take' : (it.track_done ? 'timeout' : 'open'));
       const status = `<span style="color:${outcomeColors[oc]||'#8b949e'}">${oc}</span>`;
-      tr.innerHTML = `<td>${it.strategy === 'continuation' ? '📈' : '📉'}</td><td>${it.symbol}</td><td>${it.tf}</td><td>EMA${it.period}</td>`+
+      const isCont = it.strategy === 'continuation';
+      // v0.31.6: по прямому вопросу "как поймём, какие проценты менять" —
+      // для continuation closest/max_adverse — те самые НИКОГДА не
+      // обновляемые EMA-относительные поля (v0.31.5), показывать их тут
+      // так же вредно, как было в сводке. Показываем честные MFE/MAE
+      // (cont_best_pct/cont_worst_pct) вместо них
+      const col2 = isCont ? `${it.cont_best_pct ?? '—'}%` : `${it.closest_stretch_pct}%`;
+      const col3 = isCont ? `${it.cont_worst_pct ?? '—'}%` : `${it.max_adverse_stretch_pct ?? it.stretch_pct}%`;
+      const col4 = isCont ? '—' : `${it.max_retrace_pct_of_stretch}%`;
+      tr.innerHTML = `<td>${isCont ? '📈' : '📉'}</td><td>${it.symbol}</td><td>${it.tf}</td><td>EMA${it.period}</td>`+
         `<td>${it.entry ?? '—'}</td><td>${it.stop ?? '—'}</td><td>${it.take ?? '—'}</td>`+
-        `<td>${it.stretch_pct>0?'+':''}${it.stretch_pct}%</td><td>${it.closest_stretch_pct}%</td>`+
-        `<td>${it.max_adverse_stretch_pct ?? it.stretch_pct}%</td>`+
-        `<td>${it.max_retrace_pct_of_stretch}%</td><td>${status}</td>`+
+        `<td>${it.stretch_pct>0?'+':''}${it.stretch_pct}%</td><td>${col2}</td>`+
+        `<td>${col3}</td>`+
+        `<td>${col4}</td><td>${status}</td>`+
         `<td>${timeToTouch}</td><td>${fmtAgo(it.ts)}</td>`;
       tbody.appendChild(tr);
     }
