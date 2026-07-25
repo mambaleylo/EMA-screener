@@ -1,7 +1,25 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.31.4 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.31.5 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.31.5: реальный баг, найден по прямому вопросу "почему нулевые данные
+  в лонгах" — оказалось, наоборот, "Выжив. при стопе" показывала
+  ЛОЖНЫЕ 100% буквально у ВСЕХ continuation-строк, даже у тех с честным
+  винрейтом 0%. Причина — closest_stretch_pct/max_adverse_stretch_pct у
+  continuation НИКОГДА не обновляются после создания (трек-луп для
+  continuation ведёт отдельный учёт по цене от входа/стопа/тейка, эти
+  EMA-относительные поля не трогает вообще — подтверждено живым примером
+  BEAT_USDT, где оба поля застыли равными исходному stretch_pct). Метрики,
+  посчитанные из них (touch_rate/avg_retrace/stop_survival/
+  excess_adverse), были полностью бессмысленны для continuation. Теперь
+  для continuation-строк эти поля честно возвращают None ("—" на
+  странице) вместо ложных чисел — единственная надёжная метрика для
+  continuation это "Винрейт тейк/стоп" (считается отдельно, по-настоящему
+  работающей веткой трек-лупа). Заодно подтвердилось на реальных, живых
+  данных с хорошей выборкой: 4h/EMA10 — 33.3% (n=42, почти ровно брейкивен
+  для стоп1%/тейк2%), а 15m/EMA10 (n=45) и 30m/EMA5 (n=18) — честный,
+  подтверждённый 0% (не шум) — обе уже отрезаны от алертов фильтром
+  v0.31.4.
 - v0.31.4: по прямому вопросу "почему всё стало плохо, как улучшить для
   лонгов" — разбор 733 решённых continuation-сигналов по ТФ дал чёткую,
   крупновыборочную зависимость (не тренд/объём — те внутри одного ТФ
@@ -2096,7 +2114,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.31.4"
+APP_VERSION  = "0.31.5"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -10214,8 +10232,40 @@ def _stretch_diag_summary(min_events=3):
 
     def _agg(items):
         total = len(items)
+        strategy = items[0].get("strategy", "fade") if items else "fade"
         evaluated = [r for r in items if r.get("track_done")]
         touched = sum(1 for r in evaluated if r.get("touched"))
+        resolved_sig = [r for r in items if r.get("signal_outcome") in ("take", "stop")]
+        wins = sum(1 for r in resolved_sig if r["signal_outcome"] == "take")
+        timeouts = sum(1 for r in items if r.get("signal_outcome") == "timeout")
+        base = {
+            "total": total, "evaluated": len(evaluated), "touched": touched,
+            "signal_resolved_n": len(resolved_sig),
+            "signal_win_rate": round(wins / len(resolved_sig) * 100, 1) if resolved_sig else None,
+            "signal_timeouts": timeouts,
+        }
+        if strategy == "continuation":
+            # v0.31.5: реальный баг, найден по прямому вопросу "почему
+            # нулевые данные в лонгах" (на самом деле — "почему выживаемость
+            # 100% у ВСЕХ строк, даже у тех с винрейтом 0%"). Причина —
+            # closest_stretch_pct/max_adverse_stretch_pct у continuation
+            # НИКОГДА не обновляются после создания (трек-луп для
+            # continuation ведёт отдельный учёт по цене от входа/стопа/
+            # тейка, эти EMA-относительные поля не трогает вообще —
+            # см. живой пример BEAT_USDT, где оба поля застыли равными
+            # исходному stretch_pct). Метрики, посчитанные из них
+            # (touch_rate/avg_retrace/stop_survival/excess_adverse), были
+            # бессмысленны для continuation — 100% "выживаемости" не
+            # отражало реальность. Честно возвращаем None вместо ложных
+            # чисел — единственная надёжная метрика для continuation это
+            # signal_win_rate (уже считается отдельно, по-настоящему).
+            base.update({
+                "touch_rate": None, "avg_retrace_pct_of_stretch": None,
+                "median_retrace_pct_of_stretch": None, "avg_time_to_touch_min": None,
+                "avg_extra_adverse_pct": None, "max_extra_adverse_pct": None,
+                "stop_survival_n": 0, "stop_survival_rate": None,
+            })
+            return base
         retrace_vals = [r["max_retrace_pct_of_stretch"] for r in evaluated]
         touch_times = [r["time_to_touch_sec"] for r in evaluated if r.get("touched") and r.get("time_to_touch_sec")]
         # v0.30.56: по прямому запросу — не только "вернулась ли", но и
@@ -10231,15 +10281,7 @@ def _stretch_diag_summary(min_events=3):
         # именно это режет P&L при реальной позиции с фиксированным стопом
         survived = sum(1 for r in adverse_items
                        if abs(r["max_adverse_stretch_pct"] - r["stretch_pct"]) < STRETCH_REF_STOP_PCT)
-        # v0.30.67: реальный сигнал с тейком/стопом — исход по факту
-        # порядка событий (не задним числом), считается в трек-лупе.
-        # win_rate — среди РЕШЁННЫХ по стопу/тейку (таймауты — отдельно,
-        # это "ни то ни другое", не считаем как проигрыш явно)
-        resolved_sig = [r for r in items if r.get("signal_outcome") in ("take", "stop")]
-        wins = sum(1 for r in resolved_sig if r["signal_outcome"] == "take")
-        timeouts = sum(1 for r in items if r.get("signal_outcome") == "timeout")
-        return {
-            "total": total, "evaluated": len(evaluated), "touched": touched,
+        base.update({
             "touch_rate": round(touched / len(evaluated) * 100, 1) if evaluated else None,
             "avg_retrace_pct_of_stretch": round(sum(retrace_vals) / len(retrace_vals), 1) if retrace_vals else None,
             "median_retrace_pct_of_stretch": round(statistics.median(retrace_vals), 1) if retrace_vals else None,
@@ -10248,10 +10290,8 @@ def _stretch_diag_summary(min_events=3):
             "max_extra_adverse_pct": round(max(excess_vals), 2) if excess_vals else None,
             "stop_survival_n": len(adverse_items),
             "stop_survival_rate": round(survived / len(adverse_items) * 100, 1) if adverse_items else None,
-            "signal_resolved_n": len(resolved_sig),
-            "signal_win_rate": round(wins / len(resolved_sig) * 100, 1) if resolved_sig else None,
-            "signal_timeouts": timeouts,
-        }
+        })
+        return base
 
     result = []
     for (tf, period, strategy), items in groups.items():
