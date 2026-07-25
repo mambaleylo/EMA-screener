@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.31.6 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.31.7 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.31.7: по прямому запросу — "файл уже 6 МБ, сократи макс до 5"
+  (подтверждено: присланный ema_stretch_diag весит 6.39 МБ). Раньше
+  ограничение у истории отрывов от EMA было только по КОЛИЧЕСТВУ записей
+  (STRETCH_DIAG_MAX_RECORDS=5000), не по байтам — с ростом числа полей на
+  запись (debug_*, cont_best_pct, app_version и другие, добавленные за
+  этот разговор) те же 5000 записей стали весить больше, чем раньше.
+  Добавлен явный предел в 5 МБ (STRETCH_DIAG_MAX_BYTES), тем же
+  паттерном, что уже был у LOG_FILE — при превышении пропорционально
+  обрезаются самые старые записи, пока файл не влезет. Заодно реальная
+  находка: раньше обрезалась только ЛОКАЛЬНАЯ копия для записи на диск, а
+  сам список в памяти (_stretch_diag_records) рос без границ — диск был
+  ограничен, память — нет. Теперь обрезается и настоящий список тоже.
 - v0.31.6: по прямому вопросу — "как поймём, какие проценты потом менять
   по тейку и стопу" для continuation, раз v0.31.5 честно занулила
   сломанные метрики. Реальный пробел: continuation фиксировал только
@@ -2129,7 +2141,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.31.6"
+APP_VERSION  = "0.31.7"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -9531,13 +9543,34 @@ def _stretch_check_symbol(symbol, tf, submitted_ts=None):
     return out
 
 
+STRETCH_DIAG_MAX_BYTES = 5 * 1024 * 1024   # v0.31.7: по прямому запросу — "файл уже 6 МБ, сократи макс до 5" — раньше ограничение было только по КОЛИЧЕСТВУ записей (STRETCH_DIAG_MAX_RECORDS), а не по байтам; с ростом числа полей на запись (debug_*, cont_best_pct, app_version и т.д.) те же 5000 записей стали весить больше. Теперь как у LOG_FILE — явный предел в байтах, тем же паттерном
+
+
 def _stretch_diag_save():
     try:
         with _stretch_diag_lock:
             trimmed = _stretch_diag_records[-STRETCH_DIAG_MAX_RECORDS:]
+        body = json.dumps(trimmed).encode()
+        if len(body) > STRETCH_DIAG_MAX_BYTES:
+            # v0.31.7: пропорционально обрезаем самые старые записи, пока
+            # не влезет в лимит байт — количество записей само по себе не
+            # гарантирует размер файла, разные записи имеют разный набор
+            # полей (fade/continuation, старые/новые версии)
+            ratio = STRETCH_DIAG_MAX_BYTES / len(body)
+            keep_n = max(200, int(len(trimmed) * ratio * 0.95))   # 5% запас, чтобы не пришлось обрезать повторно
+            trimmed = trimmed[-keep_n:]
+            body = json.dumps(trimmed).encode()
+        with _stretch_diag_lock:
+            # v0.31.7: реальная находка — раньше обрезался только этот
+            # ЛОКАЛЬНЫЙ trimmed (копия для записи на диск), а сам
+            # _stretch_diag_records в памяti продолжал расти БЕЗ ГРАНИЦ —
+            # диск был ограничен, память — нет. Теперь обрезаем и
+            # настоящий список тоже, тем же результатом
+            if len(_stretch_diag_records) > len(trimmed):
+                _stretch_diag_records[:] = trimmed
         tmp_path = STRETCH_DIAG_FILE + f".tmp{os.getpid()}"
-        with open(tmp_path, "w") as f:
-            json.dump(trimmed, f)
+        with open(tmp_path, "wb") as f:
+            f.write(body)
         os.replace(tmp_path, STRETCH_DIAG_FILE)
     except Exception as e:
         olog(f"[ema_stretch] ⚠ не смог сохранить {STRETCH_DIAG_FILE}: {_explain_error(e)}")
