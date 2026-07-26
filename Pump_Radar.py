@@ -1,7 +1,23 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.31.13 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.31.14 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.31.14: по прямому запросу — "эксперимент стал хуже, продолжение
+  лучше, пересмотри и тейки". Разбор нашёл реальный, серьёзный пробел:
+  та же обрезка слежения сразу после резолва, что чинили у fade
+  (v0.31.8), осталась НЕЧИНЕНОЙ у reverse/continuation — их MFE/MAE
+  (cont_best_pct/cont_worst_pct) переставали обновляться в момент СВОЕГО
+  резолва. Добавлено расширенное price-relative слежение (тем же
+  паттерном extended_track_until/done, что и у fade) — теперь и
+  reverse, и continuation честно продолжают отслеживать пик/дно после
+  резолва. Заодно — реальная переоценка параметров по свежим живым
+  данным (1658 reverse, 265 continuation): stop reverse 0.25%→0.15%,
+  take 1.0%→0.5% (винрейт 43.3% против живых 19% при старых); stop
+  continuation 1.0%→0.5%, take без изменений 2.0% (винрейт 47.5% против
+  живых 36.1%). ⚠️ Оба перебора НЕ учитывают порядок событий (мог ли
+  тейк случиться раньше стопа) — цифры оптимистичны, но направление
+  (уже=лучше) совпадает с уже подтверждённым паттерном у фейда, взято с
+  осторожным запасом, не крайние значения из перебора.
 - v0.31.13: по прямому запросу — переделал шапку страницы /ema_stretch.
   Было: отдельная строка навигации (ссылки в виде тяжёлых кнопок) + ниже
   отдельный крупный <h1> + четыре абзаца описания/чейнджлога подряд —
@@ -2219,7 +2235,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.31.13"
+APP_VERSION  = "0.31.14"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -9619,6 +9635,8 @@ def _stretch_check_symbol(symbol, tf, submitted_ts=None):
                 "signal_outcome": "open",
                 "last_checked_ts": int(now),
                 "track_until": now + STRETCH_DIAG_TRACK_WINDOW_SEC.get(tf, 6 * 3600), "track_done": False,
+                "extended_track_until": now + STRETCH_DIAG_TRACK_WINDOW_SEC.get(tf, 6 * 3600) * STRETCH_EXTENDED_TRACK_MULT,   # v0.31.14: реальная находка по прямому вопросу "пересмотри и тейки" — та же самая обрезка слежения сразу после резолва, что чинили у fade (v0.31.8), осталась НЕЧИНЕНОЙ у reverse/continuation — MFE/MAE (cont_best_pct/cont_worst_pct) переставали обновляться в момент СВОЕГО резолва, искажая честный перебор альтернативных стоп/тейк
+                "extended_track_done": False,
             })
         if stretch_pct > STRETCH_CONTINUATION_MIN_PCT:
             # v0.30.83: по прямому запросу — "силу отрыва больше 2% можно
@@ -9655,6 +9673,8 @@ def _stretch_check_symbol(symbol, tf, submitted_ts=None):
                 "signal_outcome": "open",
                 "last_checked_ts": int(now),
                 "track_until": now + STRETCH_DIAG_TRACK_WINDOW_SEC.get(tf, 6 * 3600), "track_done": False,
+                "extended_track_until": now + STRETCH_DIAG_TRACK_WINDOW_SEC.get(tf, 6 * 3600) * STRETCH_EXTENDED_TRACK_MULT,   # v0.31.14: см. докстринг у reverse — та же самая обрезка слежения сразу после резолва, теперь исправлена и здесь
+                "extended_track_done": False,
             })
     return out
 
@@ -9679,8 +9699,8 @@ def _stretch_diag_save():
             def _fully_done(r):
                 if not r.get("track_done"):
                     return False
-                if r.get("strategy", "fade") == "fade":
-                    return r.get("extended_track_done", True)   # старые записи без этого поля — считаем завершёнными
+                if r.get("strategy", "fade") in ("fade", "continuation", "reverse"):
+                    return r.get("extended_track_done", True)   # v0.31.14: расширенное слежение теперь и у continuation/reverse — старые записи без этого поля считаем завершёнными
                 return True
             active = [r for r in trimmed if not _fully_done(r)]
             done = [r for r in trimmed if _fully_done(r)]
@@ -9893,13 +9913,13 @@ def _stretch_diag_scan_loop():
 STRETCH_TOP_ALERT_MIN_EVENTS = 10   # v0.30.53: не объявляем "топовую связку" по горстке случайных событий — ждём минимум столько оценённых, прежде чем на неё начать алертить
 STRETCH_ALERT_MAX_STALENESS_SEC = 300   # v0.30.79: по прямому запросу — "задержка по факту позднего запуска, сигнал неактуален, зачем слать". 5 минут "мёртвого" времени ДО постановки в очередь (не путать с самой обработкой — та обычно секунды) — типичный признак пропущенного цикла/рестарта, не нормальная рабочая задержка
 STRETCH_SIGNAL_MAX_PCT = 2.0   # v0.30.83: по прямому запросу вернули обратно на 2.0 (было временно занижено до 1.5 в v0.30.82) — отрывы больше этого порога теперь не отбрасываются, а идут в отдельную стратегию продолжения (см. STRETCH_CONTINUATION_*)
-STRETCH_REVERSE_STOP_PCT = 0.25   # v0.31.10: по прямому запросу — эксперимент "разворот" (LONG на слабом отрыве 1-2%, там же где фейд сейчас плохо работает). Бэктест на частично расширенных данных (см. докстринг ниже у самой стратегии): стоп 0.25%/тейк 1.0% дал винрейт 58.2%, PnL +0.53%, устойчиво на соседних комбинациях (0.15-0.5% стопа с тем же тейком давали похожий результат)
-STRETCH_REVERSE_TAKE_PCT = 1.0   # v0.31.10: см. выше — тейк шире, чем изначально казалось нужным по старым (обрезанным) данным (0.5%), потому что честно расширенное отслеживание показало, что цена реально идёт дальше, чем виделось раньше
+STRETCH_REVERSE_STOP_PCT = 0.15   # v0.31.14: реальная переоценка по прямому запросу "эксперимент стал хуже, пересмотри тейки" — живой винрейт на текущих 0.25/1.0 упал до 19%/-0.013% (был лучше на более ранних, ещё не показательных данных). Перебор по прямым MFE/MAE (cont_best_pct/cont_worst_pct) стабильно выделяет более узкий стоп (0.1-0.2%) как лучший — но ⚠️ бэктест НЕ знает порядок событий (мог ли тейк случиться раньше стопа), поэтому цифры оптимистичны; направление (уже=лучше) совпадает с тем, что уже нашли у фейда, взял с осторожным запасом, не самый крайний вариант из перебора
+STRETCH_REVERSE_TAKE_PCT = 0.5   # v0.31.14: см. выше — перебор стабильно показывает тейк 0.5% лучше широкого 1.0% при узком стопе (винрейт 43.3% против 27% на реальных данных, с тем же осторожным допущением)
 STRETCH_CONTINUATION_MIN_PCT = 5.0   # v0.30.88: реальная находка на 1491 решённых continuation-сигналах — у continuation ОБРАТНАЯ зависимость от фейда: чем сильнее отрыв, тем ЛУЧШЕ (2-4% давали винрейт 25-27%/PnL от -0.18% до -0.26%, а 5%+ дали 40%/+0.21%). Зона 2-5% — "ничья земля", не работает ни как фейд (уже отсекается STRETCH_SIGNAL_MAX_PCT), ни как продолжение. Раньше continuation триггерился сразу с >2.0 (тем же порогом, что и потолок фейда) — теперь свой, отдельный, более высокий порог, дальше от границы
 STRETCH_FADE_MAX_TREND_PCT = 8.0   # v0.31.0: по прямому вопросу "применить фильтры из логов" — на свежих данных (2323 решённых) нашёлся РАЗВОРОТ прежней находки (v0.30.90 показывал наоборот, сильный тренд лучше для фейда) — сейчас |trend|<3%=винрейт 31%/PnL+0.055%, а |trend|>=8%=14%/-0.246%. Направление зависимости само по себе меняется вместе с режимом рынка (раньше было наоборот) — константу стоит периодически пересматривать по свежим данным, не считать законом навсегда. Не режем запись/статистику, только отправку алерта — та же логика, что у STRETCH_SIGNAL_MAX_PCT
 STRETCH_CONTINUATION_ALLOWED_TFS = {"4h"}   # v0.31.4: реальная находка на 733 решённых continuation-сигналах — чёткая, крупновыборочная зависимость от ТФ (не тренд/объём — те внутри 4h различают слабо): 4h винрейт 21-27%/PnL -0.19...-0.36%, а 15m — винрейт 0-7%/PnL -0.80...-1.00% (почти гарантированный слив). Быстрые ТФ дают "отрыв 5%+" слишком часто просто из шума, медленные — из настоящего движения. Даже 4h пока в минусе в среднем, НО внутри него нашёлся сегмент 7-10% отрыва в честном плюсе (винрейт 34%/PnL+0.03%, n=35 — не гигантская выборка, не факт что удержится). Ограничение только по ТФ, не по силе отрыва — тот сегмент пока не трогаем, маловато данных, не хотим повторить историю с STRETCH_CONTINUATION_MIN_PCT, которая уже разворачивалась
-STRETCH_CONTINUATION_STOP_PCT = 1.0   # v0.30.84: по прямому предложению — раз у фейда была логика "стоп 2% / тейк ~1%" (широкий стоп, узкая цель — ждём слабый откат), для продолжения тренда логично ЗЕРКАЛЬНО: узкий стоп (настоящий тренд не должен откатываться против нас сильно) и широкая цель (ловим сам импульс). Всё ещё НЕ откалибровано по данным — стартовая прикидка, копим статистику с нуля
-STRETCH_CONTINUATION_TAKE_PCT = 2.0   # v0.30.84: см. выше — RR теперь 2:1 при СУЖЕННОМ стопе (было 4%/2%=2:1 при широком стопе — тот же RR, но абсолютные числа меньше и логика соответствует самой идее тренда, а не скопирована с фейда бездумно
+STRETCH_CONTINUATION_STOP_PCT = 0.5   # v0.31.14: реальная переоценка по прямому запросу "продолжение стало лучше, пересмотри тейки" — живой винрейт вырос до 36.1%/+0.083% на текущих 1.0/2.0. Перебор по прямым MFE/MAE стабильно предпочитает более узкий стоп (0.5%) при том же тейке 2.0% (винрейт 47.5% против текущих 36.1% в бэктесте) — ⚠️ та же оговорка про порядок событий, что и у reverse, направление совпадает с уже подтверждённым паттерном "уже=лучше"
+STRETCH_CONTINUATION_TAKE_PCT = 2.0   # v0.30.84: см. выше — RR теперь 2:1 при СУЖЕННОМ стопе (было 4%/2%=2:1 при широком стопе — тот же RR, но абсолютные числа меньше и логика соответствует самой идее тренда, а не скопирована с фейда бездумно. v0.31.14: тейк оставлен без изменений — перебор не дал явного улучшения от смены только тейка при новом более узком стопе
 
 
 def _stretch_render_alert_chart(rec):
@@ -10352,6 +10372,45 @@ def _stretch_diag_track_loop():
                                   if r.get("track_done") and r.get("strategy", "fade") == "fade"
                                   and not r.get("extended_track_done")
                                   and time.time() < r.get("extended_track_until", 0)]
+                # v0.31.14: реальная находка по прямому вопросу "пересмотри
+                # и тейки" — та же самая обрезка слежения, что чинили у
+                # fade (v0.31.8), осталась НЕЧИНЕНОЙ у reverse/continuation
+                # — их MFE/MAE (cont_best_pct/cont_worst_pct) переставали
+                # обновляться в момент СВОЕГО резолва, искажая честный
+                # перебор альтернативных стоп/тейк на бэктесте. Отдельный,
+                # более простой (price-relative, не EMA-relative) проход
+                extended_recs_price = [r for r in _stretch_diag_records
+                                         if r.get("track_done") and r.get("strategy") in ("continuation", "reverse")
+                                         and not r.get("extended_track_done")
+                                         and time.time() < r.get("extended_track_until", 0)]
+            if extended_recs_price:
+                def _process_extended_price(rec):
+                    try:
+                        live_price = _gate_get_price(rec["symbol"])
+                        now_ext = time.time()
+                        if not live_price:
+                            if now_ext >= rec.get("extended_track_until", 0):
+                                rec["extended_track_done"] = True
+                            return
+                        recent_hl = _stretch_recent_1m_high_low(rec["symbol"])
+                        entry = rec["entry"]
+                        best_price = max(live_price, recent_hl[0]) if recent_hl else live_price
+                        worst_price = min(live_price, recent_hl[1]) if recent_hl else live_price
+                        best_pct = round((best_price - entry) / entry * 100, 3)
+                        worst_pct = round((worst_price - entry) / entry * 100, 3)
+                        if best_pct > rec.get("cont_best_pct", best_pct):
+                            rec["cont_best_pct"] = best_pct
+                        if worst_pct < rec.get("cont_worst_pct", worst_pct):
+                            rec["cont_worst_pct"] = worst_pct
+                        if now_ext >= rec.get("extended_track_until", 0):
+                            rec["extended_track_done"] = True
+                    except Exception as e:
+                        olog(f"[ema_stretch_track] ⚠ расширенное слежение (price) — пропущена битая запись "
+                             f"({rec.get('symbol', '?')}): {_explain_error(e)}")
+
+                with ThreadPoolExecutor(max_workers=STRETCH_TRACK_WORKERS) as pool:
+                    list(pool.map(_process_extended_price, extended_recs_price))
+                _stretch_diag_save()
             if extended_recs:
                 def _process_extended(rec):
                     try:
