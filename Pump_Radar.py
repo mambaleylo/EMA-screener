@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.31.12 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.31.13 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.31.13: по прямому запросу — переделал шапку страницы /ema_stretch.
+  Было: отдельная строка навигации (ссылки в виде тяжёлых кнопок) + ниже
+  отдельный крупный <h1> + четыре абзаца описания/чейнджлога подряд —
+  визуально выглядело как "куча текста". Теперь: один компактный блок —
+  заголовок с номером версии (v__APP_VERSION__, тот же паттерн подстановки,
+  что уже был на главной странице) слева, навигация мелкими ссылками
+  справа, всё остальное убрано целиком. Проверил страницу на буквальные
+  дубли кнопок построчно — не нашёл ничего внутри самой этой страницы
+  (то, что похоже казалось дублем в грубом поиске, было соседними
+  страницами с похожей навигацией — Weekly EMA Backtest и др., не
+  дублирование внутри одной страницы). Отдельно — /ema_stretch теперь
+  страница по умолчанию: редирект с "/" ведёт сюда, не на /ema.
 - v0.31.12: по прямому запросу — "чекбоксы для уведомлений
   экспериментальных и всех остальных, хочу видеть только
   экспериментальные". Раньше алерты в Telegram слались по всем трём
@@ -2207,7 +2219,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.31.12"
+APP_VERSION  = "0.31.13"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -11798,19 +11810,17 @@ tbody tr:hover{background:#1c2128}
 select,input{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px;font-size:13px}
 .summary-line{font-size:13px;color:#8b949e;margin-top:6px}
 </style></head><body>
-<div style="background:#161b22;border-bottom:1px solid #30363d;padding:8px 12px;display:flex;gap:6px;flex-wrap:wrap;font-size:12px">
-  <a href="/ema" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#127968; Главная</a>
-  <a href="/manual_scan" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128269; Ручной скан</a>
-  <a href="/ema_diag" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128202; EMA Диагностика</a>
-  <a href="/ema_stretch" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128201; Отрыв от EMA</a>
-  <a href="/weekly_ema_backtest" style="color:#c9d1d9;text-decoration:none;padding:5px 10px;border-radius:6px;background:#21262d;border:1px solid #30363d">&#128200; Бэктест EMA</a>
+<div style="background:#161b22;border-bottom:1px solid #30363d;padding:10px 14px">
+  <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+    <h1 style="margin:0;font-size:18px">&#128201; Отрыв от EMA <span style="font-size:12px;color:#8b949e;font-weight:normal">v__APP_VERSION__</span></h1>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;font-size:12px">
+      <a href="/ema" style="color:#8b949e;text-decoration:none;padding:4px 8px;border-radius:6px">&#127968; Главная</a>
+      <a href="/manual_scan" style="color:#8b949e;text-decoration:none;padding:4px 8px;border-radius:6px">&#128269; Ручной скан</a>
+      <a href="/ema_diag" style="color:#8b949e;text-decoration:none;padding:4px 8px;border-radius:6px">&#128202; EMA Диагностика</a>
+      <a href="/weekly_ema_backtest" style="color:#8b949e;text-decoration:none;padding:4px 8px;border-radius:6px">&#128200; Бэктест EMA</a>
+    </div>
+  </div>
 </div>
-
-<h1>&#128201; Отрыв от EMA — сколько в среднем откатывает</h1>
-<p style="color:#8b949e;font-size:13px;max-width:520px">Триггер — отрыв цены ВВЕРХ от короткой EMA (5/10/20) на ЗАКРЫТИИ свечи, ≥1%, на ТФ 15м/30м/1h/4h (только вверх — ожидаем падение к EMA обратно, отрыв вниз не отслеживается). Дальше следим ЛИБО до касания той же EMA обратно, ЛИБО до таймаута (свой на каждый ТФ) — и считаем % отката от исходного отрыва (100% = полностью коснулась). Сводка разбита ещё и по величине самого отрыва (1-3% / 3-6% / 6%+), чтобы видеть, растёт ли шанс отката вместе с силой отрыва.</p>
-<p style="color:#d29922;font-size:12px;max-width:520px">С v0.30.78 топ-связка (та, по которой шлются алерты) ранжируется в первую очередь по винрейту тейк/стоп (колонка "Винрейт тейк/стоп"), "выживаемость при стопе" — второй критерий (тай-брейк), не первый. До v0.30.60 было по чистому % отката. С v0.30.85 стоп для фейда — 0.5% (было 2.0%) — узкий стоп при типично небольшом тейке (уровень EMA) даёт заметно лучшее матожидание, даже при более низком винрейте (найдено симуляцией на реальных данных).</p>
-<p style="color:#3fb950;font-size:12px;max-width:520px">С v0.30.67 это уже настоящий сигнал: Вход = цена триггера, Стоп = вход+2% (SHORT — цена ушла вверх, ждём падения), Тейк = уровень EMA. Исход (тейк/стоп/таймаут) считается в реальном порядке событий — если стоп задело раньше, чем цена дошла до EMA, это "stop", даже если ПОЗЖЕ цена всё равно дошла бы до цели (реальной позиции бы уже не было). Колонка "Винрейт тейк/стоп" — по этому честному исходу.</p>
-<p style="color:#58a6ff;font-size:12px;max-width:520px">С v0.30.83 — вторая, отдельная стратегия: "📈 продолжение" (LONG). Данные показали, что отрывы больше 2% почти никогда не откатываются до фиксированного стопа — это чаще реальный тренд, не перегрев. Для таких случаев теперь отдельный сигнал на продолжение импульса вместо фейда. Стоп 1% / тейк 2% (RR 2:1, узкий стоп — зеркально фейду, настоящий тренд не должен откатываться сильно) — ⚠️ экспериментально, НЕ откалибровано по своим историческим данным, копим статистику с нуля так же, как и с фейдом в своё время.</p>
 
 <div class="section-card">
   <h3>&#9989; Скан только по выбранным ЕМА+ТФ</h3>
@@ -12559,7 +12569,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
       try:
         if self.path == "/" or self.path == "/index.html":
             self.send_response(302)
-            self.send_header("Location", "/ema")
+            self.send_header("Location", "/ema_stretch")
             self.end_headers()
         elif self.path == "/ema" or self.path == "/ema.html":
             body = PUMP_MAIN_HTML_PAGE.replace("__APP_VERSION__", APP_VERSION).encode()
@@ -12814,7 +12824,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         elif self.path == "/ema_stretch" or self.path == "/ema_stretch.html":
-            body = EMA_STRETCH_HTML_PAGE.encode()
+            body = EMA_STRETCH_HTML_PAGE.replace("__APP_VERSION__", APP_VERSION).encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", len(body))
