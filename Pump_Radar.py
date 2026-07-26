@@ -1,7 +1,20 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.31.9 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.31.10 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.31.10: по прямому запросу — реализован третий, экспериментальный
+  режим "разворот" (strategy="reverse"): LONG на том же слабом отрыве
+  1-2%, где сейчас фейд (SHORT) слабо работает. Параметры (стоп 0.25%/
+  тейк 1.0%) — по бэктесту на частично расширенных данных: винрейт
+  58.2%, PnL +0.53%, устойчиво на соседних комбинациях. ⚠️ Не то же
+  самое, что continuation (тот LONG на СИЛЬНОМ отрыве 5%+, другая
+  логика). Реализация: своя запись рядом с fade (тот же триггер),
+  переиспользует price-based трек-луп и MFE/MAE-трекинг continuation
+  (структурно идентичны), свой топ в сводке, свой алерт в Telegram
+  (с двойным ⚠️⚠️ — экспериментально). Автоторговля НЕ подхватит
+  разворот сама — архитектура (v0.30.95) уже требует явного выбора
+  конкретных tf|period|strategy через чекбоксы в настройках, ничего
+  дополнительно исключать не пришлось.
 - v0.31.9: реальная асимметрия, найденная сразу после v0.31.8 — расширял
   слежение только за ПИКОМ (вверх, полезно для тейка гипотетического
   разворота в лонг), но НЕ за ближайшим подходом к EMA (вниз, нужно для
@@ -2167,7 +2180,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.31.9"
+APP_VERSION  = "0.31.10"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -9533,6 +9546,41 @@ def _stretch_check_symbol(symbol, tf, submitted_ts=None):
             "extended_track_until": now + STRETCH_DIAG_TRACK_WINDOW_SEC.get(tf, 6 * 3600) * STRETCH_EXTENDED_TRACK_MULT,   # v0.31.8: по прямому запросу — "таймаут увеличим, чтобы понимать точно как закрылась сделка [для гипотетического разворота]". Официальный исход фейда резолвится быстро (стоп 0.25%), но ПОСЛЕ этого слежение обычно останавливалось — не видели, куда цена шла ДАЛЬШЕ. Теперь после резолва слежение за экстремумом продолжается ещё STRETCH_EXTENDED_TRACK_MULT раз дольше — см. max_adverse_stretch_pct_ext
             "extended_track_done": False,
         })
+        if stretch_pct <= STRETCH_SIGNAL_MAX_PCT:
+            # v0.31.10: по прямому запросу — эксперимент "разворот": LONG на
+            # том же самом отрыве 1-2%, где сейчас фейд (SHORT) слабо
+            # работает. По бэктесту на частично расширенных данных (только
+            # "вверх" честно продлён, "вниз" ещё старый — см. v0.31.8/9):
+            # стоп 0.25%/тейк 1.0% дал винрейт 58.2%, PnL +0.53%, устойчиво
+            # на нескольких соседних комбинациях. ⚠️ ЭКСПЕРИМЕНТАЛЬНО — это
+            # НЕ то же самое, что continuation (там LONG на СИЛЬНОМ отрыве
+            # 5%+, здесь на СЛАБОМ 1-2%, другая логика/другой диапазон).
+            # Специально НЕ подключено к автоторговле пока — только алерт,
+            # для ручного наблюдения, пока не накопится честная (симметрично
+            # расширенная) статистика
+            r_entry = closed_price
+            r_stop = _round_price(r_entry * (1 - STRETCH_REVERSE_STOP_PCT / 100))
+            r_take = _round_price(r_entry * (1 + STRETCH_REVERSE_TAKE_PCT / 100))
+            out.append({
+                "id": f"{symbol}|{tf}|{period}|rev|{int(now)}",
+                "ts": int(now), "symbol": symbol, "tf": tf, "period": period,
+                "bar_close_ts": bar_close_ts,
+                "debug_queue_wait_sec": queue_wait_sec, "debug_submitted_ts": submitted_ts,
+                "debug_gate_wait_sec": ctx.get("_debug_gate_wait_sec"), "debug_fetch_sec": ctx.get("_debug_fetch_sec"),
+                "trigger_price": closed_price, "trigger_ema": _round_price(ema_closed),
+                "entry": r_entry, "stop": r_stop, "take": r_take,
+                "strategy": "reverse", "direction": "long",
+                "app_version": APP_VERSION,
+                "trend_pct": trend_pct, "trigger_vol_ratio": trigger_vol_ratio,
+                "stretch_pct": round(stretch_pct, 3), "side": "above",
+                "touched": False, "touched_at": None, "time_to_touch_sec": None,
+                "closest_stretch_pct": round(stretch_pct, 3),
+                "max_retrace_pct_of_stretch": 0.0,
+                "max_adverse_stretch_pct": round(stretch_pct, 3),
+                "signal_outcome": "open",
+                "last_checked_ts": int(now),
+                "track_until": now + STRETCH_DIAG_TRACK_WINDOW_SEC.get(tf, 6 * 3600), "track_done": False,
+            })
         if stretch_pct > STRETCH_CONTINUATION_MIN_PCT:
             # v0.30.83: по прямому запросу — "силу отрыва больше 2% можно
             # использовать как открытие сделки в другую сторону". Данные
@@ -9777,6 +9825,8 @@ def _stretch_diag_scan_loop():
 STRETCH_TOP_ALERT_MIN_EVENTS = 10   # v0.30.53: не объявляем "топовую связку" по горстке случайных событий — ждём минимум столько оценённых, прежде чем на неё начать алертить
 STRETCH_ALERT_MAX_STALENESS_SEC = 300   # v0.30.79: по прямому запросу — "задержка по факту позднего запуска, сигнал неактуален, зачем слать". 5 минут "мёртвого" времени ДО постановки в очередь (не путать с самой обработкой — та обычно секунды) — типичный признак пропущенного цикла/рестарта, не нормальная рабочая задержка
 STRETCH_SIGNAL_MAX_PCT = 2.0   # v0.30.83: по прямому запросу вернули обратно на 2.0 (было временно занижено до 1.5 в v0.30.82) — отрывы больше этого порога теперь не отбрасываются, а идут в отдельную стратегию продолжения (см. STRETCH_CONTINUATION_*)
+STRETCH_REVERSE_STOP_PCT = 0.25   # v0.31.10: по прямому запросу — эксперимент "разворот" (LONG на слабом отрыве 1-2%, там же где фейд сейчас плохо работает). Бэктест на частично расширенных данных (см. докстринг ниже у самой стратегии): стоп 0.25%/тейк 1.0% дал винрейт 58.2%, PnL +0.53%, устойчиво на соседних комбинациях (0.15-0.5% стопа с тем же тейком давали похожий результат)
+STRETCH_REVERSE_TAKE_PCT = 1.0   # v0.31.10: см. выше — тейк шире, чем изначально казалось нужным по старым (обрезанным) данным (0.5%), потому что честно расширенное отслеживание показало, что цена реально идёт дальше, чем виделось раньше
 STRETCH_CONTINUATION_MIN_PCT = 5.0   # v0.30.88: реальная находка на 1491 решённых continuation-сигналах — у continuation ОБРАТНАЯ зависимость от фейда: чем сильнее отрыв, тем ЛУЧШЕ (2-4% давали винрейт 25-27%/PnL от -0.18% до -0.26%, а 5%+ дали 40%/+0.21%). Зона 2-5% — "ничья земля", не работает ни как фейд (уже отсекается STRETCH_SIGNAL_MAX_PCT), ни как продолжение. Раньше continuation триггерился сразу с >2.0 (тем же порогом, что и потолок фейда) — теперь свой, отдельный, более высокий порог, дальше от границы
 STRETCH_FADE_MAX_TREND_PCT = 8.0   # v0.31.0: по прямому вопросу "применить фильтры из логов" — на свежих данных (2323 решённых) нашёлся РАЗВОРОТ прежней находки (v0.30.90 показывал наоборот, сильный тренд лучше для фейда) — сейчас |trend|<3%=винрейт 31%/PnL+0.055%, а |trend|>=8%=14%/-0.246%. Направление зависимости само по себе меняется вместе с режимом рынка (раньше было наоборот) — константу стоит периодически пересматривать по свежим данным, не считать законом навсегда. Не режем запись/статистику, только отправку алерта — та же логика, что у STRETCH_SIGNAL_MAX_PCT
 STRETCH_CONTINUATION_ALLOWED_TFS = {"4h"}   # v0.31.4: реальная находка на 733 решённых continuation-сигналах — чёткая, крупновыборочная зависимость от ТФ (не тренд/объём — те внутри 4h различают слабо): 4h винрейт 21-27%/PnL -0.19...-0.36%, а 15m — винрейт 0-7%/PnL -0.80...-1.00% (почти гарантированный слив). Быстрые ТФ дают "отрыв 5%+" слишком часто просто из шума, медленные — из настоящего движения. Даже 4h пока в минусе в среднем, НО внутри него нашёлся сегмент 7-10% отрыва в честном плюсе (винрейт 34%/PnL+0.03%, n=35 — не гигантская выборка, не факт что удержится). Ограничение только по ТФ, не по силе отрыва — тот сегмент пока не трогаем, маловато данных, не хотим повторить историю с STRETCH_CONTINUATION_MIN_PCT, которая уже разворачивалась
@@ -9808,8 +9858,12 @@ def _stretch_render_alert_chart(rec):
         ctx = _stretch_get_closed_ctx(rec["symbol"], rec["tf"])
         if not ctx:
             return None, "не удалось получить контекст свечей для графика (ctx пуст)"
-        dir_label = (f"LONG — продолжение импульса" if rec.get("strategy") == "continuation"
-                     else f"SHORT — цель EMA{rec['period']}")
+        if rec.get("strategy") == "continuation":
+            dir_label = "LONG — продолжение импульса"
+        elif rec.get("strategy") == "reverse":
+            dir_label = "LONG-разворот (эксперимент)"
+        else:
+            dir_label = f"SHORT — цель EMA{rec['period']}"
         sig = {"entry": rec.get("entry", rec["trigger_price"]), "tp": rec.get("take", rec["trigger_ema"]),
                "sl": rec.get("stop"), "dir": dir_label, "entry_i": ctx["i"]}
         if have_pil:
@@ -9916,6 +9970,19 @@ def _stretch_diag_maybe_alert_top_combo(new_recs):
                    f"Задержка от закрытия свечи: {lag_txt}{debug_txt}\n"
                    f"По статистике этой связки (n={o['evaluated']}): "
                    f"винрейт тейк/стоп (n={o['signal_resolved_n']}) — {o['signal_win_rate']}%")
+        elif rec.get("strategy") == "reverse":
+            # v0.31.10: по прямому запросу — эксперимент "разворот". НЕ
+            # подключено к автоторговле (см. _stretch_autotrade_process_
+            # fresh) — только алерт, для ручного наблюдения, пока не
+            # накопится честная (симметрично расширенная) статистика
+            msg = (f"🔄 <b>{rec['symbol']}</b> — LONG-РАЗВОРОТ на слабом отрыве от EMA{top_period} ({top_tf}), "
+                   f"топ связка по винрейту тейк/стоп (⚠️⚠️ ЭКСПЕРИМЕНТАЛЬНО — не в автоторговле, только наблюдение)\n"
+                   f"Вход: {_fmt_px(rec['entry'])} | Стоп: {_fmt_px(rec['stop'])} ({STRETCH_REVERSE_STOP_PCT}%) | "
+                   f"Тейк: {_fmt_px(rec['take'])} ({STRETCH_REVERSE_TAKE_PCT}%, фикс. цель, не EMA)\n"
+                   f"Отрыв на входе: {rec['stretch_pct']:+.2f}%\n"
+                   f"Задержка от закрытия свечи: {lag_txt}{debug_txt}\n"
+                   f"По статистике этой связки (n={o['evaluated']}): "
+                   f"винрейт тейк/стоп (n={o['signal_resolved_n']}) — {o['signal_win_rate']}%")
         else:
             msg = (f"📉 <b>{rec['symbol']}</b> — SHORT на возврат к EMA{top_period} ({top_tf}), "
                    f"топ связка по винрейту тейк/стоп\n"
@@ -9942,7 +10009,7 @@ def _stretch_diag_maybe_alert_top_combo(new_recs):
         # _stretch_autotrade_process_fresh (вызывается из скан-лупа для
         # каждого прохода, а не отсюда).
 
-    for strategy, label in (("fade", "фейд"), ("continuation", "продолжение")):
+    for strategy, label in (("fade", "фейд"), ("continuation", "продолжение"), ("reverse", "разворот")):
         candidates = [e for e in summary if e.get("strategy", "fade") == strategy]
         if not candidates:
             continue
@@ -10237,11 +10304,15 @@ def _stretch_diag_track_loop():
 
                 def _process(rec):
                     try:
-                        if rec.get("strategy") == "continuation":
+                        if rec.get("strategy") in ("continuation", "reverse"):
                             # v0.30.83: по прямому запросу — сигналы на
                             # продолжение (LONG) не связаны с EMA вообще,
                             # это простая фикс. цель/стоп от цены входа —
-                            # своя, более простая ветка слежения
+                            # своя, более простая ветка слежения.
+                            # v0.31.10: та же ветка теперь обслуживает и
+                            # эксперимент "разворот" — структурно идентичен
+                            # (LONG, фикс. стоп/тейк от входа), просто другой
+                            # диапазон отрыва и другие параметры стоп/тейк
                             live_price = _gate_get_price(rec["symbol"])
                             if not live_price:
                                 if now >= rec.get("track_until", 0):
@@ -10406,7 +10477,7 @@ def _stretch_diag_summary(min_events=3):
             "signal_win_rate": round(wins / len(resolved_sig) * 100, 1) if resolved_sig else None,
             "signal_timeouts": timeouts,
         }
-        if strategy == "continuation":
+        if strategy in ("continuation", "reverse"):
             # v0.31.5: реальный баг, найден по прямому вопросу "почему
             # нулевые данные в лонгах" (на самом деле — "почему выживаемость
             # 100% у ВСЕХ строк, даже у тех с винрейтом 0%"). Причина —
@@ -10498,7 +10569,7 @@ def _stretch_diag_summary(min_events=3):
     # сначала группируем по стратегии (фейд первым, continuation вторым),
     # ВНУТРИ каждой группы сортируем как раньше — топ каждой стратегии
     # сразу виден как первая строка своего блока, не теряется в общем списке
-    strategy_order = {"fade": 0, "continuation": 1}
+    strategy_order = {"fade": 0, "continuation": 1, "reverse": 2}
     result.sort(key=lambda e: (
         strategy_order.get(e.get("strategy", "fade"), 2),
         -(e["overall"]["signal_win_rate"] if e["overall"]["signal_win_rate"] is not None else 0),
@@ -11755,14 +11826,20 @@ async function loadSummary(){
     const r = await fetch('/ema_stretch_status'); const d = await r.json();
     const tbody = document.querySelector('#summaryTable tbody'); tbody.innerHTML = '';
     statusEl.innerText = `Всего событий в истории: ${d.count}` + (d.last_cycle_sec != null ? ` · последний скан занял ${d.last_cycle_sec}с` : '');
+    const stratMeta = {
+      fade: {emoji:'📉', label:'ФЕЙД', color:'#f85149'},
+      continuation: {emoji:'📈', label:'ПРОДОЛЖЕНИЕ', color:'#58a6ff'},
+      reverse: {emoji:'🔄', label:'РАЗВОРОТ (эксперимент)', color:'#d29922'},
+    };
     let lastStrategy = null;
     for(const e of (d.summary || [])){
       const o = e.overall;
+      const meta = stratMeta[e.strategy] || stratMeta.fade;
       if(e.strategy !== lastStrategy){
         lastStrategy = e.strategy;
         const hdr = document.createElement('tr');
-        hdr.innerHTML = `<td colspan="15" style="background:#161b22;color:${e.strategy==='continuation'?'#58a6ff':'#f85149'};font-weight:bold;padding-top:14px">`+
-          `${e.strategy === 'continuation' ? '📈 ПРОДОЛЖЕНИЕ — свой отдельный топ, алертит независимо от фейда' : '📉 ФЕЙД — свой отдельный топ, алертит независимо от продолжения'}</td>`;
+        hdr.innerHTML = `<td colspan="15" style="background:#161b22;color:${meta.color};font-weight:bold;padding-top:14px">`+
+          `${meta.emoji} ${meta.label} — свой отдельный топ, алертит независимо от остальных стратегий</td>`;
         tbody.appendChild(hdr);
       }
       const isLeader = tbody.querySelectorAll(`tr[data-strategy="${e.strategy}"]`).length === 0;
@@ -11770,7 +11847,7 @@ async function loadSummary(){
       tr.setAttribute('data-strategy', e.strategy);
       if(isLeader) tr.style.background = '#132d1d';
       const b13 = e['stretch_1-3%'], b36 = e['stretch_3-6%'], b6p = e['stretch_6%+'];
-      tr.innerHTML = `<td>${isLeader ? '👑 ' : ''}${e.strategy === 'continuation' ? '📈 продолжение' : '📉 фейд'}</td><td>${e.tf}</td><td>EMA${e.period}</td><td>${o.total}</td><td>${o.evaluated}</td>`+
+      tr.innerHTML = `<td>${isLeader ? '👑 ' : ''}${meta.emoji} ${meta.label.toLowerCase()}</td><td>${e.tf}</td><td>EMA${e.period}</td><td>${o.total}</td><td>${o.evaluated}</td>`+
         `<td>${o.signal_win_rate ?? '—'}% (n=${o.signal_resolved_n ?? 0}, таймаутов=${o.signal_timeouts ?? 0})</td>`+
         `<td>${o.stop_survival_rate ?? '—'}% (n=${o.stop_survival_n ?? 0})</td>`+
         `<td>${o.touch_rate ?? '—'}%</td><td>${o.avg_retrace_pct_of_stretch ?? '—'}%</td>`+
@@ -11937,7 +12014,8 @@ async function loadRaw(){
       const outcomeColors = {take:'#3fb950', stop:'#f85149', timeout:'#8b949e', open:'#d29922'};
       const oc = it.signal_outcome || (it.touched ? 'take' : (it.track_done ? 'timeout' : 'open'));
       const status = `<span style="color:${outcomeColors[oc]||'#8b949e'}">${oc}</span>`;
-      const isCont = it.strategy === 'continuation';
+      const isCont = it.strategy === 'continuation' || it.strategy === 'reverse';
+      const emoji = it.strategy === 'continuation' ? '📈' : (it.strategy === 'reverse' ? '🔄' : '📉');
       // v0.31.6: по прямому вопросу "как поймём, какие проценты менять" —
       // для continuation closest/max_adverse — те самые НИКОГДА не
       // обновляемые EMA-относительные поля (v0.31.5), показывать их тут
@@ -11946,7 +12024,7 @@ async function loadRaw(){
       const col2 = isCont ? `${it.cont_best_pct ?? '—'}%` : `${it.closest_stretch_pct}%`;
       const col3 = isCont ? `${it.cont_worst_pct ?? '—'}%` : `${it.max_adverse_stretch_pct ?? it.stretch_pct}%`;
       const col4 = isCont ? '—' : `${it.max_retrace_pct_of_stretch}%`;
-      tr.innerHTML = `<td>${isCont ? '📈' : '📉'}</td><td>${it.symbol}</td><td>${it.tf}</td><td>EMA${it.period}</td>`+
+      tr.innerHTML = `<td>${emoji}</td><td>${it.symbol}</td><td>${it.tf}</td><td>EMA${it.period}</td>`+
         `<td>${it.entry ?? '—'}</td><td>${it.stop ?? '—'}</td><td>${it.take ?? '—'}</td>`+
         `<td>${it.stretch_pct>0?'+':''}${it.stretch_pct}%</td><td>${col2}</td>`+
         `<td>${col3}</td>`+
