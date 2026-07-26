@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.31.8 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.31.9 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.31.9: реальная асимметрия, найденная сразу после v0.31.8 — расширял
+  слежение только за ПИКОМ (вверх, полезно для тейка гипотетического
+  разворота в лонг), но НЕ за ближайшим подходом к EMA (вниз, нужно для
+  стопа такого разворота). Подтвердилось сразу же на живых данных: 98%
+  fade-записей с частичным расширенным окном уже показали рост пика по
+  сравнению со старым обрезанным значением (в среднем +2.93 п.п.) — но
+  для записей, где фейд закрылся по СВОЕМУ стопу (цена так и не
+  вернулась к EMA), поле "ближайший подход" тоже обрывалось слишком
+  рано, просто в другую сторону, искажая расчёт стопа гипотетического
+  разворота. Добавлено новое поле closest_stretch_pct_ext — та же логика
+  расширенного слежения, симметрично, в другую сторону. Нужно копить с
+  нуля, как и с max_adverse_stretch_pct_ext (v0.31.8).
 - v0.31.8: по прямому запросу — "таймаут увеличим, чтобы понимать точно
   как закрылась сделка, или направление наоборот станет ещё привлекательнее".
   Реальный перекос в прежних бэктестах гипотетического разворота: как
@@ -2155,7 +2167,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.31.8"
+APP_VERSION  = "0.31.9"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -10195,6 +10207,22 @@ def _stretch_diag_track_loop():
                         base_worst = rec.get("max_adverse_stretch_pct_ext", rec.get("max_adverse_stretch_pct", rec["stretch_pct"]))
                         if not crossed and abs(worst_stretch) > abs(base_worst):
                             rec["max_adverse_stretch_pct_ext"] = round(worst_stretch, 3)
+                        # v0.31.9: реальная находка по прямому вопросу (та же
+                        # мысль дальше развита) — расширял слежение только за
+                        # ПИКОМ (вверх, полезно для тейка гипотетического
+                        # разворота), но НЕ за ближайшим подходом к EMA (вниз,
+                        # нужно для стопа) — асимметрия. Для записей, где фейд
+                        # закрылся по СВОЕМУ стопу (цена ушла ещё дальше,
+                        # так и не вернувшись), поле "ближайший подход" тоже
+                        # могло оборваться слишком рано, просто в другую
+                        # сторону. Теперь симметрично — та же логика, что и
+                        # у max_adverse_stretch_pct_ext, только в другую сторону
+                        best_stretch = current_stretch
+                        if recent_hl and rec["stretch_pct"] > 0:
+                            best_stretch = min(best_stretch, (recent_hl[1] - ema_now) / ema_now * 100.0)
+                        base_closest = rec.get("closest_stretch_pct_ext", rec.get("closest_stretch_pct", rec["stretch_pct"]))
+                        if abs(best_stretch) < abs(base_closest):
+                            rec["closest_stretch_pct_ext"] = round(best_stretch, 3)
                         if now_ext >= rec.get("extended_track_until", 0):
                             rec["extended_track_done"] = True
                     except Exception as e:
