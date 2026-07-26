@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
 """
-Pump Radar v0.31.11 (fork of EMA Invert Experiment v0.1.10, itself a fork of
+Pump Radar v0.31.12 (fork of EMA Invert Experiment v0.1.10, itself a fork of
 EMA Bounce Dossier v3.6.14 / SMC Optimizer v3.52.96)
+- v0.31.12: по прямому запросу — "чекбоксы для уведомлений
+  экспериментальных и всех остальных, хочу видеть только
+  экспериментальные". Раньше алерты в Telegram слались по всем трём
+  стратегиям без разбора, включить/выключить было нельзя. Добавлена
+  панель на /ema_stretch с тремя чекбоксами (📉 фейд / 📈 продолжение /
+  🔄 разворот), эндпоинты /stretch_notify_settings (GET/POST),
+  персистится на диск (~/pumpradar_stretch_notify_cfg.json). По
+  умолчанию все три включены (как было раньше) — меняется только явно.
+  Гейт стоит в самом начале _fire, до любой другой обработки — не
+  затрагивает запись истории, ранжирование или автоторговлю (та
+  полностью независима с v0.30.95), только решает, отправлять ли
+  сообщение в Telegram.
 - v0.31.11: два связанных исправления. (1) По прямому запросу — "с такими
   стопами тейк/стоп должен быть уже буквально на следующей свече, для
   15м многовато часов слежки". Старые окна отслеживания (6ч/12ч/24ч/
@@ -2195,7 +2207,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "0.31.11"
+APP_VERSION  = "0.31.12"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -9965,6 +9977,10 @@ def _stretch_diag_maybe_alert_top_combo(new_recs):
         return   # ещё не набралось достаточно данных ни по одной связке
 
     def _fire(rec, top, label):
+        with _stretch_notify_lock:
+            notify_on = _stretch_notify_state.get(rec.get("strategy", "fade"), True)
+        if not notify_on:
+            return   # v0.31.12: по прямому запросу — галочка уведомлений выключена для этой стратегии, тихо пропускаем (запись/ранжирование/автоторговля не затронуты, это только про отправку в Telegram)
         top_tf, top_period = top["tf"], top["period"]
         o = top["overall"]
         lag_sec = max(0, int(time.time() - rec.get("bar_close_ts", rec["ts"])))
@@ -10132,6 +10148,35 @@ def _save_stretch_autotrade_cfg():
             json.dump(snapshot, f)
     except Exception as e:
         olog(f"[stretch_autotrade] ошибка сохранения настроек: {_explain_error(e)}")
+
+
+STRETCH_NOTIFY_CFG_FILE = os.path.expanduser("~/pumpradar_stretch_notify_cfg.json")
+_stretch_notify_lock = threading.Lock()
+_stretch_notify_state = {
+    "fade": True, "continuation": True, "reverse": True,
+}   # v0.31.12: по прямому запросу — "чекбоксы для уведомлений экспериментальных и всех остальных, хочу видеть только экспериментальные". Отдельно от автоторговли (та уже была per-strategy) — раньше алерты в Telegram слались по всем трём стратегиям без разбора, включить/выключить было нельзя
+
+
+def _load_stretch_notify_cfg():
+    try:
+        with open(STRETCH_NOTIFY_CFG_FILE) as f:
+            saved = json.load(f)
+        with _stretch_notify_lock:
+            for k in ("fade", "continuation", "reverse"):
+                if k in saved:
+                    _stretch_notify_state[k] = bool(saved[k])
+    except Exception:
+        pass
+
+
+def _save_stretch_notify_cfg():
+    try:
+        with _stretch_notify_lock:
+            snapshot = dict(_stretch_notify_state)
+        with open(STRETCH_NOTIFY_CFG_FILE, "w") as f:
+            json.dump(snapshot, f)
+    except Exception as e:
+        olog(f"[ema_stretch] ошибка сохранения настроек уведомлений: {_explain_error(e)}")
 
 
 _stretch_autotrade_open_lock = threading.Lock()   # v0.30.93: реальная находка при финальной проверке безопасности — между проверкой "нет ли уже открытой позиции" и самим открытием ордера проходит сетевое время, в параллельном скане (48 потоков) теоретически два потока могли пройти проверку одновременно и открыть ДВЕ позиции по одной монете. Явная блокировка сериализует весь check-then-open, устраняя гонку полностью, не только для этого конкретного сценария
@@ -11775,6 +11820,24 @@ select,input{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-ra
   <div id="scanFilterStatus" style="font-size:12px;color:#8b949e;margin-top:6px"></div>
 </div>
 
+<div class="section-card">
+  <h3>&#128276; Уведомления в Telegram</h3>
+  <p style="color:#8b949e;font-size:12px">Какие стратегии шлют алерты. Не влияет на запись истории, ранжирование или автоторговлю — только на то, приходит ли сообщение в Telegram.</p>
+  <div style="display:flex;gap:16px;flex-wrap:wrap;margin:8px 0">
+    <label style="display:flex;gap:6px;align-items:center;font-size:13px;color:#c9d1d9;cursor:pointer">
+      <input type="checkbox" id="notifyFade" style="width:16px;height:16px">📉 Фейд
+    </label>
+    <label style="display:flex;gap:6px;align-items:center;font-size:13px;color:#c9d1d9;cursor:pointer">
+      <input type="checkbox" id="notifyContinuation" style="width:16px;height:16px">📈 Продолжение
+    </label>
+    <label style="display:flex;gap:6px;align-items:center;font-size:13px;color:#d29922;cursor:pointer">
+      <input type="checkbox" id="notifyReverse" style="width:16px;height:16px">🔄 Разворот (экспериментальный)
+    </label>
+  </div>
+  <button onclick="saveNotifySettings()">&#128190; Сохранить</button>
+  <div id="notifyStatus" style="font-size:12px;color:#8b949e;margin-top:6px"></div>
+</div>
+
 <div class="section-card" style="border:1px solid #f85149">
   <h3 style="color:#f85149">&#9888;&#65039; Автоторговля (реальные деньги)</h3>
   <p style="color:#8b949e;font-size:12px">Открывает настоящую позицию на Gate.io. С v0.30.95 — СТРОГО по выбранным ниже конфигам (галочки ТФ×ЕМА, отдельно для фейда и продолжения), а не по меняющейся топ-связке. Вход/стоп/тейк — из самого сигнала, плечо — фиксированное (задаётся ниже, по умолчанию 10х). Выключено по умолчанию — включай осознанно.</p>
@@ -11979,6 +12042,31 @@ function buildAutoTradeConfigsUI(){
   box.innerHTML = html;
 }
 buildAutoTradeConfigsUI();
+
+async function loadNotifySettings(){
+  const statusEl = document.getElementById('notifyStatus');
+  try{
+    const r = await fetch('/stretch_notify_settings'); const d = await r.json();
+    document.getElementById('notifyFade').checked = d.fade !== false;
+    document.getElementById('notifyContinuation').checked = d.continuation !== false;
+    document.getElementById('notifyReverse').checked = d.reverse !== false;
+  }catch(e){ statusEl.innerText = 'Ошибка загрузки'; }
+}
+async function saveNotifySettings(){
+  const statusEl = document.getElementById('notifyStatus');
+  try{
+    const r = await fetch('/stretch_notify_settings', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        fade: document.getElementById('notifyFade').checked,
+        continuation: document.getElementById('notifyContinuation').checked,
+        reverse: document.getElementById('notifyReverse').checked,
+      })});
+    const d = await r.json();
+    statusEl.style.color = d.ok ? '#3fb950' : '#f85149';
+    statusEl.innerText = d.ok ? 'Сохранено' : (d.msg || 'Ошибка сохранения');
+  }catch(e){ statusEl.style.color = '#f85149'; statusEl.innerText = 'Ошибка запроса'; }
+}
+loadNotifySettings();
 
 async function loadAutoTradeSettings(){
   const statusEl = document.getElementById('autoTradeStatus');
@@ -12751,6 +12839,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                        "notional": r.get("live_notional"), "opened_at": r.get("live_opened_at")}
                                       for r in live_open]
             self._json(cfg)
+        elif self.path == "/stretch_notify_settings":
+            with _stretch_notify_lock:
+                self._json(dict(_stretch_notify_state))
         elif self.path == "/stretch_scan_settings":
             # v0.30.95: по прямому запросу — какие ЕМА+ТФ сейчас реально
             # выбраны для скана "Отрыва от EMA" (галочки на странице)
@@ -12971,6 +13062,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             _stretch_diag_save()
             olog("[ema_stretch] история отрывов от EMA очищена вручную")
             self._json({"ok": True})
+
+        elif self.path == "/stretch_notify_settings":
+            # v0.31.12: по прямому запросу — "чекбоксы для уведомлений
+            # экспериментальных и всех остальных, хочу видеть только
+            # экспериментальные"
+            try:
+                with _stretch_notify_lock:
+                    for k in ("fade", "continuation", "reverse"):
+                        if k in body:
+                            _stretch_notify_state[k] = bool(body[k])
+                    snapshot = dict(_stretch_notify_state)
+                _save_stretch_notify_cfg()
+                self._json({"ok": True, **snapshot})
+            except (TypeError, ValueError) as e:
+                self._json({"ok": False, "msg": f"ошибка в значении: {_explain_error(e)}"})
 
         elif self.path == "/stretch_autotrade_settings":
             # v0.30.92: по прямому запросу — "автоторговля для Long или
@@ -13357,6 +13463,7 @@ def main():
     _load_gate_cfg()
     _load_ema_auto_trade_cfg()
     _load_stretch_autotrade_cfg()   # v0.30.92: по прямому запросу — автоторговля для отрывов от EMA, по умолчанию enabled=False/mode=off, не активна без явного включения через UI
+    _load_stretch_notify_cfg()   # v0.31.12: по прямому запросу — по умолчанию все три стратегии уведомляют (как было раньше), пока не выключено явно через UI
     _load_stretch_scan_cfg()   # v0.30.95: по прямому запросу — выбранные ЕМА+ТФ для скана "Отрыва от EMA", по умолчанию (нет файла) — выбрано всё
     _load_pump_render_params()
     # v0.15.0: КРИТИЧНЫЙ фикс — раньше история EMA-сигналов подхватывалась
